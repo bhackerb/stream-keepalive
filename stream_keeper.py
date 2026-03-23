@@ -237,6 +237,33 @@ class StreamKeeper:
 
         logger.info("Browser started successfully")
 
+    async def _reconnect_cdp(self):
+        """Reconnect to Chrome via CDP to pick up newly opened tabs.
+
+        Playwright's CDP connection doesn't dynamically detect tabs opened
+        by the user through the browser UI. Reconnecting gets a fresh view.
+        """
+        if not self._cdp_url:
+            return
+        logger.debug("Reconnecting CDP to refresh tab list...")
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception as e:
+            logger.debug(f"CDP disconnect (expected): {e}")
+
+        try:
+            self._browser = await self._playwright.chromium.connect_over_cdp(self._cdp_url)
+            contexts = self._browser.contexts
+            if contexts:
+                self.context = contexts[0]
+            else:
+                self.context = await self._browser.new_context()
+            page_count = len(self.context.pages) if self.context else 0
+            logger.debug(f"CDP reconnected — {page_count} tab(s)")
+        except Exception as e:
+            logger.error(f"CDP reconnect failed: {e}")
+
     async def _on_new_page(self, page: Page):
         """Handle new pages (popup ad windows).
 
@@ -425,21 +452,54 @@ class StreamKeeper:
                         continue
         return pages_with_video
 
+    @staticmethod
+    def _parse_stream_label(title: str, fallback_url: str = "") -> str:
+        """Extract a human-readable stream label from a page title.
+
+        Streaming sites typically use titles like:
+          "Watch Anaheim Ducks vs Buffalo Sabres Stream Delta 1 - Streamed"
+        We extract: "Anaheim Ducks vs Buffalo Sabres"
+        """
+        if title and " Stream " in title:
+            label = title.split(" Stream ")[0]
+            label = label.replace("Watch ", "").strip()
+            if label:
+                return label
+        if title:
+            for suffix in [" - Streamed", " | Streamed", " - OnHockey", " | OnHockey"]:
+                if suffix in title:
+                    title = title.split(suffix)[0].strip()
+            return title[:60]
+        return fallback_url.split("/")[-1][:40] if fallback_url else "unknown"
+
     async def keepalive(self) -> str:
-        """Scan all open browser tabs, attach health monitors to any with <video> elements."""
+        """Scan all open browser tabs, attach health monitors to any with <video> elements.
+
+        In CDP mode, reconnects first to pick up tabs opened after StreamKeeper started.
+        Uses CDP /json/list as fallback to detect video in cross-origin iframes.
+        """
         if not self.context:
-            return "❌ Browser not started. Start it first with a watch command."
+            return "No browser context. Start the browser first."
+
+        # Reconnect CDP to pick up newly opened tabs
+        if self._cdp_url:
+            await self._reconnect_cdp()
+
+        if not self.context:
+            return "CDP reconnect failed — no browser context."
 
         pages = self.context.pages
         attached = 0
         skipped = 0
-        already = set(s.page for s in self.active_streams.values())
+        # After CDP reconnect, page objects are new — match by URL
+        already_urls = set(s.url or "" for s in self.active_streams.values())
 
         # Pre-fetch CDP-based video detection for cross-origin iframes
         cdp_video_urls = await self._get_urls_with_video_cdp()
 
         for page in pages:
-            if page in already:
+            page_url = page.url
+            if page_url in already_urls or page_url in ("about:blank", "chrome://newtab/"):
                 skipped += 1
                 continue
 
@@ -457,23 +517,31 @@ class StreamKeeper:
                 has_video = False
 
             if not has_video:
-                has_video = page.url in cdp_video_urls
+                has_video = page_url in cdp_video_urls
 
+            # Even without detected video, attach to known streaming site pages
+            # (the video may be in an unreachable cross-origin iframe)
+            is_streaming_page = False
             if not has_video:
+                streaming_domains = ["streamed.", "onhockey.", "embedsports.", "sportsurge."]
+                is_streaming_page = any(d in page_url for d in streaming_domains)
+
+            if not has_video and not is_streaming_page:
                 continue
 
             if len(self.active_streams) >= self.max_streams:
                 break
 
-            # Extract a label from the page title or URL
+            # Extract a human-readable label from the page title
             try:
                 title = await page.title()
             except Exception:
                 title = ""
-            label = title[:50] if title else page.url.split("/")[-1][:40]
+            label = self._parse_stream_label(title, page_url)
             stream_id = self._make_stream_id(team=label)
 
-            logger.info(f"[keepalive] Attaching monitor to: {label} [{stream_id}]")
+            video_note = "video detected" if has_video else "streaming page (video in cross-origin iframe)"
+            logger.info(f"[keepalive] Attaching monitor to: {label} [{stream_id}] ({video_note})")
 
             health_mon = HealthMonitor(self.config)
             stream = ActiveStream(
@@ -483,7 +551,7 @@ class StreamKeeper:
                 driver=None,
                 health_monitor=health_mon,
                 site="keepalive",
-                url=page.url,
+                url=page_url,
             )
             stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
             self.active_streams[stream_id] = stream
@@ -491,14 +559,14 @@ class StreamKeeper:
 
         if attached == 0:
             return (
-                f"😴 No tabs with video elements found ({len(pages)} tabs open, {skipped} already monitored).\n"
+                f"No new streams found ({len(pages)} tabs open, {skipped} already monitored).\n"
                 "Open your streams in the browser first, then run keepalive again."
             )
 
         return (
-            f"🛡️ **Keepalive active** — monitoring {attached} new stream{'s' if attached != 1 else ''}\n"
-            f"📺 Total monitored: {len(self.active_streams)}/{self.max_streams}\n"
-            f"🔄 Health check every {self.config.get('health', {}).get('poll_interval_seconds', 5)}s | Auto-recovery enabled"
+            f"Keepalive active -- monitoring {attached} new stream{'s' if attached != 1 else ''}\n"
+            f"Total monitored: {len(self.active_streams)}/{self.max_streams}\n"
+            f"Health check every {self.config.get('health', {}).get('poll_interval_seconds', 5)}s | Auto-recovery enabled"
         )
 
     async def watch(self, team: str, site: Optional[str] = None) -> str:
@@ -641,9 +709,19 @@ class StreamKeeper:
     async def shutdown(self):
         """Full shutdown — stop all streams, close browser and Playwright."""
         await self.stop()  # stops all
-        if self.context:
-            await self.context.close()
+        if self._cdp_url:
+            # CDP mode — disconnect without closing the external Chrome
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
             self.context = None
+        else:
+            if self.context:
+                await self.context.close()
+                self.context = None
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
@@ -790,6 +868,7 @@ class StreamKeeper:
         """Health monitoring loop for a single stream — runs until stopped."""
         logger.info(f"Health monitoring loop started for [{stream.id}]")
         poll_interval = stream.health_monitor.poll_interval
+        consecutive_no_video = 0
 
         while stream.id in self.active_streams:
             try:
@@ -802,10 +881,24 @@ class StreamKeeper:
                     break
 
                 # Take health snapshot
-                await stream.health_monitor.check_health(stream.page)
+                snap = await stream.health_monitor.check_health(stream.page)
+
+                # If video element is unreachable (cross-origin iframe), fall back
+                # to page-level liveness checks instead of triggering false recovery
+                if snap.state == StreamState.NO_VIDEO:
+                    consecutive_no_video += 1
+                    if consecutive_no_video >= 3 and stream.site == "keepalive":
+                        snap = await stream.health_monitor.check_health_page_level(stream.page)
+                        if snap.is_healthy:
+                            continue
+                else:
+                    consecutive_no_video = 0
 
                 # Periodically dismiss any new ad overlays
-                await self.ad_handler.dismiss_overlays(stream.page)
+                try:
+                    await self.ad_handler.dismiss_overlays(stream.page)
+                except Exception:
+                    pass
 
                 # Check if recovery is needed
                 if stream.health_monitor.needs_recovery() and not stream.recovery_in_progress:

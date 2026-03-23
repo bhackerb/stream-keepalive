@@ -215,6 +215,29 @@ class HealthMonitor:
         self._monitoring = False
         self._page: Optional[Page] = None
 
+    async def check_health_page_level(self, page: Page) -> HealthSnapshot:
+        """Fallback health check when video element is unreachable (cross-origin iframe).
+
+        Instead of polling the <video> element directly, checks page-level liveness:
+        is the tab still navigable, is the URL sane, is the title still present?
+        """
+        snap = HealthSnapshot(timestamp=time.time())
+        try:
+            title = await page.title()
+            url = page.url
+            if "chrome-error" in url or url == "about:blank":
+                snap.state = StreamState.ERROR
+                snap.error_message = f"Page navigated to error/blank: {url}"
+            elif not title:
+                snap.state = StreamState.LOADING
+            else:
+                snap.state = StreamState.PLAYING
+        except Exception as e:
+            snap.state = StreamState.ERROR
+            snap.error_message = f"Page unreachable: {e}"
+        self.history.add(snap)
+        return snap
+
     async def check_health(self, page: Page) -> HealthSnapshot:
         """Take a single health snapshot from the video element."""
         snap = HealthSnapshot(timestamp=time.time())
