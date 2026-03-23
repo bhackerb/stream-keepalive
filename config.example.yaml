@@ -1,0 +1,108 @@
+# StreamKeeper Configuration
+# Copy to config.yaml and fill in your values
+
+discord:
+  bot_token: "YOUR_DISCORD_BOT_TOKEN"
+  command_channel_id: 1234567890  # Channel ID where bot listens for commands
+  notification_channel_id: 1234567890  # Channel for status notifications (can be same)
+  command_prefix: "!"
+
+# Browser settings
+browser:
+  user_data_dir: "./browser-data"  # Persistent browser profile
+  ublock_origin_path: "./extensions/ublock-origin"  # Path to extracted uBlock Origin
+  viewport_width: 1920
+  viewport_height: 1080
+  # Extra Chromium args
+  extra_args:
+    - "--autoplay-policy=no-user-gesture-required"
+    - "--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies"
+
+# Default preferences
+defaults:
+  site: "streamed.pk"  # Default streaming site
+  favorite_teams:
+    - "Blues"
+    - "Cardinals"
+
+# Health monitoring
+health:
+  poll_interval_seconds: 5  # How often to check stream health
+  stall_threshold_seconds: 15  # How long before a stall triggers recovery
+  max_recovery_attempts: 5  # Max recoveries before giving up
+  recovery_cooldown_seconds: 30  # Min time between recovery attempts
+  screenshot_on_failure: true  # Take screenshot when stream fails
+
+# Ad blocking
+ads:
+  # Network-level blocking: domains to block
+  blocked_domain_patterns:
+    - "*googleads*"
+    - "*googlesyndication*"
+    - "*doubleclick*"
+    - "*adservice*"
+    - "*adsystem*"
+    - "*advertising*"
+    - "*adnxs*"
+    - "*adsrvr*"
+    - "*adform*"
+    - "*taboola*"
+    - "*outbrain*"
+    - "*popads*"
+    - "*popcash*"
+    - "*propellerads*"
+    - "*exoclick*"
+    - "*juicyads*"
+    - "*trafficjunky*"
+    - "*hilltopads*"
+    - "*clickadu*"
+    - "*pushground*"
+    - "*richpush*"
+    - "*megapush*"
+    - "*ad-maven*"
+    - "*admaven*"
+    - "*wildcard*offer*"
+    - "*wildcasino*"
+    - "*wonderblockoffer*"
+    - "*bet365*"
+    - "*stake.com*"
+    - "*1xbet*"
+    - "*betway*"
+  # Resource types to block entirely
+  blocked_resource_types:
+    - "beacon"
+    # Uncomment below to also block images/fonts for faster loading
+    # - "image"
+    # - "font"
+
+# Site-specific settings
+sites:
+  streamed.pk:
+    base_url: "https://streamed.pk"
+    game_list_path: "/category/ice-hockey"
+    # CSS selectors — update these when site changes
+    selectors:
+      game_card: ".event-card, .match-card, [class*='event'], [class*='match']"
+      team_name: ".team-name, .event-name, [class*='team']"
+      stream_link: ".stream-link, a[href*='stream'], .source-link"
+      video_player: "video, iframe[src*='stream'], iframe[src*='player']"
+      ad_overlay: ".overlay, .ad-overlay, [class*='popup'], [class*='modal'], [id*='ad']"
+      close_button: ".close, .close-btn, [class*='close'], button[aria-label='Close']"
+
+  onhockey.tv:
+    base_url: "https://www.onhockey.tv"
+    game_list_path: "/"
+    selectors:
+      game_card: "tr, .game-row, [class*='game']"
+      team_name: "td, .team, [class*='team']"
+      stream_link: "a[href*='np_'], a[href*='stream']"
+      video_player: "video, iframe"
+      ad_overlay: ".overlay, [class*='popup'], [class*='modal']"
+      close_button: ".close, [class*='close']"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "./logs/stream-keeper.log"
+  max_size_mb: 10
+  backup_count: 3

@@ -1,0 +1,28 @@
+# Config (contains secrets)
+config.yaml
+
+# Browser profile (large, personal)
+browser-data/
+
+# uBlock Origin extension (binary, user-provided)
+extensions/
+
+# Runtime outputs
+logs/
+screenshots/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Misc
+*.tar.gz
+.env
