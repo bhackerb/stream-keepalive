@@ -32,7 +32,7 @@ except ImportError:
     print("⚠️  discord.py not installed — running in CLI-only mode")
     print("   Install with: pip install discord.py --break-system-packages")
 
-from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from ad_handler import AdHandler
 from api_server import StreamKeeperAPI
@@ -90,6 +90,8 @@ class StreamKeeper:
         self.config = config
         self.ad_handler = AdHandler(config)
         self.context: Optional[BrowserContext] = None
+        self._browser: Optional[Browser] = None
+        self._cdp_url: Optional[str] = None
         self.active_streams: dict[str, ActiveStream] = {}
         self.default_site: str = config.get("defaults", {}).get("site", "streamed.pk")
         self._playwright = None
@@ -211,12 +213,15 @@ class StreamKeeper:
 
         if remote_debugging_url:
             # Connect to an already-running Chrome via CDP
+            self._cdp_url = remote_debugging_url
             logger.info(f"Connecting to existing browser at {remote_debugging_url}")
-            browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
-            if browser.contexts:
-                self.context = browser.contexts[0]
+            self._browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
+            if self._browser.contexts:
+                self.context = self._browser.contexts[0]
             else:
-                self.context = await browser.new_context()
+                self.context = await self._browser.new_context()
+            page_count = len(self.context.pages) if self.context else 0
+            logger.info(f"CDP connected — {page_count} existing tab(s) found")
         else:
             # Launch a new persistent context
             self.context = await self._playwright.chromium.launch_persistent_context(
