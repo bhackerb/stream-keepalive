@@ -4,16 +4,20 @@ StreamKeeper — Main orchestrator.
 Ties together:
 - Playwright browser (headed, with uBlock Origin)
 - Site drivers (streamed.pk, onhockey.tv)
-- Health monitoring loop
-- Recovery cascade
+- Health monitoring loop (per-stream)
+- Recovery cascade (per-stream)
 - Discord bot interface
+
+Supports multiple simultaneous streams in separate browser tabs.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +62,24 @@ def setup_logging(config: dict):
 logger = logging.getLogger("stream-keeper")
 
 # ---------------------------------------------------------------------------
+# ActiveStream dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ActiveStream:
+    """Represents a single active stream with its own tab, driver, and health monitor."""
+    id: str                              # e.g. "blues", "cardinals" — team name lowered
+    team: str                            # display name
+    page: Page                           # browser tab
+    driver: Optional[BaseSiteDriver]     # site driver (None for direct URL watches)
+    health_monitor: HealthMonitor
+    monitor_task: Optional[asyncio.Task] = None
+    site: str = ""
+    url: Optional[str] = None            # for direct URL watches
+    started_at: float = field(default_factory=time.time)
+    recovery_in_progress: bool = False
+
+# ---------------------------------------------------------------------------
 # StreamKeeper core
 # ---------------------------------------------------------------------------
 
@@ -67,22 +89,87 @@ class StreamKeeper:
     def __init__(self, config: dict):
         self.config = config
         self.ad_handler = AdHandler(config)
-        self.health_monitor = HealthMonitor(config)
         self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
-        self.driver: Optional[BaseSiteDriver] = None
-        self.is_watching = False
-        self.current_team: Optional[str] = None
-        self.current_site: str = config.get("defaults", {}).get("site", "streamed.pk")
-        self._monitor_task: Optional[asyncio.Task] = None
+        self.active_streams: dict[str, ActiveStream] = {}
+        self.default_site: str = config.get("defaults", {}).get("site", "streamed.pk")
         self._playwright = None
-        self._recovery_in_progress = False
+
+        # Limits
+        self.max_streams = config.get("streams", {}).get("max_streams", 8)
 
         # Recovery settings
         health_cfg = config.get("health", {})
         self.max_recovery_attempts = health_cfg.get("max_recovery_attempts", 5)
         self.recovery_cooldown = health_cfg.get("recovery_cooldown_seconds", 30)
         self.screenshot_on_failure = health_cfg.get("screenshot_on_failure", True)
+
+    # ------------------------------------------------------------------
+    # Backward-compat properties — point at first stream or sensible defaults
+    # ------------------------------------------------------------------
+
+    @property
+    def is_watching(self) -> bool:
+        return len(self.active_streams) > 0
+
+    @property
+    def current_team(self) -> Optional[str]:
+        if not self.active_streams:
+            return None
+        # Return the first stream's team
+        return next(iter(self.active_streams.values())).team
+
+    @property
+    def current_site(self) -> str:
+        if not self.active_streams:
+            return self.default_site
+        return next(iter(self.active_streams.values())).site or self.default_site
+
+    @property
+    def health_monitor(self) -> HealthMonitor:
+        """Return the first stream's health monitor for backward compat."""
+        if self.active_streams:
+            return next(iter(self.active_streams.values())).health_monitor
+        # Return a dummy monitor if nothing is active
+        return HealthMonitor(self.config)
+
+    @property
+    def page(self) -> Optional[Page]:
+        """Return the first stream's page for backward compat."""
+        if self.active_streams:
+            return next(iter(self.active_streams.values())).page
+        return None
+
+    @property
+    def driver(self) -> Optional[BaseSiteDriver]:
+        """Return the first stream's driver for backward compat."""
+        if self.active_streams:
+            return next(iter(self.active_streams.values())).driver
+        return None
+
+    # ------------------------------------------------------------------
+    # Stream ID generation
+    # ------------------------------------------------------------------
+
+    def _make_stream_id(self, team: Optional[str] = None, url: Optional[str] = None) -> str:
+        """Generate a stream ID from team name or URL."""
+        if team:
+            base_id = team.lower().replace(" ", "-")
+        elif url:
+            base_id = hashlib.md5(url.encode()).hexdigest()[:8]
+        else:
+            base_id = f"stream-{int(time.time())}"
+
+        # Deduplicate if ID already exists
+        stream_id = base_id
+        counter = 2
+        while stream_id in self.active_streams:
+            stream_id = f"{base_id}-{counter}"
+            counter += 1
+        return stream_id
+
+    # ------------------------------------------------------------------
+    # Browser management
+    # ------------------------------------------------------------------
 
     async def start_browser(self):
         """Launch the Playwright browser with uBlock Origin."""
@@ -135,35 +222,52 @@ class StreamKeeper:
         # Handle popup windows (ad popups)
         self.context.on("page", self._on_new_page)
 
-        # Get the first page or create one
-        if self.context.pages:
-            self.page = self.context.pages[0]
-        else:
-            self.page = await self.context.new_page()
-
         logger.info("Browser started successfully")
 
     async def _on_new_page(self, page: Page):
-        """Handle new pages (popup ad windows)."""
+        """Handle new pages (popup ad windows).
+
+        Only auto-close pages that aren't tracked as active streams.
+        """
         await asyncio.sleep(1)  # Let it load briefly
+
+        # Check if this page belongs to an active stream (we created it)
+        for stream in self.active_streams.values():
+            if stream.page is page:
+                return  # It's one of ours, don't touch it
+
         handled = await self.ad_handler.handle_new_page_popup(page)
         if not handled:
             logger.info(f"New page opened: {page.url[:80]}")
 
-    async def watch_url(self, url: str, label: Optional[str] = None) -> str:
-        """Start watching a stream at a direct URL — skip discovery, go straight to monitoring."""
-        if self.is_watching:
-            await self.stop()
+    async def _new_stream_page(self) -> Page:
+        """Create a new browser tab for a stream."""
+        if not self.context:
+            await self.start_browser()
+        return await self.context.new_page()
 
-        self.current_team = label or url.split("/")[-1][:40]
-        logger.info(f"Starting direct watch: {self.current_team} at {url}")
+    # ------------------------------------------------------------------
+    # watch / watch_url — multi-stream versions
+    # ------------------------------------------------------------------
+
+    async def watch_url(self, url: str, label: Optional[str] = None) -> str:
+        """Start watching a stream at a direct URL in a new tab."""
+        if len(self.active_streams) >= self.max_streams:
+            return f"❌ Max streams ({self.max_streams}) reached. Stop one first with `!stop <name>`."
 
         if not self.context:
             await self.start_browser()
 
+        team = label or url.split("/")[-1][:40]
+        stream_id = self._make_stream_id(team=team if label else None, url=url)
+        logger.info(f"Starting direct watch [{stream_id}]: {team} at {url}")
+
+        page = await self._new_stream_page()
+
         try:
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
+            await page.close()
             return f"❌ Failed to navigate to URL: {e}"
 
         # Wait for video element to appear
@@ -171,12 +275,12 @@ class StreamKeeper:
 
         # Dismiss any initial ad overlays
         try:
-            await self.ad_handler.dismiss_overlays(self.page)
+            await self.ad_handler.dismiss_overlays(page)
         except Exception:
             pass
 
         # Check for video element
-        has_video = await self.page.evaluate("""() => {
+        has_video = await page.evaluate("""() => {
             let video = document.querySelector('video');
             if (!video) {
                 const iframes = document.querySelectorAll('iframe');
@@ -194,95 +298,176 @@ class StreamKeeper:
             return true;
         }""")
 
-        # Start health monitoring even if video not found yet (it might load via JS)
-        self.is_watching = True
-        self.health_monitor.history.recovery_count = 0
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        # Create ActiveStream
+        health_mon = HealthMonitor(self.config)
+        health_mon.history.recovery_count = 0
+        stream = ActiveStream(
+            id=stream_id,
+            team=team,
+            page=page,
+            driver=None,
+            health_monitor=health_mon,
+            site="direct",
+            url=url,
+        )
+        stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
+        self.active_streams[stream_id] = stream
 
         if has_video:
             return (
-                f"📺 Now watching: **{self.current_team}**\n"
+                f"📺 Now watching: **{team}** [`{stream_id}`]\n"
                 f"🔗 URL: {url[:60]}...\n"
-                f"🛡️ Ad blocking active | Health monitoring started"
+                f"🛡️ Ad blocking active | Health monitoring started\n"
+                f"📊 Active streams: {len(self.active_streams)}/{self.max_streams}"
             )
         else:
             return (
-                f"⚠️ Navigated to **{self.current_team}** but no video element found yet.\n"
+                f"⚠️ Navigated to **{team}** [`{stream_id}`] but no video element found yet.\n"
                 f"🔗 URL: {url[:60]}...\n"
-                f"🛡️ Health monitoring started — will detect video when it loads"
+                f"🛡️ Health monitoring started — will detect video when it loads\n"
+                f"📊 Active streams: {len(self.active_streams)}/{self.max_streams}"
             )
 
     async def watch(self, team: str, site: Optional[str] = None) -> str:
-        """Start watching a game for the given team."""
-        if self.is_watching:
-            await self.stop()
-
-        self.current_team = team
-        if site:
-            self.current_site = site
-
-        logger.info(f"Starting watch: {team} on {self.current_site}")
+        """Start watching a game for the given team in a new tab."""
+        if len(self.active_streams) >= self.max_streams:
+            return f"❌ Max streams ({self.max_streams}) reached. Stop one first with `!stop <name>`."
 
         if not self.context:
             await self.start_browser()
 
-        # Create site driver
-        self.driver = get_driver(self.page, self.config, self.current_site)
+        use_site = site or self.default_site
+        stream_id = self._make_stream_id(team=team)
+
+        logger.info(f"Starting watch [{stream_id}]: {team} on {use_site}")
+
+        page = await self._new_stream_page()
+
+        # Create site driver for this page
+        driver = get_driver(page, self.config, use_site)
 
         # Navigate to games
-        if not await self.driver.navigate_to_games():
-            return f"❌ Failed to load {self.current_site} game listings"
+        if not await driver.navigate_to_games():
+            await page.close()
+            return f"❌ Failed to load {use_site} game listings"
 
         # Find the game
-        game = await self.driver.find_game(team)
+        game = await driver.find_game(team)
         if not game:
-            return f"❌ No game found for **{team}** on {self.current_site}"
+            await page.close()
+            return f"❌ No game found for **{team}** on {use_site}"
 
         # Open the game page
-        if not await self.driver.open_game(game):
+        if not await driver.open_game(game):
+            await page.close()
             return f"❌ Failed to open game page for: {game.title}"
 
         # List and load stream sources
-        await self.driver.list_sources()
-        if not await self.driver.load_stream(0):
-            return (
-                f"⚠️ Opened game page for **{game.title}** but couldn't find video player. "
-                "The stream might need manual interaction to start."
-            )
+        await driver.list_sources()
+        if not await driver.load_stream(0):
+            # Keep the page open — might need manual interaction
+            pass
 
-        # Start health monitoring
-        self.is_watching = True
-        self.health_monitor.history.recovery_count = 0
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        # Create ActiveStream
+        health_mon = HealthMonitor(self.config)
+        health_mon.history.recovery_count = 0
+        stream = ActiveStream(
+            id=stream_id,
+            team=team,
+            page=page,
+            driver=driver,
+            health_monitor=health_mon,
+            site=use_site,
+        )
+        stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
+        self.active_streams[stream_id] = stream
 
-        sources_count = len(self.driver.available_sources)
+        sources_count = len(driver.available_sources)
         return (
-            f"🏒 Now watching: **{game.title}**\n"
-            f"📺 Site: {self.current_site}\n"
+            f"🏒 Now watching: **{game.title}** [`{stream_id}`]\n"
+            f"📺 Site: {use_site}\n"
             f"🔗 Sources available: {sources_count}\n"
-            f"🛡️ Ad blocking active | Health monitoring started"
+            f"🛡️ Ad blocking active | Health monitoring started\n"
+            f"📊 Active streams: {len(self.active_streams)}/{self.max_streams}"
         )
 
-    async def stop(self) -> str:
-        """Stop watching and clean up."""
-        self.is_watching = False
-        if self._monitor_task:
-            self._monitor_task.cancel()
+    # ------------------------------------------------------------------
+    # stop — per-stream or all
+    # ------------------------------------------------------------------
+
+    async def stop(self, stream_id: Optional[str] = None) -> str:
+        """Stop a specific stream, or all streams if stream_id is None."""
+        if stream_id and stream_id.lower() == "all":
+            stream_id = None  # Treat "all" as stop-everything
+
+        if stream_id:
+            # Find stream by ID (case-insensitive) or partial match
+            stream = self._find_stream(stream_id)
+            if not stream:
+                return f"❌ No active stream matching `{stream_id}`"
+            return await self._stop_stream(stream)
+
+        # Stop all streams
+        if not self.active_streams:
+            return "😴 Nothing is playing"
+
+        names = [s.team for s in self.active_streams.values()]
+        # Copy keys to avoid mutation during iteration
+        for sid in list(self.active_streams.keys()):
+            stream = self.active_streams.get(sid)
+            if stream:
+                await self._stop_stream(stream)
+
+        return f"⏹️ Stopped all streams: {', '.join(names)}"
+
+    async def _stop_stream(self, stream: ActiveStream) -> str:
+        """Stop and clean up a single stream."""
+        stream_id = stream.id
+        team = stream.team
+
+        # Cancel monitor task
+        if stream.monitor_task:
+            stream.monitor_task.cancel()
             try:
-                await self._monitor_task
+                await stream.monitor_task
             except asyncio.CancelledError:
                 pass
-            self._monitor_task = None
 
-        team = self.current_team or "stream"
-        self.current_team = None
-        self.driver = None
-        logger.info("Stopped watching")
-        return f"⏹️ Stopped watching {team}"
+        # Close the page/tab
+        try:
+            if not stream.page.is_closed():
+                await stream.page.close()
+        except Exception as e:
+            logger.warning(f"Error closing page for {stream_id}: {e}")
+
+        # Remove from active streams
+        self.active_streams.pop(stream_id, None)
+
+        logger.info(f"Stopped stream [{stream_id}]: {team}")
+        return f"⏹️ Stopped watching {team} [`{stream_id}`] — {len(self.active_streams)} stream(s) remaining"
+
+    def _find_stream(self, query: str) -> Optional[ActiveStream]:
+        """Find stream by exact ID, or case-insensitive partial match on ID or team name."""
+        q = query.lower().strip()
+
+        # Exact ID match
+        if q in self.active_streams:
+            return self.active_streams[q]
+
+        # Partial match on ID or team name
+        for sid, stream in self.active_streams.items():
+            if q in sid or q in stream.team.lower():
+                return stream
+
+        return None
+
+    # ------------------------------------------------------------------
+    # shutdown
+    # ------------------------------------------------------------------
 
     async def shutdown(self):
-        """Full shutdown — close browser and Playwright."""
-        await self.stop()
+        """Full shutdown — stop all streams, close browser and Playwright."""
+        await self.stop()  # stops all
         if self.context:
             await self.context.close()
             self.context = None
@@ -291,205 +476,291 @@ class StreamKeeper:
             self._playwright = None
         logger.info("StreamKeeper shut down")
 
-    async def get_status(self) -> str:
-        """Get current status as a formatted string."""
-        if not self.is_watching:
+    # ------------------------------------------------------------------
+    # get_status — per-stream or all
+    # ------------------------------------------------------------------
+
+    async def get_status(self, stream_id: Optional[str] = None) -> str:
+        """Get status for a specific stream or all streams."""
+        if not self.active_streams:
             return "😴 Not currently watching anything"
 
-        health = self.health_monitor.stats
-        ads = self.ad_handler.stats
+        if stream_id:
+            stream = self._find_stream(stream_id)
+            if not stream:
+                return f"❌ No active stream matching `{stream_id}`"
+            return self._format_stream_status(stream)
 
+        # All streams summary
+        ads = self.ad_handler.stats
+        lines = [f"📊 **{len(self.active_streams)} active stream(s)** (max {self.max_streams})\n"]
+
+        for stream in self.active_streams.values():
+            lines.append(self._format_stream_status(stream, compact=True))
+
+        lines.append(f"\n🛡️ **Ads blocked**: {ads['requests_blocked']} | Overlays dismissed: {ads['overlays_dismissed']}")
+        return "\n".join(lines)
+
+    def _format_stream_status(self, stream: ActiveStream, compact: bool = False) -> str:
+        """Format status for a single stream."""
+        health = stream.health_monitor.stats
+        uptime = int(time.time() - stream.started_at)
+        uptime_str = f"{uptime // 3600}h{(uptime % 3600) // 60}m" if uptime >= 3600 else f"{uptime // 60}m{uptime % 60}s"
+
+        if compact:
+            state_icon = "🟢" if health["state"] == "playing" else "🟡" if health["state"] in ("loading", "stalled") else "🔴"
+            return (
+                f"{state_icon} **{stream.team}** [`{stream.id}`] — "
+                f"{health['state']} | {health['resolution']} | "
+                f"up {uptime_str} | recoveries: {health['recovery_count']}"
+            )
+
+        source = stream.site if stream.site != "direct" else (stream.url[:50] + "..." if stream.url else "direct URL")
         lines = [
-            f"🏒 **Watching**: {self.current_team} on {self.current_site}",
+            f"🏒 **Watching**: {stream.team} [`{stream.id}`] on {source}",
             f"📊 **Stream**: {health['state']} | {health['resolution']}",
             f"⏱️ **Position**: {health['current_time']} | Buffered to: {health['buffered_to']}",
             f"🔊 **Audio**: {health['audio']} (muted={health['muted']}, vol={health['volume']})",
             f"🔄 **Recoveries**: {health['recovery_count']} | Stall: {health['stall_duration']}",
-            f"🛡️ **Ads blocked**: {ads['requests_blocked']} | Overlays dismissed: {ads['overlays_dismissed']}",
+            f"⏳ **Uptime**: {uptime_str}",
         ]
         return "\n".join(lines)
 
-    async def take_screenshot(self) -> Optional[str]:
-        """Take a screenshot of the current page."""
-        if not self.page:
-            return None
-        path = f"./screenshots/stream-{int(time.time())}.png"
+    # ------------------------------------------------------------------
+    # Per-stream actions
+    # ------------------------------------------------------------------
+
+    async def take_screenshot(self, stream_id: Optional[str] = None) -> Optional[str | list[str]]:
+        """Take a screenshot. If stream_id given, screenshot that stream. Otherwise all."""
         os.makedirs("./screenshots", exist_ok=True)
-        await self.page.screenshot(path=path)
-        logger.info(f"Screenshot saved: {path}")
-        return path
 
-    async def force_unmute(self) -> str:
-        """Force unmute the stream."""
-        if not self.page:
-            return "❌ No active page"
-        success = await self.health_monitor.force_unmute(self.page)
-        return "🔊 Unmuted" if success else "❌ Failed to unmute (no video element found)"
+        if stream_id:
+            stream = self._find_stream(stream_id)
+            if not stream:
+                return None
+            return await self._screenshot_stream(stream)
 
-    async def force_reload(self) -> str:
-        """Force reload the current stream."""
-        if not self.driver:
-            return "❌ No active stream"
-        success = await self.driver.reload_stream()
-        return "🔄 Reloaded" if success else "❌ Reload failed"
+        if not self.active_streams:
+            return None
 
-    async def switch_source(self) -> str:
-        """Switch to the next stream source."""
-        if not self.driver:
-            return "❌ No active stream"
-        success = await self.driver.next_source()
+        # Screenshot all streams
+        paths = []
+        for stream in self.active_streams.values():
+            path = await self._screenshot_stream(stream)
+            if path:
+                paths.append(path)
+        return paths if paths else None
+
+    async def _screenshot_stream(self, stream: ActiveStream) -> Optional[str]:
+        """Take a screenshot of a single stream's page."""
+        try:
+            if stream.page.is_closed():
+                return None
+            path = f"./screenshots/{stream.id}-{int(time.time())}.png"
+            await stream.page.screenshot(path=path)
+            logger.info(f"Screenshot saved: {path}")
+            return path
+        except Exception as e:
+            logger.warning(f"Screenshot failed for {stream.id}: {e}")
+            return None
+
+    async def force_unmute(self, stream_id: Optional[str] = None) -> str:
+        """Force unmute a stream (first stream if no ID given)."""
+        stream = self._resolve_stream(stream_id)
+        if not stream:
+            return "❌ No active stream" if not stream_id else f"❌ No stream matching `{stream_id}`"
+        success = await stream.health_monitor.force_unmute(stream.page)
+        return f"🔊 Unmuted {stream.team}" if success else f"❌ Failed to unmute {stream.team} (no video element found)"
+
+    async def force_reload(self, stream_id: Optional[str] = None) -> str:
+        """Force reload a stream."""
+        stream = self._resolve_stream(stream_id)
+        if not stream:
+            return "❌ No active stream" if not stream_id else f"❌ No stream matching `{stream_id}`"
+        if not stream.driver:
+            # Direct URL watch — reload the page
+            try:
+                await stream.page.reload(wait_until="domcontentloaded", timeout=30000)
+                return f"🔄 Reloaded {stream.team} (page refresh)"
+            except Exception as e:
+                return f"❌ Reload failed for {stream.team}: {e}"
+        success = await stream.driver.reload_stream()
+        return f"🔄 Reloaded {stream.team}" if success else f"❌ Reload failed for {stream.team}"
+
+    async def switch_source(self, stream_id: Optional[str] = None) -> str:
+        """Switch to the next stream source for a stream."""
+        stream = self._resolve_stream(stream_id)
+        if not stream:
+            return "❌ No active stream" if not stream_id else f"❌ No stream matching `{stream_id}`"
+        if not stream.driver:
+            return f"❌ {stream.team} is a direct URL watch — no sources to switch"
+        success = await stream.driver.next_source()
         if success:
-            idx = self.driver.current_source_index
-            name = self.driver.available_sources[idx].name if idx < len(self.driver.available_sources) else "?"
-            return f"🔀 Switched to source: {name}"
-        return "❌ No more sources available"
+            idx = stream.driver.current_source_index
+            name = stream.driver.available_sources[idx].name if idx < len(stream.driver.available_sources) else "?"
+            return f"🔀 Switched {stream.team} to source: {name}"
+        return f"❌ No more sources available for {stream.team}"
+
+    def _resolve_stream(self, stream_id: Optional[str] = None) -> Optional[ActiveStream]:
+        """Resolve a stream by ID, or return the first active stream if None."""
+        if stream_id:
+            return self._find_stream(stream_id)
+        if self.active_streams:
+            return next(iter(self.active_streams.values()))
+        return None
 
     # ------------------------------------------------------------------
-    # Health monitoring loop
+    # Health monitoring loop (per-stream)
     # ------------------------------------------------------------------
 
-    async def _monitor_loop(self):
-        """Main health monitoring loop — runs until stopped."""
-        logger.info("Health monitoring loop started")
-        poll_interval = self.health_monitor.poll_interval
+    async def _monitor_loop(self, stream: ActiveStream):
+        """Health monitoring loop for a single stream — runs until stopped."""
+        logger.info(f"Health monitoring loop started for [{stream.id}]")
+        poll_interval = stream.health_monitor.poll_interval
 
-        while self.is_watching:
+        while stream.id in self.active_streams:
             try:
                 await asyncio.sleep(poll_interval)
-                if not self.is_watching:
+                if stream.id not in self.active_streams:
+                    break
+                if stream.page.is_closed():
+                    logger.warning(f"Page closed for [{stream.id}], removing stream")
+                    self.active_streams.pop(stream.id, None)
                     break
 
                 # Take health snapshot
-                snap = await self.health_monitor.check_health(self.page)
+                await stream.health_monitor.check_health(stream.page)
 
                 # Periodically dismiss any new ad overlays
-                await self.ad_handler.dismiss_overlays(self.page)
+                await self.ad_handler.dismiss_overlays(stream.page)
 
                 # Check if recovery is needed
-                if self.health_monitor.needs_recovery() and not self._recovery_in_progress:
-                    reason = self.health_monitor.get_recovery_reason()
-                    logger.warning(f"Stream unhealthy: {reason}")
-                    await self._attempt_recovery(reason)
+                if stream.health_monitor.needs_recovery() and not stream.recovery_in_progress:
+                    reason = stream.health_monitor.get_recovery_reason()
+                    logger.warning(f"Stream [{stream.id}] unhealthy: {reason}")
+                    await self._attempt_recovery(stream, reason)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Monitor loop error: {e}", exc_info=True)
+                logger.error(f"Monitor loop error [{stream.id}]: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-        logger.info("Health monitoring loop stopped")
+        logger.info(f"Health monitoring loop stopped for [{stream.id}]")
 
-    async def _attempt_recovery(self, reason: str):
-        """Graduated recovery cascade."""
-        if self._recovery_in_progress:
+    async def _attempt_recovery(self, stream: ActiveStream, reason: str):
+        """Graduated recovery cascade for a single stream."""
+        if stream.recovery_in_progress:
             return
-        if self.health_monitor.history.seconds_since_recovery < self.recovery_cooldown:
-            logger.debug("Recovery on cooldown, skipping")
+        if stream.health_monitor.history.seconds_since_recovery < self.recovery_cooldown:
+            logger.debug(f"Recovery on cooldown for [{stream.id}], skipping")
             return
-        if self.health_monitor.history.recovery_count >= self.max_recovery_attempts:
+        if stream.health_monitor.history.recovery_count >= self.max_recovery_attempts:
             logger.error(
-                f"Max recovery attempts ({self.max_recovery_attempts}) reached. "
+                f"Max recovery attempts ({self.max_recovery_attempts}) reached for [{stream.id}]. "
                 "Manual intervention needed."
             )
             if self._discord_notify:
                 await self._discord_notify(
                     f"🚨 **StreamKeeper needs help!**\n"
-                    f"Max recovery attempts reached for {self.current_team}.\n"
+                    f"Max recovery attempts reached for {stream.team} [`{stream.id}`].\n"
                     f"Reason: {reason}\n"
-                    f"Use `!reload` or `!switch` to try manually."
+                    f"Use `!reload {stream.team}` or `!switch {stream.team}` to try manually."
                 )
             return
 
-        self._recovery_in_progress = True
-        self.health_monitor.history.recovery_count += 1
-        self.health_monitor.history.last_recovery = time.time()
-        attempt = self.health_monitor.history.recovery_count
+        stream.recovery_in_progress = True
+        stream.health_monitor.history.recovery_count += 1
+        stream.health_monitor.history.last_recovery = time.time()
+        attempt = stream.health_monitor.history.recovery_count
 
-        logger.info(f"Recovery attempt #{attempt}: {reason}")
+        logger.info(f"Recovery attempt #{attempt} for [{stream.id}]: {reason}")
 
         if self.screenshot_on_failure:
-            await self.take_screenshot()
+            await self._screenshot_stream(stream)
 
         try:
             # Level 1: Soft fix — play + unmute
             if attempt <= 2:
-                logger.info("Recovery L1: Force play + unmute")
-                await self.health_monitor.force_play(self.page)
+                logger.info(f"Recovery L1 [{stream.id}]: Force play + unmute")
+                await stream.health_monitor.force_play(stream.page)
                 await asyncio.sleep(3)
 
-                snap = await self.health_monitor.check_health(self.page)
+                snap = await stream.health_monitor.check_health(stream.page)
                 if snap.is_healthy:
-                    logger.info("Recovery L1 succeeded!")
+                    logger.info(f"Recovery L1 succeeded for [{stream.id}]!")
                     if self._discord_notify:
                         await self._discord_notify(
-                            f"🔧 Auto-recovered (play+unmute) — {self.current_team} stream back"
+                            f"🔧 Auto-recovered (play+unmute) — {stream.team} stream back"
                         )
                     return
 
             # Level 2: Reload the stream iframe / re-click source
             if attempt <= 3:
-                logger.info("Recovery L2: Reload stream")
-                if self.driver:
-                    await self.driver.reload_stream()
-                    await asyncio.sleep(5)
+                logger.info(f"Recovery L2 [{stream.id}]: Reload stream")
+                if stream.driver:
+                    await stream.driver.reload_stream()
+                elif stream.url:
+                    await stream.page.reload(wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(5)
 
-                    snap = await self.health_monitor.check_health(self.page)
-                    if snap.is_healthy:
-                        logger.info("Recovery L2 succeeded!")
-                        if self._discord_notify:
-                            await self._discord_notify(
-                                f"🔄 Auto-recovered (reload) — {self.current_team} stream back"
-                            )
-                        return
+                snap = await stream.health_monitor.check_health(stream.page)
+                if snap.is_healthy:
+                    logger.info(f"Recovery L2 succeeded for [{stream.id}]!")
+                    if self._discord_notify:
+                        await self._discord_notify(
+                            f"🔄 Auto-recovered (reload) — {stream.team} stream back"
+                        )
+                    return
 
             # Level 3: Try next mirror
             if attempt <= 4:
-                logger.info("Recovery L3: Switch to next source")
-                if self.driver:
-                    success = await self.driver.next_source()
+                logger.info(f"Recovery L3 [{stream.id}]: Switch to next source")
+                if stream.driver:
+                    success = await stream.driver.next_source()
                     if success:
                         await asyncio.sleep(5)
-                        snap = await self.health_monitor.check_health(self.page)
+                        snap = await stream.health_monitor.check_health(stream.page)
                         if snap.is_healthy:
-                            logger.info("Recovery L3 succeeded!")
+                            logger.info(f"Recovery L3 succeeded for [{stream.id}]!")
                             if self._discord_notify:
                                 await self._discord_notify(
-                                    f"🔀 Auto-recovered (mirror switch) — {self.current_team} stream back"
+                                    f"🔀 Auto-recovered (mirror switch) — {stream.team} stream back"
                                 )
                             return
 
             # Level 4: Full restart from scratch
-            logger.info("Recovery L4: Full restart")
-            if self.driver and self.current_team:
-                await self.driver.navigate_to_games()
-                game = await self.driver.find_game(self.current_team)
+            logger.info(f"Recovery L4 [{stream.id}]: Full restart")
+            if stream.driver and stream.team:
+                await stream.driver.navigate_to_games()
+                game = await stream.driver.find_game(stream.team)
                 if game:
-                    await self.driver.open_game(game)
-                    await self.driver.list_sources()
-                    await self.driver.load_stream(0)
+                    await stream.driver.open_game(game)
+                    await stream.driver.list_sources()
+                    await stream.driver.load_stream(0)
                     await asyncio.sleep(5)
 
-                    snap = await self.health_monitor.check_health(self.page)
+                    snap = await stream.health_monitor.check_health(stream.page)
                     if snap.is_healthy:
-                        logger.info("Recovery L4 succeeded!")
+                        logger.info(f"Recovery L4 succeeded for [{stream.id}]!")
                         if self._discord_notify:
                             await self._discord_notify(
-                                f"🔁 Auto-recovered (full restart) — {self.current_team} stream back"
+                                f"🔁 Auto-recovered (full restart) — {stream.team} stream back"
                             )
                         return
 
             # If we get here, all recovery failed
-            logger.error("All recovery levels failed")
+            logger.error(f"All recovery levels failed for [{stream.id}]")
             if self._discord_notify:
                 await self._discord_notify(
-                    f"⚠️ Recovery attempt #{attempt} failed for {self.current_team}.\n"
+                    f"⚠️ Recovery attempt #{attempt} failed for {stream.team} [`{stream.id}`].\n"
                     f"Reason: {reason}"
                 )
 
         except Exception as e:
-            logger.error(f"Recovery error: {e}", exc_info=True)
+            logger.error(f"Recovery error [{stream.id}]: {e}", exc_info=True)
         finally:
-            self._recovery_in_progress = False
+            stream.recovery_in_progress = False
 
     # Callback for Discord notifications (set by the bot)
     _discord_notify = None
@@ -534,18 +805,18 @@ class StreamKeeperBot:
 
         @bot.command(name="watch_url")
         async def cmd_watch_url(ctx, *, url: str = ""):
-            """Watch a direct stream URL. Usage: !watch_url https://streamed.pk/watch/..."""
+            """Watch a direct stream URL in a new tab. Usage: !watch_url https://..."""
             if not url:
                 await ctx.send("Usage: `!watch_url <url>` — provide a direct stream URL")
                 return
             label = url.split("/watch/")[-1].split("/")[0] if "/watch/" in url else None
-            await ctx.send(f"🔍 Opening stream...")
+            await ctx.send(f"🔍 Opening stream in new tab...")
             result = await keeper.watch_url(url, label)
             await ctx.send(result)
 
         @bot.command(name="watch")
         async def cmd_watch(ctx, *, args: str = ""):
-            """Start watching a game. Usage: !watch Blues [--site onhockey]"""
+            """Watch a game in a new tab. Usage: !watch Blues [--site onhockey]"""
             parts = args.split("--site")
             team = parts[0].strip()
             site = parts[1].strip() if len(parts) > 1 else None
@@ -560,62 +831,75 @@ class StreamKeeperBot:
                     await ctx.send("Usage: `!watch <team>` e.g. `!watch Blues`")
                 return
 
-            await ctx.send(f"🔍 Looking for {team} game on {site or keeper.current_site}...")
+            await ctx.send(f"🔍 Looking for {team} game on {site or keeper.default_site}...")
             result = await keeper.watch(team, site)
             await ctx.send(result)
 
         @bot.command(name="status")
-        async def cmd_status(ctx):
-            """Show current stream status."""
-            status = await keeper.get_status()
+        async def cmd_status(ctx, *, args: str = ""):
+            """Show stream status. Usage: !status [stream_name]"""
+            stream_id = args.strip() if args.strip() else None
+            status = await keeper.get_status(stream_id)
             await ctx.send(status)
 
         @bot.command(name="stop")
-        async def cmd_stop(ctx):
-            """Stop watching."""
-            result = await keeper.stop()
+        async def cmd_stop(ctx, *, args: str = ""):
+            """Stop a stream. Usage: !stop Blues | !stop all"""
+            target = args.strip() if args.strip() else None
+            result = await keeper.stop(target)
             await ctx.send(result)
 
         @bot.command(name="reload")
-        async def cmd_reload(ctx):
-            """Force reload the stream."""
-            result = await keeper.force_reload()
+        async def cmd_reload(ctx, *, args: str = ""):
+            """Force reload a stream. Usage: !reload [stream_name]"""
+            stream_id = args.strip() if args.strip() else None
+            result = await keeper.force_reload(stream_id)
             await ctx.send(result)
 
         @bot.command(name="unmute")
-        async def cmd_unmute(ctx):
-            """Force unmute the stream."""
-            result = await keeper.force_unmute()
+        async def cmd_unmute(ctx, *, args: str = ""):
+            """Force unmute a stream. Usage: !unmute [stream_name]"""
+            stream_id = args.strip() if args.strip() else None
+            result = await keeper.force_unmute(stream_id)
             await ctx.send(result)
 
         @bot.command(name="switch")
-        async def cmd_switch(ctx):
-            """Switch to next stream mirror."""
-            result = await keeper.switch_source()
+        async def cmd_switch(ctx, *, args: str = ""):
+            """Switch to next stream mirror. Usage: !switch [stream_name]"""
+            stream_id = args.strip() if args.strip() else None
+            result = await keeper.switch_source(stream_id)
             await ctx.send(result)
 
         @bot.command(name="screenshot")
-        async def cmd_screenshot(ctx):
-            """Take a screenshot of the current stream."""
-            path = await keeper.take_screenshot()
-            if path:
-                await ctx.send(file=discord.File(path))
-            else:
+        async def cmd_screenshot(ctx, *, args: str = ""):
+            """Screenshot a stream. Usage: !screenshot [stream_name]"""
+            stream_id = args.strip() if args.strip() else None
+            result = await keeper.take_screenshot(stream_id)
+
+            if result is None:
                 await ctx.send("❌ No active stream to screenshot")
+            elif isinstance(result, list):
+                for path in result:
+                    await ctx.send(file=discord.File(path))
+            else:
+                await ctx.send(file=discord.File(result))
 
         @bot.command(name="sk_help")
         async def cmd_help_sk(ctx):
             """Show StreamKeeper commands."""
             help_text = (
-                "**StreamKeeper Commands:**\n"
-                "`!watch <team>` — Find and watch a game\n"
+                "**StreamKeeper Commands (multi-stream):**\n"
+                "`!watch <team>` — Find and watch a game (new tab)\n"
                 "`!watch <team> --site onhockey` — Use specific site\n"
-                "`!status` — Show stream health\n"
-                "`!reload` — Force reload stream\n"
-                "`!unmute` — Force unmute audio\n"
-                "`!switch` — Try next stream mirror\n"
-                "`!screenshot` — Screenshot current state\n"
-                "`!stop` — Stop watching\n"
+                "`!watch_url <url>` — Watch direct URL (new tab)\n"
+                "`!status` — Show all active streams\n"
+                "`!status <name>` — Show specific stream detail\n"
+                "`!reload <name>` — Force reload stream\n"
+                "`!unmute <name>` — Force unmute audio\n"
+                "`!switch <name>` — Try next stream mirror\n"
+                "`!screenshot [name]` — Screenshot stream(s)\n"
+                "`!stop <name>` — Stop specific stream\n"
+                "`!stop all` — Stop everything\n"
             )
             await ctx.send(help_text)
 
@@ -653,7 +937,7 @@ async def run_cli(config: dict):
         print(f"\n📢 {msg}\n")
     keeper._discord_notify = cli_notify
 
-    print("🏒 StreamKeeper — CLI Mode")
+    print("🏒 StreamKeeper — CLI Mode (multi-stream)")
     print("=" * 40)
 
     team = input("Team to watch (e.g. Blues): ").strip()
@@ -675,30 +959,48 @@ async def run_cli(config: dict):
 
     if keeper.is_watching:
         print("Stream is running. Press Ctrl+C to stop.")
-        print("Commands: status, reload, unmute, switch, screenshot, stop")
+        print("Commands: status, reload, unmute, switch, screenshot, stop, watch <team>, stop <name>, stop all")
         try:
             while keeper.is_watching:
-                # Simple command loop
                 try:
                     cmd = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(None, input),
                         timeout=None
                     )
-                    cmd = cmd.strip().lower()
-                    if cmd == "status":
-                        print(await keeper.get_status())
-                    elif cmd == "reload":
-                        print(await keeper.force_reload())
-                    elif cmd == "unmute":
-                        print(await keeper.force_unmute())
-                    elif cmd == "switch":
-                        print(await keeper.switch_source())
-                    elif cmd == "screenshot":
-                        path = await keeper.take_screenshot()
-                        print(f"Saved: {path}" if path else "Failed")
-                    elif cmd == "stop":
-                        print(await keeper.stop())
-                        break
+                    parts = cmd.strip().split(maxsplit=1)
+                    action = parts[0].lower() if parts else ""
+                    arg = parts[1].strip() if len(parts) > 1 else None
+
+                    if action == "status":
+                        print(await keeper.get_status(arg))
+                    elif action == "reload":
+                        print(await keeper.force_reload(arg))
+                    elif action == "unmute":
+                        print(await keeper.force_unmute(arg))
+                    elif action == "switch":
+                        print(await keeper.switch_source(arg))
+                    elif action == "screenshot":
+                        result = await keeper.take_screenshot(arg)
+                        if isinstance(result, list):
+                            for p in result:
+                                print(f"Saved: {p}")
+                        elif result:
+                            print(f"Saved: {result}")
+                        else:
+                            print("Failed")
+                    elif action == "watch" and arg:
+                        site_parts = arg.split("--site")
+                        t = site_parts[0].strip()
+                        s = site_parts[1].strip() if len(site_parts) > 1 else None
+                        print(await keeper.watch(t, s))
+                    elif action == "watch_url" and arg:
+                        print(await keeper.watch_url(arg))
+                    elif action == "stop":
+                        print(await keeper.stop(arg))
+                        if not keeper.is_watching:
+                            break
+                    else:
+                        print("Unknown command. Try: status, watch <team>, stop <name>, stop all, reload, unmute, switch, screenshot")
                 except EOFError:
                     break
         except KeyboardInterrupt:
