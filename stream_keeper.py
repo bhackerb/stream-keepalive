@@ -459,23 +459,40 @@ class StreamKeeper:
 
     @staticmethod
     def _parse_stream_label(title: str, fallback_url: str = "") -> str:
-        """Extract a human-readable stream label from a page title.
+        """Extract a human-readable stream label from a page title or URL.
 
         Streaming sites typically use titles like:
           "Watch Anaheim Ducks vs Buffalo Sabres Stream Delta 1 - Streamed"
         We extract: "Anaheim Ducks vs Buffalo Sabres"
+
+        If the title is empty/unhelpful, parse the URL slug:
+          "https://streamed.pk/watch/alabama-vs-texas-tech-2453656/admin/1"
+        We extract: "alabama vs texas tech"
         """
         if title and " Stream " in title:
             label = title.split(" Stream ")[0]
             label = label.replace("Watch ", "").strip()
             if label:
                 return label
-        if title:
+        if title and len(title) > 3:
             for suffix in [" - Streamed", " | Streamed", " - OnHockey", " | OnHockey"]:
                 if suffix in title:
                     title = title.split(suffix)[0].strip()
             return title[:60]
-        return fallback_url.split("/")[-1][:40] if fallback_url else "unknown"
+        # Fall back to URL path parsing
+        if fallback_url and "/watch/" in fallback_url:
+            import re
+            # Extract slug after /watch/ e.g. "alabama-vs-texas-tech-2453656"
+            slug = fallback_url.split("/watch/")[1].split("/")[0]
+            # Strip trailing numeric ID
+            slug = re.sub(r'-\d{4,}$', '', slug)
+            # Convert dashes to spaces, title-case
+            label = slug.replace("-", " ").strip().title()
+            if label:
+                return label
+        if fallback_url:
+            return fallback_url.split("/")[-1][:40]
+        return "unknown"
 
     async def keepalive(self) -> str:
         """Scan all open browser tabs, attach health monitors to any with <video> elements.
