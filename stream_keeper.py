@@ -150,6 +150,68 @@ class StreamKeeper:
         if not handled:
             logger.info(f"New page opened: {page.url[:80]}")
 
+    async def watch_url(self, url: str, label: Optional[str] = None) -> str:
+        """Start watching a stream at a direct URL — skip discovery, go straight to monitoring."""
+        if self.is_watching:
+            await self.stop()
+
+        self.current_team = label or url.split("/")[-1][:40]
+        logger.info(f"Starting direct watch: {self.current_team} at {url}")
+
+        if not self.context:
+            await self.start_browser()
+
+        try:
+            await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            return f"❌ Failed to navigate to URL: {e}"
+
+        # Wait for video element to appear
+        await asyncio.sleep(3)
+
+        # Dismiss any initial ad overlays
+        try:
+            await self.ad_handler.dismiss_overlays(self.page)
+        except Exception:
+            pass
+
+        # Check for video element
+        has_video = await self.page.evaluate("""() => {
+            let video = document.querySelector('video');
+            if (!video) {
+                const iframes = document.querySelectorAll('iframe');
+                for (const iframe of iframes) {
+                    try {
+                        const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                        if (doc) { video = doc.querySelector('video'); if (video) break; }
+                    } catch (e) {}
+                }
+            }
+            if (!video) return false;
+            video.muted = false;
+            video.volume = 1.0;
+            video.play().catch(() => {});
+            return true;
+        }""")
+
+        # Start health monitoring even if video not found yet (it might load via JS)
+        self.is_watching = True
+        self.health_monitor.history.recovery_count = 0
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+        if has_video:
+            return (
+                f"📺 Now watching: **{self.current_team}**\n"
+                f"🔗 URL: {url[:60]}...\n"
+                f"🛡️ Ad blocking active | Health monitoring started"
+            )
+        else:
+            return (
+                f"⚠️ Navigated to **{self.current_team}** but no video element found yet.\n"
+                f"🔗 URL: {url[:60]}...\n"
+                f"🛡️ Health monitoring started — will detect video when it loads"
+            )
+
     async def watch(self, team: str, site: Optional[str] = None) -> str:
         """Start watching a game for the given team."""
         if self.is_watching:
@@ -469,6 +531,17 @@ class StreamKeeperBot:
                 ch = bot.get_channel(self.notification_channel_id)
                 if ch:
                     await ch.send("🟢 StreamKeeper is online and ready!")
+
+        @bot.command(name="watch_url")
+        async def cmd_watch_url(ctx, *, url: str = ""):
+            """Watch a direct stream URL. Usage: !watch_url https://streamed.pk/watch/..."""
+            if not url:
+                await ctx.send("Usage: `!watch_url <url>` — provide a direct stream URL")
+                return
+            label = url.split("/watch/")[-1].split("/")[0] if "/watch/" in url else None
+            await ctx.send(f"🔍 Opening stream...")
+            result = await keeper.watch_url(url, label)
+            await ctx.send(result)
 
         @bot.command(name="watch")
         async def cmd_watch(ctx, *, args: str = ""):

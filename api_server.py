@@ -132,6 +132,19 @@ class StreamKeeperAPI:
                 status=400,
             )
 
+        # Check if this is a direct URL watch
+        url = body.get("url", "").strip()
+        if url:
+            label = body.get("label", "").strip() or None
+            logger.info(f"API: watch_url request — url={url[:60]}, label={label}")
+            result = await self.keeper.watch_url(url, label)
+            success = not result.startswith("\u274c")
+            return web.json_response({
+                "success": success,
+                "message": result,
+                "url": url,
+            })
+
         site = body.get("site")
         logger.info(f"API: watch request — team={team}, site={site}")
 
