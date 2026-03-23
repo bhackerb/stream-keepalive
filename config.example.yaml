@@ -18,6 +18,7 @@ browser:
   ublock_origin_path: "./extensions/ublock-origin"  # Path to extracted uBlock Origin
   viewport_width: 1920
   viewport_height: 1080
+  headless: false  # Set true for server-side monitoring without a display (API/health only)
   # Extra Chromium args
   extra_args:
     - "--autoplay-policy=no-user-gesture-required"

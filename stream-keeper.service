@@ -1,0 +1,16 @@
+[Unit]
+Description=StreamKeeper — Sports Stream Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/home/ben/testies/stream-keepalive
+ExecStart=/usr/bin/python3 stream_keeper.py
+Restart=on-failure
+RestartSec=10
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=multi-user.target

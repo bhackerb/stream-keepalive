@@ -204,10 +204,13 @@ class StreamKeeper:
                 "running with network-level ad blocking only"
             )
 
-        # Launch persistent context (headed mode for watching + extensions)
+        # Headless mode: useful for server-side health monitoring without a display
+        headless = browser_cfg.get("headless", False)
+
+        # Launch persistent context
         self.context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir,
-            headless=False,
+            headless=headless,
             channel="chromium",
             args=args,
             viewport={"width": viewport_w, "height": viewport_h},
