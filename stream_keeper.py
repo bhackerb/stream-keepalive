@@ -31,6 +31,7 @@ except ImportError:
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 from ad_handler import AdHandler
+from api_server import StreamKeeperAPI
 from health_monitor import HealthMonitor, StreamState
 from sites import get_driver, BaseSiteDriver
 
@@ -663,9 +664,13 @@ async def main():
     if mode == "discord":
         keeper = StreamKeeper(config)
         bot = StreamKeeperBot(config, keeper)
+        api = StreamKeeperAPI(keeper, config)
 
         # Start browser before bot connects
         await keeper.start_browser()
+
+        # Start API server alongside the Discord bot
+        await api.start()
 
         # Run bot (blocking)
         try:
@@ -673,9 +678,15 @@ async def main():
         except KeyboardInterrupt:
             pass
         finally:
+            await api.stop()
             await keeper.shutdown()
     else:
+        # CLI mode — still start the API server if enabled
+        keeper = StreamKeeper(config)
+        api = StreamKeeperAPI(keeper, config)
+        await api.start()
         await run_cli(config)
+        await api.stop()
 
 
 if __name__ == "__main__":

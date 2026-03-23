@@ -1,6 +1,11 @@
 # StreamKeeper Configuration
 # Copy to config.yaml and fill in your values
 
+api:
+  enabled: true
+  port: 8890
+  api_key: "YOUR_API_KEY"  # For bearer token auth
+
 discord:
   bot_token: "YOUR_DISCORD_BOT_TOKEN"
   command_channel_id: 1234567890  # Channel ID where bot listens for commands
