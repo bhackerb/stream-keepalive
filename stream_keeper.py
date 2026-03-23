@@ -405,6 +405,102 @@ class StreamKeeper:
                 f"📊 Active streams: {len(self.active_streams)}/{self.max_streams}"
             )
 
+    def _get_cdp_base(self) -> str:
+        """Get the CDP base URL for /json/list queries."""
+        remote_url = self.config.get("browser", {}).get("remote_debugging_url", "http://localhost:9222")
+        return remote_url.rstrip("/")
+
+    async def _get_iframe_targets_for_page(self, page_url: str) -> list[dict]:
+        """Get iframe CDP targets belonging to a specific page URL."""
+        import aiohttp as _aiohttp
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.get(f"{self._get_cdp_base()}/json/list") as r:
+                    targets = await r.json()
+        except Exception:
+            return []
+
+        cur_page_url = None
+        iframes: list[dict] = []
+        for t in targets:
+            if t.get("type") == "page":
+                cur_page_url = t.get("url", "")
+            elif t.get("type") == "iframe" and cur_page_url == page_url:
+                iframes.append(t)
+        return iframes
+
+    async def _check_video_health_cdp(self, page_url: str) -> dict | None:
+        """Use CDP to check video health through cross-origin iframes."""
+        iframes = await self._get_iframe_targets_for_page(page_url)
+        if not iframes:
+            return None
+
+        js_check = """(() => {
+            const v = document.querySelector('video');
+            if (!v) return null;
+            return {
+                readyState: v.readyState,
+                currentTime: v.currentTime,
+                paused: v.paused,
+                ended: v.ended,
+                muted: v.muted,
+                volume: v.volume,
+                videoWidth: v.videoWidth,
+                videoHeight: v.videoHeight,
+                networkState: v.networkState,
+                error: v.error ? {code: v.error.code, message: v.error.message} : null,
+                bufferedEnd: v.buffered && v.buffered.length > 0 ? v.buffered.end(v.buffered.length - 1) : 0
+            };
+        })()"""
+
+        import aiohttp as _aiohttp
+        async with _aiohttp.ClientSession() as sess:
+            for iframe in iframes:
+                ws_url = iframe.get("webSocketDebuggerUrl")
+                if not ws_url:
+                    continue
+                try:
+                    async with sess.ws_connect(ws_url) as ws:
+                        await ws.send_json({
+                            "id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": js_check, "returnByValue": True}
+                        })
+                        resp = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                        result = resp.get("result", {}).get("result", {}).get("value")
+                        if result and isinstance(result, dict) and "readyState" in result:
+                            return result
+                except Exception:
+                    continue
+        return None
+
+    async def _force_play_cdp(self, page_url: str) -> bool:
+        """Use CDP to force play + unmute the video through cross-origin iframes."""
+        iframes = await self._get_iframe_targets_for_page(page_url)
+
+        import aiohttp as _aiohttp
+        for iframe in iframes:
+            ws_url = iframe.get("webSocketDebuggerUrl")
+            if not ws_url:
+                continue
+            try:
+                async with _aiohttp.ClientSession() as sess:
+                    async with sess.ws_connect(ws_url) as ws:
+                        await ws.send_json({
+                            "id": 1, "method": "Runtime.evaluate",
+                            "params": {
+                                "expression": "(() => { const v = document.querySelector('video'); if (!v) return false; v.play().catch(()=>{}); v.muted = false; v.volume = 1.0; return true; })()",
+                                "returnByValue": True
+                            }
+                        })
+                        resp = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                        val = resp.get("result", {}).get("result", {}).get("value", False)
+                        if val:
+                            logger.info(f"CDP force play on iframe: {iframe.get('url', '')[:60]}")
+                            return True
+            except Exception:
+                continue
+        return False
+
     async def _get_urls_with_video_cdp(self) -> set:
         """Query CDP iframe targets directly to find which page URLs have video players.
 
@@ -412,7 +508,7 @@ class StreamKeeper:
         Uses the CDP /json/list ordering: iframe targets follow their parent page target.
         """
         remote_url = self.config.get("browser", {}).get("remote_debugging_url", "http://localhost:9222")
-        cdp_base = remote_url.rstrip("/").rsplit("/", 1)[0] if "/" in remote_url.split("://", 1)[-1] else remote_url
+        cdp_base = remote_url.rstrip("/")
 
         import aiohttp as _aiohttp
         try:
@@ -905,14 +1001,40 @@ class StreamKeeper:
                 # Take health snapshot
                 snap = await stream.health_monitor.check_health(stream.page)
 
-                # If video element is unreachable (cross-origin iframe), fall back
-                # to page-level liveness checks instead of triggering false recovery
+                # If video element is unreachable (cross-origin iframe), use CDP
                 if snap.state == StreamState.NO_VIDEO:
                     consecutive_no_video += 1
-                    if consecutive_no_video >= 3 and stream.site == "keepalive":
-                        snap = await stream.health_monitor.check_health_page_level(stream.page)
-                        if snap.is_healthy:
+                    if consecutive_no_video >= 2 and stream.url and self.config.get("browser", {}).get("remote_debugging_url"):
+                        # Try CDP to reach the video through cross-origin iframes
+                        cdp_health = await self._check_video_health_cdp(stream.url)
+                        if cdp_health:
+                            # Map CDP result to a HealthSnapshot
+                            snap.ready_state = cdp_health.get("readyState", 0)
+                            snap.current_time = cdp_health.get("currentTime", 0)
+                            snap.paused = cdp_health.get("paused", False)
+                            snap.ended = cdp_health.get("ended", False)
+                            snap.muted = cdp_health.get("muted", False)
+                            snap.volume = cdp_health.get("volume", 1.0)
+                            snap.video_width = cdp_health.get("videoWidth", 0)
+                            snap.video_height = cdp_health.get("videoHeight", 0)
+                            snap.buffered_end = cdp_health.get("bufferedEnd", 0)
+                            err = cdp_health.get("error")
+                            if err:
+                                snap.error_code = err.get("code")
+                                snap.error_message = err.get("message", "")
+                            snap.state = stream.health_monitor._determine_state(snap)
+                            stream.health_monitor.history.add(snap)
+                            if snap.state == StreamState.PLAYING:
+                                consecutive_no_video = 0
+                                logger.info(f"[{stream.id}] CDP health: PLAYING {snap.video_width}x{snap.video_height} @ {snap.current_time:.1f}s")
+                            elif snap.state in (StreamState.FROZEN, StreamState.STALLED, StreamState.ERROR):
+                                logger.warning(f"[{stream.id}] CDP health: {snap.state.value}")
                             continue
+                        else:
+                            # CDP found no video either — page-level fallback
+                            snap = await stream.health_monitor.check_health_page_level(stream.page)
+                            if snap.is_healthy:
+                                continue
                 else:
                     consecutive_no_video = 0
 
@@ -968,7 +1090,22 @@ class StreamKeeper:
             await self._screenshot_stream(stream)
 
         try:
-            # Level 1: Soft fix — play + unmute
+            # Level 0: CDP force play (for cross-origin iframe streams)
+            if attempt <= 2 and stream.url and self.config.get("browser", {}).get("remote_debugging_url"):
+                logger.info(f"Recovery L0 [{stream.id}]: CDP force play through iframe")
+                cdp_ok = await self._force_play_cdp(stream.url)
+                if cdp_ok:
+                    await asyncio.sleep(3)
+                    cdp_health = await self._check_video_health_cdp(stream.url)
+                    if cdp_health and cdp_health.get("readyState", 0) >= 3 and cdp_health.get("currentTime", 0) > 0:
+                        logger.info(f"Recovery L0 succeeded for [{stream.id}] via CDP!")
+                        if self._discord_notify:
+                            await self._discord_notify(
+                                f"🔧 Auto-recovered (CDP play) — {stream.team} stream back"
+                            )
+                        return
+
+            # Level 1: Soft fix — play + unmute (direct page, non-iframe)
             if attempt <= 2:
                 logger.info(f"Recovery L1 [{stream.id}]: Force play + unmute")
                 await stream.health_monitor.force_play(stream.page)
