@@ -1058,8 +1058,28 @@ async def main():
         finally:
             await api.stop()
             await keeper.shutdown()
+    elif config.get("api", {}).get("enabled"):
+        # API-only mode — no Discord, no CLI, just the HTTP API
+        keeper = StreamKeeper(config)
+        api = StreamKeeperAPI(keeper, config)
+
+        await keeper.start_browser()
+        await api.start()
+
+        logger.info("StreamKeeper running in API-only mode (no Discord, no CLI)")
+        logger.info(f"API server: http://0.0.0.0:{config.get('api', {}).get('port', 8890)}")
+
+        # Keep running until interrupted
+        try:
+            while True:
+                await asyncio.sleep(60)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            await api.stop()
+            await keeper.shutdown()
     else:
-        # CLI mode — still start the API server if enabled
+        # CLI mode
         keeper = StreamKeeper(config)
         api = StreamKeeperAPI(keeper, config)
         await api.start()
