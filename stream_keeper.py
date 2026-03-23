@@ -273,33 +273,65 @@ class StreamKeeper:
             await page.close()
             return f"❌ Failed to navigate to URL: {e}"
 
-        # Wait for video element to appear
-        await asyncio.sleep(3)
+        # Aggressive startup: multiple rounds of overlay dismissal + video detection
+        # Streaming sites often have layered ads that appear after initial load
+        has_video = False
+        for attempt in range(5):
+            await asyncio.sleep(3 if attempt == 0 else 2)
 
-        # Dismiss any initial ad overlays
-        try:
-            await self.ad_handler.dismiss_overlays(page)
-        except Exception:
-            pass
+            # Dismiss overlays
+            try:
+                dismissed = await self.ad_handler.dismiss_overlays(page)
+                if dismissed > 0:
+                    logger.info(f"[{stream_id}] Startup round {attempt+1}: dismissed {dismissed} overlays")
+            except Exception:
+                pass
 
-        # Check for video element
-        has_video = await page.evaluate("""() => {
-            let video = document.querySelector('video');
-            if (!video) {
-                const iframes = document.querySelectorAll('iframe');
-                for (const iframe of iframes) {
-                    try {
-                        const doc = iframe.contentDocument || iframe.contentWindow?.document;
-                        if (doc) { video = doc.querySelector('video'); if (video) break; }
-                    } catch (e) {}
+            # Click any visible play buttons or stream source links
+            try:
+                await page.evaluate("""() => {
+                    // Click play buttons
+                    const playBtns = document.querySelectorAll(
+                        'button[class*="play"], [class*="play-btn"], [class*="play-button"],' +
+                        'div[class*="play"], svg[class*="play"], [aria-label*="play" i],' +
+                        '.vjs-big-play-button, .jw-icon-playback, [data-plyr="play"]'
+                    );
+                    for (const btn of playBtns) {
+                        if (btn.offsetParent !== null) { btn.click(); break; }
+                    }
+                    // Click stream source links (first available)
+                    const sources = document.querySelectorAll(
+                        'a[href*="stream"], a[href*="player"], .source-link, .stream-link'
+                    );
+                    for (const src of sources) {
+                        if (src.offsetParent !== null) { src.click(); break; }
+                    }
+                }""")
+            except Exception:
+                pass
+
+            # Check for video element
+            has_video = await page.evaluate("""() => {
+                let video = document.querySelector('video');
+                if (!video) {
+                    const iframes = document.querySelectorAll('iframe');
+                    for (const iframe of iframes) {
+                        try {
+                            const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                            if (doc) { video = doc.querySelector('video'); if (video) break; }
+                        } catch (e) {}
+                    }
                 }
-            }
-            if (!video) return false;
-            video.muted = false;
-            video.volume = 1.0;
-            video.play().catch(() => {});
-            return true;
-        }""")
+                if (!video) return false;
+                video.muted = false;
+                video.volume = 1.0;
+                video.play().catch(() => {});
+                return true;
+            }""")
+
+            if has_video:
+                logger.info(f"[{stream_id}] Video found after {attempt+1} startup rounds")
+                break
 
         # Create ActiveStream
         health_mon = HealthMonitor(self.config)
