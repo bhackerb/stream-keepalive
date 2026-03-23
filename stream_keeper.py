@@ -206,18 +206,28 @@ class StreamKeeper:
 
         # Headless mode: useful for server-side health monitoring without a display
         headless = browser_cfg.get("headless", False)
+        channel = browser_cfg.get("channel", "chromium")
+        remote_debugging_url = browser_cfg.get("remote_debugging_url")
 
-        # Launch persistent context
-        self.context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir,
-            headless=headless,
-            channel="chromium",
-            args=args,
-            viewport={"width": viewport_w, "height": viewport_h},
-            ignore_default_args=["--disable-extensions"],
-            # Accept all permissions
-            permissions=["geolocation"],
-        )
+        if remote_debugging_url:
+            # Connect to an already-running Chrome via CDP
+            logger.info(f"Connecting to existing browser at {remote_debugging_url}")
+            browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
+            if browser.contexts:
+                self.context = browser.contexts[0]
+            else:
+                self.context = await browser.new_context()
+        else:
+            # Launch a new persistent context
+            self.context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=headless,
+                channel=channel,
+                args=args,
+                viewport={"width": viewport_w, "height": viewport_h},
+                ignore_default_args=["--disable-extensions"],
+                permissions=["geolocation"],
+            )
 
         # Set up ad blocking on the context
         await self.ad_handler.setup_network_blocking(self.context)
@@ -363,6 +373,58 @@ class StreamKeeper:
                 f"📊 Active streams: {len(self.active_streams)}/{self.max_streams}"
             )
 
+    async def _get_urls_with_video_cdp(self) -> set:
+        """Query CDP iframe targets directly to find which page URLs have video players.
+
+        Handles doubly-nested cross-origin iframes that Playwright can't traverse.
+        Uses the CDP /json/list ordering: iframe targets follow their parent page target.
+        """
+        remote_url = self.config.get("browser", {}).get("remote_debugging_url", "http://localhost:9222")
+        cdp_base = remote_url.rstrip("/").rsplit("/", 1)[0] if "/" in remote_url.split("://", 1)[-1] else remote_url
+
+        import aiohttp as _aiohttp
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.get(f"{cdp_base}/json/list") as r:
+                    targets = await r.json()
+        except Exception:
+            return set()
+
+        # Group: iframes that appear between two page entries belong to the preceding page
+        groups: list[tuple[dict, list[dict]]] = []
+        cur_page: dict | None = None
+        cur_iframes: list[dict] = []
+        for t in targets:
+            if t.get("type") == "page":
+                if cur_page:
+                    groups.append((cur_page, cur_iframes))
+                cur_page, cur_iframes = t, []
+            elif t.get("type") == "iframe" and cur_page:
+                cur_iframes.append(t)
+        if cur_page:
+            groups.append((cur_page, cur_iframes))
+
+        pages_with_video: set[str] = set()
+        async with _aiohttp.ClientSession() as sess:
+            for page_target, iframes in groups:
+                for iframe in iframes:
+                    ws_url = iframe.get("webSocketDebuggerUrl")
+                    if not ws_url:
+                        continue
+                    try:
+                        async with sess.ws_connect(ws_url) as ws:
+                            await ws.send_json({"id": 1, "method": "Runtime.evaluate",
+                                               "params": {"expression": "!!document.querySelector('video')",
+                                                          "returnByValue": True}})
+                            resp = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                            has_vid = resp.get("result", {}).get("result", {}).get("value", False)
+                            if has_vid:
+                                pages_with_video.add(page_target["url"])
+                                break
+                    except Exception:
+                        continue
+        return pages_with_video
+
     async def keepalive(self) -> str:
         """Scan all open browser tabs, attach health monitors to any with <video> elements."""
         if not self.context:
@@ -373,28 +435,29 @@ class StreamKeeper:
         skipped = 0
         already = set(s.page for s in self.active_streams.values())
 
+        # Pre-fetch CDP-based video detection for cross-origin iframes
+        cdp_video_urls = await self._get_urls_with_video_cdp()
+
         for page in pages:
             if page in already:
                 skipped += 1
                 continue
 
-            # Check if page has a video element
+            # Check if page has a video element — try frames first, fall back to CDP iframe scan
             try:
-                has_video = await page.evaluate("""() => {
-                    let video = document.querySelector('video');
-                    if (!video) {
-                        const iframes = document.querySelectorAll('iframe');
-                        for (const iframe of iframes) {
-                            try {
-                                const doc = iframe.contentDocument || iframe.contentWindow?.document;
-                                if (doc) { video = doc.querySelector('video'); if (video) break; }
-                            } catch (e) {}
-                        }
-                    }
-                    return !!video;
-                }""")
+                has_video = False
+                for frame in page.frames:
+                    try:
+                        has_video = await frame.evaluate("() => !!document.querySelector('video')")
+                        if has_video:
+                            break
+                    except Exception:
+                        continue
             except Exception:
-                continue
+                has_video = False
+
+            if not has_video:
+                has_video = page.url in cdp_video_urls
 
             if not has_video:
                 continue
