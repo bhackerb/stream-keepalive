@@ -47,6 +47,7 @@ class StreamKeeperAPI:
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/status", self.handle_status)
         self.app.router.add_post("/watch", self.handle_watch)
+        self.app.router.add_post("/keepalive", self.handle_keepalive)
         self.app.router.add_post("/stop", self.handle_stop)
         self.app.router.add_post("/reload", self.handle_reload)
         self.app.router.add_post("/unmute", self.handle_unmute)
@@ -146,6 +147,13 @@ class StreamKeeperAPI:
                 "recovery_count": health["recovery_count"],
             },
         }
+
+    async def handle_keepalive(self, _request: web.Request) -> web.Response:
+        """Scan all open tabs and attach health monitors to any with video elements."""
+        logger.info("API: keepalive request")
+        result = await self.keeper.keepalive()
+        success = not result.startswith("\u274c")
+        return web.json_response({"success": success, "message": result})
 
     async def handle_watch(self, request: web.Request) -> web.Response:
         """Start watching a game in a new tab.

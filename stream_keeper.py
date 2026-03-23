@@ -363,6 +363,81 @@ class StreamKeeper:
                 f"📊 Active streams: {len(self.active_streams)}/{self.max_streams}"
             )
 
+    async def keepalive(self) -> str:
+        """Scan all open browser tabs, attach health monitors to any with <video> elements."""
+        if not self.context:
+            return "❌ Browser not started. Start it first with a watch command."
+
+        pages = self.context.pages
+        attached = 0
+        skipped = 0
+        already = set(s.page for s in self.active_streams.values())
+
+        for page in pages:
+            if page in already:
+                skipped += 1
+                continue
+
+            # Check if page has a video element
+            try:
+                has_video = await page.evaluate("""() => {
+                    let video = document.querySelector('video');
+                    if (!video) {
+                        const iframes = document.querySelectorAll('iframe');
+                        for (const iframe of iframes) {
+                            try {
+                                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                                if (doc) { video = doc.querySelector('video'); if (video) break; }
+                            } catch (e) {}
+                        }
+                    }
+                    return !!video;
+                }""")
+            except Exception:
+                continue
+
+            if not has_video:
+                continue
+
+            if len(self.active_streams) >= self.max_streams:
+                break
+
+            # Extract a label from the page title or URL
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
+            label = title[:50] if title else page.url.split("/")[-1][:40]
+            stream_id = self._make_stream_id(team=label)
+
+            logger.info(f"[keepalive] Attaching monitor to: {label} [{stream_id}]")
+
+            health_mon = HealthMonitor(self.config)
+            stream = ActiveStream(
+                id=stream_id,
+                team=label,
+                page=page,
+                driver=None,
+                health_monitor=health_mon,
+                site="keepalive",
+                url=page.url,
+            )
+            stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
+            self.active_streams[stream_id] = stream
+            attached += 1
+
+        if attached == 0:
+            return (
+                f"😴 No tabs with video elements found ({len(pages)} tabs open, {skipped} already monitored).\n"
+                "Open your streams in the browser first, then run keepalive again."
+            )
+
+        return (
+            f"🛡️ **Keepalive active** — monitoring {attached} new stream{'s' if attached != 1 else ''}\n"
+            f"📺 Total monitored: {len(self.active_streams)}/{self.max_streams}\n"
+            f"🔄 Health check every {self.config.get('health', {}).get('poll_interval_seconds', 5)}s | Auto-recovery enabled"
+        )
+
     async def watch(self, team: str, site: Optional[str] = None) -> str:
         """Start watching a game for the given team in a new tab."""
         if len(self.active_streams) >= self.max_streams:
@@ -837,6 +912,12 @@ class StreamKeeperBot:
                 ch = bot.get_channel(self.notification_channel_id)
                 if ch:
                     await ch.send("🟢 StreamKeeper is online and ready!")
+
+        @bot.command(name="keepalive")
+        async def cmd_keepalive(ctx):
+            """Monitor all open tabs with video streams. Open your streams first, then run this."""
+            result = await keeper.keepalive()
+            await ctx.send(result)
 
         @bot.command(name="watch_url")
         async def cmd_watch_url(ctx, *, url: str = ""):
