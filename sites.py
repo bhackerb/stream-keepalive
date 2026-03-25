@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 from dataclasses import dataclass
 
+import aiohttp
 from playwright.async_api import Page
 
 logger = logging.getLogger("stream-keeper.sites")
@@ -161,7 +162,7 @@ class StreamedPKDriver(BaseSiteDriver):
 
     async def navigate_to_games(self) -> bool:
         """Navigate to the hockey game listings."""
-        path = self.site_config.get("game_list_path", "/category/ice-hockey")
+        path = self.site_config.get("game_list_path", "/category/hockey")
         url = f"{self.base_url}{path}"
         logger.info(f"Navigating to game listings: {url}")
         try:
@@ -173,15 +174,74 @@ class StreamedPKDriver(BaseSiteDriver):
             logger.error(f"Failed to navigate to game listings: {e}")
             return False
 
-    async def find_game(self, team: str) -> Optional[GameInfo]:
-        """Find a game by team name on the listings page."""
+    async def _find_game_via_api(self, team: str, category: str = "hockey") -> Optional[GameInfo]:
+        """Find a game using the streamed.pk JSON API (much more reliable than DOM scraping)."""
         team_lower = team.lower()
+        api_url = f"{self.base_url}/api/matches/{category}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"API returned {resp.status} for {api_url}")
+                        return None
+                    matches = await resp.json()
+        except Exception as e:
+            logger.warning(f"API request failed: {e}")
+            return None
+
+        for match in matches:
+            teams = match.get("teams", {})
+            home_name = teams.get("home", {}).get("name", "")
+            away_name = teams.get("away", {}).get("name", "")
+            title = match.get("title", "")
+            match_id = match.get("id", "")
+
+            # Check if team name matches (fuzzy: check city name, full name, or partial)
+            names_to_check = [home_name.lower(), away_name.lower(), title.lower()]
+            team_parts = team_lower.split()
+
+            found = any(team_lower in name for name in names_to_check)
+            if not found:
+                # Try matching just the team nickname (e.g., "Blues" matches "St. Louis Blues")
+                found = any(
+                    part in name
+                    for part in team_parts
+                    for name in names_to_check
+                    if len(part) > 3  # Skip short words like "St." or "vs"
+                )
+
+            if found:
+                # Build the game URL: /watch/{id}
+                game_url = f"/watch/{match_id}"
+                sources = match.get("sources", [])
+                game = GameInfo(
+                    title=title or f"{home_name} vs {away_name}",
+                    teams=[home_name, away_name],
+                    url=game_url,
+                    is_live=True,
+                )
+                # Store sources for later use
+                game.api_sources = sources
+                logger.info(f"API found game: {game.title} ({len(sources)} sources)")
+                self.current_game = game
+                return game
+
+        logger.warning(f"API: No games found for team: {team}")
+        return None
+
+    async def find_game(self, team: str) -> Optional[GameInfo]:
+        """Find a game by team name — API first, DOM scraping fallback."""
         logger.info(f"Searching for game with team: {team}")
 
-        # Strategy 1: Look for links/cards containing the team name
+        # Strategy 0 (preferred): Use the streamed.pk JSON API
+        game = await self._find_game_via_api(team)
+        if game:
+            return game
+
+        # Strategy 1: Look for links/cards containing the team name in DOM
+        team_lower = team.lower()
         games_found = await self.page.evaluate("""(teamName) => {
             const results = [];
-            // Look for any clickable element containing the team name
             const allLinks = document.querySelectorAll('a');
             for (const link of allLinks) {
                 const text = link.innerText || link.textContent || '';
@@ -209,11 +269,10 @@ class StreamedPKDriver(BaseSiteDriver):
             logger.warning(f"No games found for team: {team}")
             return None
 
-        # Pick the first (most relevant) result
         game_data = games_found[0]
         game = GameInfo(
             title=game_data["text"],
-            teams=[team],  # We know at least this team is playing
+            teams=[team],
             url=game_data.get("href"),
             is_live=game_data.get("isLive", False),
         )
@@ -221,29 +280,82 @@ class StreamedPKDriver(BaseSiteDriver):
         self.current_game = game
         return game
 
+    async def _fetch_stream_sources_api(self, game: GameInfo) -> list[dict]:
+        """Fetch stream URLs from the streamed.pk API for a game's sources."""
+        all_streams = []
+        api_sources = getattr(game, 'api_sources', None) or []
+
+        # Default to admin source if no API sources available
+        if not api_sources:
+            return all_streams
+
+        for src in api_sources:
+            source_name = src.get("source", "")
+            source_id = src.get("id", "")
+            if not source_id:
+                continue
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = f"{self.base_url}/api/stream/{source_name}/{source_id}"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            streams = await resp.json()
+                            for s in streams:
+                                s["_source_name"] = source_name
+                                all_streams.append(s)
+            except Exception as e:
+                logger.warning(f"Failed to fetch streams for {source_name}/{source_id}: {e}")
+
+        # Sort: admin first, then by viewers descending
+        all_streams.sort(key=lambda s: (
+            0 if s.get("_source_name") == "admin" else 1,
+            -(s.get("viewers", 0))
+        ))
+        return all_streams
+
     async def open_game(self, game: GameInfo) -> bool:
-        """Navigate to the game's stream page."""
+        """Navigate to the game's stream page and fetch API sources."""
         if not game.url:
             logger.error("Game has no URL")
             return False
 
         logger.info(f"Opening game page: {game.url}")
         try:
-            # Handle relative URLs
             url = game.url if game.url.startswith("http") else f"{self.base_url}{game.url}"
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
             await self._dismiss_initial_ads()
+
+            # Pre-fetch stream sources via API
+            api_streams = await self._fetch_stream_sources_api(game)
+            if api_streams:
+                self._api_streams = api_streams
+                logger.info(f"API found {len(api_streams)} stream options across sources")
             return True
         except Exception as e:
             logger.error(f"Failed to open game page: {e}")
             return False
 
     async def list_sources(self) -> list[StreamSource]:
-        """List available stream sources on the game page."""
+        """List available stream sources — prefer API data over DOM scraping."""
+        api_streams = getattr(self, '_api_streams', None) or []
+
+        if api_streams:
+            self.available_sources = [
+                StreamSource(
+                    name=f"{s.get('_source_name', '?')} stream {s.get('streamNo', '?')} "
+                         f"({'HD' if s.get('hd') else 'SD'}, {s.get('viewers', 0)} viewers)",
+                    url=s.get("embedUrl"),
+                    element_index=i
+                )
+                for i, s in enumerate(api_streams)
+            ]
+            logger.info(f"Found {len(self.available_sources)} stream sources via API")
+            return self.available_sources
+
+        # Fallback: DOM scraping
         sources = await self.page.evaluate("""() => {
             const results = [];
-            // Look for stream source links/buttons
             const candidates = document.querySelectorAll(
                 'a[href*="stream"], a[href*="source"], a[href*="link"],' +
                 'button[class*="source"], [class*="stream-link"],' +
@@ -264,26 +376,49 @@ class StreamedPKDriver(BaseSiteDriver):
         }""")
 
         self.available_sources = [
-            StreamSource(
-                name=s["name"],
-                url=s.get("href"),
-                element_index=s["index"]
-            )
+            StreamSource(name=s["name"], url=s.get("href"), element_index=s["index"])
             for s in sources
         ]
-        logger.info(f"Found {len(self.available_sources)} stream sources")
+        logger.info(f"Found {len(self.available_sources)} stream sources via DOM")
         return self.available_sources
 
     async def load_stream(self, source_index: int = 0) -> bool:
-        """Click a stream source and wait for the video player to appear."""
-        self.current_source_index = source_index
+        """Load a stream source.
 
-        # If we have sources, click the right one
-        if self.available_sources and source_index < len(self.available_sources):
+        In CDP mode (user's browser), stay on the watch page — the stream loads
+        in an iframe and the user gets theater mode + source selection UI.
+        In headless mode, navigate directly to the embed URL for the video.
+        """
+        self.current_source_index = source_index
+        api_streams = getattr(self, '_api_streams', None) or []
+
+        # Check if we're on a streamed.pk watch page (CDP mode — user's browser)
+        current_url = self.page.url or ""
+        on_watch_page = "streamed.pk/watch/" in current_url
+
+        if api_streams and source_index < len(api_streams):
+            stream = api_streams[source_index]
+            embed_url = stream.get("embedUrl")
+            source_name = stream.get("_source_name", "?")
+            stream_no = stream.get("streamNo", "?")
+
+            if on_watch_page:
+                # CDP mode: stay on watch page, the site loads the stream in an iframe.
+                # Just wait for the iframe to appear — don't navigate away.
+                logger.info(f"Watch page mode: waiting for {source_name} stream #{stream_no} to load in iframe")
+                await asyncio.sleep(5)
+            elif embed_url:
+                # Headless mode: navigate directly to the embed URL
+                logger.info(f"Loading embed URL: {source_name} stream #{stream_no} — {embed_url}")
+                try:
+                    await self.page.goto(embed_url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(3)
+                    await self._dismiss_initial_ads()
+                except Exception as e:
+                    logger.warning(f"Failed to navigate to embed URL: {e}")
+        elif self.available_sources and source_index < len(self.available_sources):
             source = self.available_sources[source_index]
             logger.info(f"Loading stream source: {source.name}")
-
-            # Click the source link
             try:
                 source_links = await self.page.query_selector_all(
                     'a[href*="stream"], a[href*="source"], .source-item a, .stream-option a'
@@ -294,14 +429,12 @@ class StreamedPKDriver(BaseSiteDriver):
             except Exception as e:
                 logger.warning(f"Failed to click source link: {e}")
 
-        # Dismiss any ads that appeared
         await self._dismiss_initial_ads()
 
         # Wait for video element
         for attempt in range(10):
             if await self._has_video_element():
                 logger.info("Video element found!")
-                # Try to auto-play and unmute
                 await self.page.evaluate("""() => {
                     const videos = document.querySelectorAll('video');
                     for (const v of videos) {
@@ -309,7 +442,6 @@ class StreamedPKDriver(BaseSiteDriver):
                         v.volume = 1.0;
                         v.play().catch(() => {});
                     }
-                    // Also check iframes
                     for (const iframe of document.querySelectorAll('iframe')) {
                         try {
                             const doc = iframe.contentDocument || iframe.contentWindow?.document;

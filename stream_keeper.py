@@ -211,18 +211,30 @@ class StreamKeeper:
         channel = browser_cfg.get("channel", "chromium")
         remote_debugging_url = browser_cfg.get("remote_debugging_url")
 
+        cdp_connected = False
         if remote_debugging_url:
-            # Connect to an already-running Chrome via CDP
-            self._cdp_url = remote_debugging_url
-            logger.info(f"Connecting to existing browser at {remote_debugging_url}")
-            self._browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
-            if self._browser.contexts:
-                self.context = self._browser.contexts[0]
-            else:
-                self.context = await self._browser.new_context()
-            page_count = len(self.context.pages) if self.context else 0
-            logger.info(f"CDP connected — {page_count} existing tab(s) found")
-        else:
+            # Try to connect to an already-running Chrome via CDP
+            try:
+                import aiohttp as _aiohttp_check
+                async with _aiohttp_check.ClientSession() as sess:
+                    async with sess.get(f"{remote_debugging_url.rstrip('/')}/json/version", timeout=_aiohttp_check.ClientTimeout(total=2)) as r:
+                        if r.status == 200:
+                            self._cdp_url = remote_debugging_url
+                            logger.info(f"Connecting to existing browser at {remote_debugging_url}")
+                            self._browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
+                            if self._browser.contexts:
+                                self.context = self._browser.contexts[0]
+                            else:
+                                self.context = await self._browser.new_context()
+                            page_count = len(self.context.pages) if self.context else 0
+                            logger.info(f"CDP connected — {page_count} existing tab(s) found")
+                            cdp_connected = True
+                        else:
+                            logger.warning(f"CDP endpoint returned {r.status} — falling back to headless browser")
+            except Exception as e:
+                logger.warning(f"Stream Chrome not running at {remote_debugging_url} ({e}) — falling back to headless browser")
+
+        if not cdp_connected:
             # Launch a new persistent context
             self.context = await self._playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -425,8 +437,10 @@ class StreamKeeper:
         for t in targets:
             if t.get("type") == "page":
                 cur_page_url = t.get("url", "")
-            elif t.get("type") == "iframe" and cur_page_url == page_url:
-                iframes.append(t)
+            elif t.get("type") == "iframe" and cur_page_url:
+                # Match by exact URL or by common path prefix (handles URL changes)
+                if cur_page_url == page_url or (page_url and page_url.split("?")[0] in cur_page_url):
+                    iframes.append(t)
         return iframes
 
     async def _check_video_health_cdp(self, page_url: str) -> dict | None:
@@ -474,7 +488,10 @@ class StreamKeeper:
         return None
 
     async def _force_play_cdp(self, page_url: str) -> bool:
-        """Use CDP to force play + unmute the video through cross-origin iframes."""
+        """Use CDP to force play + unmute the video through cross-origin iframes.
+
+        Uses Input.dispatchMouseEvent (simulated click) to satisfy browser autoplay policy.
+        """
         iframes = await self._get_iframe_targets_for_page(page_url)
 
         import aiohttp as _aiohttp
@@ -485,21 +502,169 @@ class StreamKeeper:
             try:
                 async with _aiohttp.ClientSession() as sess:
                     async with sess.ws_connect(ws_url) as ws:
+                        # Get video element position
                         await ws.send_json({
                             "id": 1, "method": "Runtime.evaluate",
                             "params": {
-                                "expression": "(() => { const v = document.querySelector('video'); if (!v) return false; v.play().catch(()=>{}); v.muted = false; v.volume = 1.0; return true; })()",
+                                "expression": "(function(){ var v = document.querySelector('video'); if (!v) return null; var r = v.getBoundingClientRect(); return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), w: r.width}; })()",
                                 "returnByValue": True
                             }
                         })
                         resp = await asyncio.wait_for(ws.receive_json(), timeout=3)
-                        val = resp.get("result", {}).get("result", {}).get("value", False)
-                        if val:
-                            logger.info(f"CDP force play on iframe: {iframe.get('url', '')[:60]}")
+                        pos = resp.get("result", {}).get("result", {}).get("value")
+
+                        if pos and pos.get("w", 0) > 0:
+                            # Simulated click (user gesture) to start playback
+                            x, y = pos["x"], pos["y"]
+                            await ws.send_json({"id": 2, "method": "Input.dispatchMouseEvent", "params": {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}})
+                            await asyncio.wait_for(ws.receive_json(), timeout=3)
+                            await ws.send_json({"id": 3, "method": "Input.dispatchMouseEvent", "params": {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}})
+                            await asyncio.wait_for(ws.receive_json(), timeout=3)
+
+                            # Unmute
+                            await asyncio.sleep(1)
+                            await ws.send_json({
+                                "id": 4, "method": "Runtime.evaluate",
+                                "params": {
+                                    "expression": "(function(){ var v = document.querySelector('video'); if(!v) return false; v.muted=false; v.volume=1.0; try{jwplayer().setMute(false);jwplayer().setVolume(100);}catch(e){} return true; })()",
+                                    "returnByValue": True
+                                }
+                            })
+                            await asyncio.wait_for(ws.receive_json(), timeout=3)
+                            logger.info(f"CDP force play (click) on iframe: {iframe.get('url', '')[:60]}")
                             return True
+                        else:
+                            # Fallback: try JS play (may not work with autoplay policy)
+                            await ws.send_json({
+                                "id": 5, "method": "Runtime.evaluate",
+                                "params": {
+                                    "expression": "(() => { const v = document.querySelector('video'); if (!v) return false; v.play().catch(()=>{}); v.muted = false; v.volume = 1.0; return true; })()",
+                                    "returnByValue": True
+                                }
+                            })
+                            resp = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                            val = resp.get("result", {}).get("result", {}).get("value", False)
+                            if val:
+                                logger.info(f"CDP force play (JS) on iframe: {iframe.get('url', '')[:60]}")
+                                return True
             except Exception:
                 continue
         return False
+
+    async def _auto_setup_stream_cdp(self, page_url: str) -> bool:
+        """CDP-based auto-setup: click play on JW Player, activate theater mode on streamed.pk.
+
+        Handles the full chain:
+        1. Find the pooembed.eu iframe (JW Player) and click play + unmute
+        2. Enable theater mode on the parent streamed.pk watch page
+        """
+        cdp_base = self._get_cdp_base()
+        import aiohttp as _aiohttp
+
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.get(f"{cdp_base}/json/list") as r:
+                    targets = await r.json()
+        except Exception:
+            return False
+
+        did_something = False
+
+        # Step 1: Find and click play on JW Player iframes (pooembed.eu or similar)
+        for t in targets:
+            if t.get("type") != "iframe":
+                continue
+            iframe_url = t.get("url", "")
+            ws_url = t.get("webSocketDebuggerUrl")
+            if not ws_url:
+                continue
+
+            # Only target iframes that are related to our page URL
+            # JW Player lives in pooembed.eu, embedhd.org, or similar
+            if not any(domain in iframe_url for domain in ["pooembed", "embedhd", "embedme", "sportshd"]):
+                continue
+
+            try:
+                async with _aiohttp.ClientSession() as sess2:
+                    async with sess2.ws_connect(ws_url) as ws:
+                        # Click JW Player play button and unmute
+                        js_play = """(() => {
+                            var v = document.querySelector('video');
+                            if (!v) return 'no-video';
+                            var jwp = document.querySelector('.jwplayer');
+                            if (jwp) {
+                                // JW Player API
+                                var api = jwplayer();
+                                if (api && api.play) { api.play(); api.setMute(false); api.setVolume(100); return 'jw-play'; }
+                            }
+                            // Fallback: direct video element
+                            v.play().catch(function(){});
+                            v.muted = false;
+                            v.volume = 1.0;
+                            return 'direct-play';
+                        })()"""
+                        await ws.send_json({
+                            "id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": js_play, "returnByValue": True}
+                        })
+                        resp = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                        val = resp.get("result", {}).get("result", {}).get("value", "")
+                        if val and val != "no-video":
+                            logger.info(f"Auto-play via CDP ({val}): {iframe_url[:60]}")
+                            did_something = True
+            except Exception:
+                continue
+
+        # Step 2: Enable theater mode on the streamed.pk watch page
+        for t in targets:
+            if t.get("type") != "page":
+                continue
+            target_url = t.get("url", "")
+            if "streamed.pk/watch/" not in target_url:
+                continue
+            ws_url = t.get("webSocketDebuggerUrl")
+            if not ws_url:
+                continue
+
+            try:
+                async with _aiohttp.ClientSession() as sess2:
+                    async with sess2.ws_connect(ws_url) as ws:
+                        # Click theater mode button if not already active
+                        js_theater = """(() => {
+                            // streamed.pk theater mode: look for expand/theater button
+                            var btns = document.querySelectorAll('button, [role=button]');
+                            for (var i = 0; i < btns.length; i++) {
+                                var b = btns[i];
+                                var text = (b.innerText || b.textContent || '').toLowerCase();
+                                var cls = (b.className || '').toLowerCase();
+                                var title = (b.getAttribute('title') || '').toLowerCase();
+                                if (text.includes('theater') || text.includes('theatre') ||
+                                    cls.includes('theater') || cls.includes('expand') ||
+                                    title.includes('theater') || title.includes('expand')) {
+                                    b.click();
+                                    return 'theater-clicked';
+                                }
+                            }
+                            // Try aria-label
+                            var theater = document.querySelector('[aria-label*="theater" i], [aria-label*="expand" i]');
+                            if (theater) { theater.click(); return 'theater-aria'; }
+                            return 'no-theater-btn';
+                        })()"""
+                        await ws.send_json({
+                            "id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": js_theater, "returnByValue": True}
+                        })
+                        resp = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                        val = resp.get("result", {}).get("result", {}).get("value", "")
+                        if val and "theater" in val:
+                            logger.info(f"Theater mode activated: {val}")
+                            did_something = True
+                        else:
+                            logger.debug(f"Theater mode: {val}")
+            except Exception:
+                continue
+
+        return did_something
 
     async def _get_urls_with_video_cdp(self) -> set:
         """Query CDP iframe targets directly to find which page URLs have video players.
@@ -687,7 +852,204 @@ class StreamKeeper:
             f"Health check every {self.config.get('health', {}).get('poll_interval_seconds', 5)}s | Auto-recovery enabled"
         )
 
-    async def watch(self, team: str, site: Optional[str] = None) -> str:
+    async def _watch_cdp_native(self, team: str, use_site: str, stream_id: str):
+        """CDP-native watch: use API for game lookup, open tab via Target.createTarget.
+
+        Opens the tab in Chrome's native context (with user extensions, no Playwright
+        ad blocking), which is required for streamed.pk embeds to load properly.
+
+        Returns (page, driver, game) on success, or (None, None, error_str) on failure.
+        """
+        import aiohttp as _aiohttp
+        from sites import StreamedPKDriver, GameInfo
+
+        # Step 1: Use API to find the game (no browser page needed)
+        base_url = self.config.get("sites", {}).get("streamed.pk", {}).get("base_url", "https://streamed.pk")
+        api_url = f"{base_url}/api/matches/hockey"
+        team_lower = team.lower()
+        game = None
+
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.get(api_url, timeout=_aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        matches = await resp.json()
+                        for match in matches:
+                            teams_data = match.get("teams", {})
+                            home = teams_data.get("home", {}).get("name", "")
+                            away = teams_data.get("away", {}).get("name", "")
+                            title = match.get("title", "")
+                            match_id = match.get("id", "")
+                            names = [home.lower(), away.lower(), title.lower()]
+                            parts = team_lower.split()
+                            found = any(team_lower in n for n in names)
+                            if not found:
+                                found = any(p in n for p in parts for n in names if len(p) > 3)
+                            if found:
+                                sources = match.get("sources", [])
+                                game = {
+                                    "title": title or f"{home} vs {away}",
+                                    "match_id": match_id,
+                                    "home": home,
+                                    "away": away,
+                                    "sources": sources,
+                                }
+                                break
+        except Exception as e:
+            logger.warning(f"API game lookup failed: {e}")
+
+        if not game:
+            return None, None, f"❌ No game found for **{team}** on {use_site}"
+
+        logger.info(f"API found game: {game['title']} ({len(game['sources'])} sources)")
+
+        # Step 2: Pick the best source (admin stream 1)
+        source_path = "admin/1"  # Default: admin stream 1
+        for src in game["sources"]:
+            if src.get("source") == "admin":
+                source_path = "admin/1"
+                break
+
+        # Step 3: Open tab via CDP Target.createTarget (native browser context)
+        watch_url = f"{base_url}/watch/{game['match_id']}/{source_path}"
+        cdp_base = self._get_cdp_base()
+
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                # Get any existing page's WS URL to send Target.createTarget
+                async with sess.get(f"{cdp_base}/json/list") as r:
+                    cdp_targets = await r.json()
+
+                ws_url = None
+                for t in cdp_targets:
+                    if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                        ws_url = t["webSocketDebuggerUrl"]
+                        break
+
+                if not ws_url:
+                    return None, None, "❌ No CDP page available to create new tab"
+
+                async with sess.ws_connect(ws_url) as ws:
+                    await ws.send_json({
+                        "id": 1,
+                        "method": "Target.createTarget",
+                        "params": {"url": watch_url}
+                    })
+                    resp = await asyncio.wait_for(ws.receive_json(), timeout=10)
+                    target_id = resp.get("result", {}).get("targetId")
+                    logger.info(f"CDP opened native tab: {watch_url} (target: {target_id})")
+        except Exception as e:
+            logger.error(f"CDP Target.createTarget failed: {e}")
+            return None, None, f"❌ Failed to open stream tab: {e}"
+
+        # Step 4: Wait for page to load, then auto-setup (theater + play)
+        await asyncio.sleep(8)  # Wait for React hydration + embed iframe load
+
+        # Auto-play JW Player in the stream's pooembed iframe
+        try:
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.get(f"{cdp_base}/json/list") as r:
+                    cdp_targets = await r.json()
+
+                # Find the pooembed iframe for this game and click play
+                for t in cdp_targets:
+                    iframe_url = t.get("url", "")
+                    if t.get("type") != "iframe" or "pooembed" not in iframe_url:
+                        continue
+                    home_parts = game["home"].lower().split()
+                    away_parts = game["away"].lower().split()
+                    if not any(p[:3] in iframe_url.lower() for p in home_parts + away_parts if len(p) >= 3):
+                        continue
+
+                    iframe_ws = t.get("webSocketDebuggerUrl")
+                    if not iframe_ws:
+                        continue
+                    try:
+                        async with sess.ws_connect(iframe_ws) as ws:
+                            # Get video element center position for click
+                            await ws.send_json({"id": 1, "method": "Runtime.evaluate", "params": {
+                                "expression": "(function(){ var v = document.querySelector('video'); if (!v) return null; var r = v.getBoundingClientRect(); return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), w: r.width}; })()",
+                                "returnByValue": True
+                            }})
+                            resp = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                            pos = resp.get("result", {}).get("result", {}).get("value")
+
+                            if pos and pos.get("w", 0) > 0:
+                                # Simulate mouse click (satisfies autoplay policy)
+                                x, y = pos["x"], pos["y"]
+                                await ws.send_json({"id": 2, "method": "Input.dispatchMouseEvent", "params": {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}})
+                                await asyncio.wait_for(ws.receive_json(), timeout=3)
+                                await ws.send_json({"id": 3, "method": "Input.dispatchMouseEvent", "params": {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}})
+                                await asyncio.wait_for(ws.receive_json(), timeout=3)
+                                logger.info(f"CDP click-to-play at ({x},{y}) on {iframe_url[:60]}")
+
+                                # Unmute via JS after click
+                                await asyncio.sleep(1)
+                                await ws.send_json({"id": 4, "method": "Runtime.evaluate", "params": {
+                                    "expression": "(function(){ try { var api = jwplayer(); api.setMute(false); api.setVolume(100); return 'state=' + api.getState(); } catch(e) { var v = document.querySelector('video'); if(v){v.muted=false;v.volume=1;} return 'direct'; } })()",
+                                    "returnByValue": True
+                                }})
+                                resp = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                                val = resp.get("result", {}).get("result", {}).get("value", "")
+                                logger.info(f"CDP auto-play result: {val}")
+                            else:
+                                logger.warning(f"Video element not positioned on {iframe_url[:60]} — may need manual play")
+                    except Exception as e:
+                        logger.warning(f"CDP auto-play failed on {iframe_url[:60]}: {e}")
+                    break
+
+                # Enable theater mode on the watch page
+                for t in cdp_targets:
+                    target_url = t.get("url", "")
+                    if t.get("type") != "page" or game["match_id"] not in target_url:
+                        continue
+                    page_ws = t.get("webSocketDebuggerUrl")
+                    if not page_ws:
+                        continue
+                    try:
+                        async with sess.ws_connect(page_ws) as ws:
+                            js = """(function(){
+                                var btns = document.querySelectorAll('button');
+                                for (var i=0; i<btns.length; i++) {
+                                    var t = (btns[i].innerText || '').trim().toLowerCase();
+                                    if (t.includes('enter theater')) { btns[i].click(); return 'theater-on'; }
+                                }
+                                return 'no-theater';
+                            })()"""
+                            await ws.send_json({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}})
+                            resp = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                            val = resp.get("result", {}).get("result", {}).get("value", "")
+                            logger.info(f"CDP theater mode: {val}")
+                    except Exception:
+                        pass
+                    break
+        except Exception as e:
+            logger.warning(f"CDP auto-setup failed (non-fatal): {e}")
+
+        # Step 5: Find the Playwright page object for this tab (after CDP reconnect)
+        await self._reconnect_cdp()
+        page = None
+        if self.context:
+            for p in self.context.pages:
+                if game["match_id"] in (p.url or ""):
+                    page = p
+                    break
+
+        if not page:
+            # Create a dummy page reference — health monitoring will use CDP directly
+            logger.warning("Could not find Playwright page for CDP-opened tab — using CDP-only monitoring")
+            page = await self._new_stream_page()
+            await page.goto(watch_url, wait_until="domcontentloaded", timeout=30000)
+
+        driver = get_driver(page, self.config, use_site)
+        driver.current_game = GameInfo(
+            title=game["title"],
+            teams=[game["home"], game["away"]],
+            url=watch_url,
+            is_live=True,
+        )
+
+        return page, driver, game
         """Start watching a game for the given team in a new tab."""
         if len(self.active_streams) >= self.max_streams:
             return f"❌ Max streams ({self.max_streams}) reached. Stop one first with `!stop <name>`."
@@ -700,36 +1062,38 @@ class StreamKeeper:
 
         logger.info(f"Starting watch [{stream_id}]: {team} on {use_site}")
 
-        page = await self._new_stream_page()
+        # --- CDP mode: use API for game lookup, open tab natively via CDP ---
+        if self._cdp_url and use_site == "streamed.pk":
+            page, driver, game = await self._watch_cdp_native(team, use_site, stream_id)
+            if page is None:
+                return game  # game holds the error string
+        else:
+            # --- Headless / non-CDP mode: use Playwright pages ---
+            page = await self._new_stream_page()
+            driver = get_driver(page, self.config, use_site)
 
-        # Create site driver for this page
-        driver = get_driver(page, self.config, use_site)
+            nav_ok = await driver.navigate_to_games()
+            if not nav_ok:
+                logger.warning(f"Page navigation to {use_site} failed — will try API-based game lookup")
 
-        # Navigate to games
-        if not await driver.navigate_to_games():
-            await page.close()
-            return f"❌ Failed to load {use_site} game listings"
+            game = await driver.find_game(team)
+            if not game:
+                await page.close()
+                return f"❌ No game found for **{team}** on {use_site}"
 
-        # Find the game
-        game = await driver.find_game(team)
-        if not game:
-            await page.close()
-            return f"❌ No game found for **{team}** on {use_site}"
+            if not await driver.open_game(game):
+                await page.close()
+                return f"❌ Failed to open game page for: {game.title}"
 
-        # Open the game page
-        if not await driver.open_game(game):
-            await page.close()
-            return f"❌ Failed to open game page for: {game.title}"
-
-        # List and load stream sources
-        await driver.list_sources()
-        if not await driver.load_stream(0):
-            # Keep the page open — might need manual interaction
-            pass
+            await driver.list_sources()
+            if not await driver.load_stream(0):
+                pass
 
         # Create ActiveStream
         health_mon = HealthMonitor(self.config)
         health_mon.history.recovery_count = 0
+        # Set stream URL for CDP health checks — use the page's current URL
+        stream_url = page.url if page and not page.is_closed() else None
         stream = ActiveStream(
             id=stream_id,
             team=team,
@@ -737,13 +1101,15 @@ class StreamKeeper:
             driver=driver,
             health_monitor=health_mon,
             site=use_site,
+            url=stream_url,
         )
         stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
         self.active_streams[stream_id] = stream
 
         sources_count = len(driver.available_sources)
+        game_title = game["title"] if isinstance(game, dict) else game.title
         return (
-            f"🏒 Now watching: **{game.title}** [`{stream_id}`]\n"
+            f"🏒 Now watching: **{game_title}** [`{stream_id}`]\n"
             f"📺 Site: {use_site}\n"
             f"🔗 Sources available: {sources_count}\n"
             f"🛡️ Ad blocking active | Health monitoring started\n"
