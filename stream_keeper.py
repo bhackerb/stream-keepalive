@@ -95,6 +95,7 @@ class StreamKeeper:
         self.active_streams: dict[str, ActiveStream] = {}
         self.default_site: str = config.get("defaults", {}).get("site", "streamed.pk")
         self._playwright = None
+        self._auto_keepalive_task: Optional[asyncio.Task] = None
 
         # Limits
         self.max_streams = config.get("streams", {}).get("max_streams", 8)
@@ -253,6 +254,93 @@ class StreamKeeper:
         self.context.on("page", self._on_new_page)
 
         logger.info("Browser started successfully")
+
+        # Start auto-keepalive loop if configured
+        interval = self.config.get("keepalive", {}).get("auto_scan_interval_seconds", 30)
+        self._auto_keepalive_task = asyncio.create_task(self._auto_keepalive_loop(interval))
+        logger.info(f"Auto-keepalive scan started (every {interval}s)")
+
+    async def _auto_keepalive_loop(self, interval: int):
+        """Background loop: periodically scan all open browser tabs and attach
+        health monitors to any new stream pages. Runs until shutdown.
+
+        This ensures tabs opened after startup (manually or via watch()) are
+        automatically picked up without a manual POST /keepalive call.
+        """
+        await asyncio.sleep(interval)  # Initial delay — let browser settle
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if not self.context:
+                    continue
+                # Reconnect CDP to pick up tabs opened since last scan
+                if self._cdp_url:
+                    await self._reconnect_cdp()
+                if not self.context:
+                    continue
+
+                pages = self.context.pages
+                already_urls = set(s.url or "" for s in self.active_streams.values())
+                cdp_video_urls = await self._get_urls_with_video_cdp()
+
+                newly_attached = []
+                for page in pages:
+                    page_url = page.url
+                    if page_url in already_urls or page_url in ("about:blank", "chrome://newtab/"):
+                        continue
+                    if len(self.active_streams) >= self.max_streams:
+                        break
+
+                    has_video = False
+                    try:
+                        for frame in page.frames:
+                            try:
+                                has_video = await frame.evaluate("() => !!document.querySelector('video')")
+                                if has_video:
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                    if not has_video:
+                        has_video = page_url in cdp_video_urls
+
+                    streaming_domains = ["streamed.", "onhockey.", "embedsports.", "sportsurge."]
+                    is_streaming_page = any(d in page_url for d in streaming_domains)
+
+                    if not has_video and not is_streaming_page:
+                        continue
+
+                    try:
+                        title = await page.title()
+                    except Exception:
+                        title = ""
+                    label = self._parse_stream_label(title, page_url)
+                    stream_id = self._make_stream_id(team=label)
+
+                    health_mon = HealthMonitor(self.config)
+                    stream = ActiveStream(
+                        id=stream_id,
+                        team=label,
+                        page=page,
+                        driver=None,
+                        health_monitor=health_mon,
+                        site="keepalive",
+                        url=page_url,
+                    )
+                    stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
+                    self.active_streams[stream_id] = stream
+                    newly_attached.append(label)
+                    logger.info(f"[auto-keepalive] Attached monitor to new stream: {label}")
+
+                if newly_attached:
+                    logger.info(f"[auto-keepalive] Picked up {len(newly_attached)} new stream(s): {', '.join(newly_attached)}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Auto-keepalive scan error: {e}")
 
     async def _reconnect_cdp(self):
         """Reconnect to Chrome via CDP to pick up newly opened tabs.
@@ -1240,6 +1328,13 @@ class StreamKeeper:
 
     async def shutdown(self):
         """Full shutdown — stop all streams, close browser and Playwright."""
+        if self._auto_keepalive_task:
+            self._auto_keepalive_task.cancel()
+            try:
+                await self._auto_keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self._auto_keepalive_task = None
         await self.stop()  # stops all
         if self._cdp_url:
             # CDP mode — disconnect without closing the external Chrome
