@@ -312,6 +312,8 @@ class StreamKeeper:
         if len(self.active_streams) >= self.max_streams:
             return f"❌ Max streams ({self.max_streams}) reached. Stop one first with `!stop <name>`."
 
+        await self._try_late_cdp_connect()
+
         if not self.context:
             await self.start_browser()
 
@@ -1050,9 +1052,55 @@ class StreamKeeper:
         )
 
         return page, driver, game
+
+    async def _try_late_cdp_connect(self):
+        """If we started in headless fallback mode but remote_debugging_url is configured,
+        try to connect to Chrome now. Allows watch() to use visible browser even if
+        Stream Chrome wasn't running when StreamKeeper started.
+        """
+        if self._cdp_url:
+            return  # Already in CDP mode
+        remote_debugging_url = self.config.get("browser", {}).get("remote_debugging_url")
+        if not remote_debugging_url:
+            return  # No CDP URL configured
+        try:
+            import aiohttp as _aiohttp_check
+            async with _aiohttp_check.ClientSession() as sess:
+                async with sess.get(
+                    f"{remote_debugging_url.rstrip('/')}/json/version",
+                    timeout=_aiohttp_check.ClientTimeout(total=2),
+                ) as r:
+                    if r.status != 200:
+                        return
+            logger.info(f"Stream Chrome found at {remote_debugging_url} — switching from headless to CDP mode")
+            # Close headless browser
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+                self.context = None
+            # Connect via CDP
+            self._cdp_url = remote_debugging_url
+            self._browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
+            if self._browser.contexts:
+                self.context = self._browser.contexts[0]
+            else:
+                self.context = await self._browser.new_context()
+            await self.ad_handler.setup_network_blocking(self.context)
+            self.context.on("page", self._on_new_page)
+            page_count = len(self.context.pages) if self.context else 0
+            logger.info(f"Late CDP connect successful — {page_count} existing tab(s)")
+        except Exception as e:
+            logger.debug(f"Late CDP connect attempt failed: {e}")
+
+    async def watch(self, team: str, site: Optional[str] = None) -> str:
         """Start watching a game for the given team in a new tab."""
         if len(self.active_streams) >= self.max_streams:
             return f"❌ Max streams ({self.max_streams}) reached. Stop one first with `!stop <name>`."
+
+        await self._try_late_cdp_connect()
 
         if not self.context:
             await self.start_browser()
