@@ -37,7 +37,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from ad_handler import AdHandler
 from api_server import StreamKeeperAPI
 from health_monitor import HealthMonitor, StreamState
-from sites import get_driver, BaseSiteDriver
+from sites import get_driver, BaseSiteDriver, STREAMING_DOMAINS, infer_site_from_url
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -247,8 +247,15 @@ class StreamKeeper:
                 permissions=["geolocation"],
             )
 
-        # Set up ad blocking on the context
-        await self.ad_handler.setup_network_blocking(self.context)
+        # Ad blocking: ONLY install Playwright route() interception when we
+        # launched our own browser. When attached via CDP to the user's real
+        # Chrome, uBlock Origin is already running in-profile and routing every
+        # request through Python's asyncio loop adds catastrophic latency to
+        # HLS video segments. Skip it entirely in CDP mode.
+        if not cdp_connected:
+            await self.ad_handler.setup_network_blocking(self.context)
+        else:
+            logger.info("CDP mode: skipping Playwright route() ad blocking (relying on in-profile uBlock)")
 
         # Handle popup windows (ad popups)
         self.context.on("page", self._on_new_page)
@@ -266,13 +273,27 @@ class StreamKeeper:
 
         This ensures tabs opened after startup (manually or via watch()) are
         automatically picked up without a manual POST /keepalive call.
+
+        If the daemon booted before Stream Chrome was up (headless fallback),
+        retry the CDP promotion every ~2 min so we self-heal without a manual
+        service restart.
         """
         await asyncio.sleep(interval)  # Initial delay — let browser settle
+        ticks_since_cdp_probe = 0
         while True:
             try:
                 await asyncio.sleep(interval)
                 if not self.context:
                     continue
+
+                # Headless-fallback self-heal: probe for Chrome every ~2 min.
+                # Once CDP connects, this path is a no-op (guarded by _cdp_url).
+                if not self._cdp_url:
+                    ticks_since_cdp_probe += 1
+                    if ticks_since_cdp_probe * interval >= 120:
+                        ticks_since_cdp_probe = 0
+                        await self._try_late_cdp_connect()
+
                 # Reconnect CDP to pick up tabs opened since last scan
                 if self._cdp_url:
                     await self._reconnect_cdp()
@@ -306,8 +327,8 @@ class StreamKeeper:
                     if not has_video:
                         has_video = page_url in cdp_video_urls
 
-                    streaming_domains = ["streamed.", "onhockey.", "embedsports.", "sportsurge."]
-                    is_streaming_page = any(d in page_url for d in streaming_domains)
+                    inferred_site = infer_site_from_url(page_url)
+                    is_streaming_page = inferred_site is not None
 
                     if not has_video and not is_streaming_page:
                         continue
@@ -320,13 +341,22 @@ class StreamKeeper:
                     stream_id = self._make_stream_id(team=label)
 
                     health_mon = HealthMonitor(self.config)
+                    # Assign a driver if we recognize the site — this is what
+                    # enables L3 (mirror switch) recovery for tabs the user
+                    # opened in their own browser.
+                    auto_driver = None
+                    if inferred_site:
+                        try:
+                            auto_driver = get_driver(page, self.config, inferred_site)
+                        except Exception as e:
+                            logger.debug(f"[auto-keepalive] driver init failed for {inferred_site}: {e}")
                     stream = ActiveStream(
                         id=stream_id,
                         team=label,
                         page=page,
-                        driver=None,
+                        driver=auto_driver,
                         health_monitor=health_mon,
-                        site="keepalive",
+                        site=inferred_site or "keepalive",
                         url=page_url,
                     )
                     stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
@@ -854,6 +884,12 @@ class StreamKeeper:
         if not self.context:
             return "No browser context. Start the browser first."
 
+        # If we booted in headless-fallback mode (Chrome wasn't up yet),
+        # try to promote to CDP now that the user is poking keepalive —
+        # their browser is almost certainly running.
+        if not self._cdp_url:
+            await self._try_late_cdp_connect()
+
         # Reconnect CDP to pick up newly opened tabs
         if self._cdp_url:
             await self._reconnect_cdp()
@@ -894,10 +930,8 @@ class StreamKeeper:
 
             # Even without detected video, attach to known streaming site pages
             # (the video may be in an unreachable cross-origin iframe)
-            is_streaming_page = False
-            if not has_video:
-                streaming_domains = ["streamed.", "onhockey.", "embedsports.", "sportsurge."]
-                is_streaming_page = any(d in page_url for d in streaming_domains)
+            inferred_site = infer_site_from_url(page_url)
+            is_streaming_page = inferred_site is not None
 
             if not has_video and not is_streaming_page:
                 continue
@@ -917,13 +951,19 @@ class StreamKeeper:
             logger.info(f"[keepalive] Attaching monitor to: {label} [{stream_id}] ({video_note})")
 
             health_mon = HealthMonitor(self.config)
+            auto_driver = None
+            if inferred_site:
+                try:
+                    auto_driver = get_driver(page, self.config, inferred_site)
+                except Exception as e:
+                    logger.debug(f"[keepalive] driver init failed for {inferred_site}: {e}")
             stream = ActiveStream(
                 id=stream_id,
                 team=label,
                 page=page,
-                driver=None,
+                driver=auto_driver,
                 health_monitor=health_mon,
-                site="keepalive",
+                site=inferred_site or "keepalive",
                 url=page_url,
             )
             stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
@@ -1176,7 +1216,8 @@ class StreamKeeper:
                 self.context = self._browser.contexts[0]
             else:
                 self.context = await self._browser.new_context()
-            await self.ad_handler.setup_network_blocking(self.context)
+            # CDP-attach path — rely on in-profile uBlock, do not install
+            # route() interception (would lag every video segment).
             self.context.on("page", self._on_new_page)
             page_count = len(self.context.pages) if self.context else 0
             logger.info(f"Late CDP connect successful — {page_count} existing tab(s)")
