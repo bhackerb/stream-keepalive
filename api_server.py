@@ -1,6 +1,7 @@
 """HTTP API for StreamKeeper — allows remote control from Mithrandir or other devices."""
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ def _bearer_token(request: web.Request) -> Optional[str]:
 def _check_auth(request: web.Request, api_key: str) -> bool:
     """Validate bearer token against configured API key."""
     token = _bearer_token(request)
-    return token == api_key
+    return hmac.compare_digest(token or "", api_key or "")
 
 
 class StreamKeeperAPI:

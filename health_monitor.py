@@ -386,7 +386,6 @@ class HealthMonitor:
             StreamState.ERROR,
             StreamState.ENDED,
             StreamState.PAUSED,
-            StreamState.AUDIO_LOST,
         )
 
     def get_recovery_reason(self) -> str:

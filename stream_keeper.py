@@ -14,6 +14,7 @@ Supports multiple simultaneous streams in separate browser tabs.
 import asyncio
 import hashlib
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -55,7 +56,7 @@ def setup_logging(config: dict):
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file),
+            logging.handlers.RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5),
         ],
     )
 
@@ -92,6 +93,7 @@ class StreamKeeper:
         self.context: Optional[BrowserContext] = None
         self._browser: Optional[Browser] = None
         self._cdp_url: Optional[str] = None
+        self._cdp_reconnect_failures: int = 0
         self.active_streams: dict[str, ActiveStream] = {}
         self.default_site: str = config.get("defaults", {}).get("site", "streamed.pk")
         self._playwright = None
@@ -396,8 +398,13 @@ class StreamKeeper:
                 self.context = await self._browser.new_context()
             page_count = len(self.context.pages) if self.context else 0
             logger.debug(f"CDP reconnected — {page_count} tab(s)")
+            self._cdp_reconnect_failures = 0
         except Exception as e:
-            logger.error(f"CDP reconnect failed: {e}")
+            self._cdp_reconnect_failures += 1
+            if self._cdp_reconnect_failures == 1:
+                logger.error(f"CDP reconnect failed: {e}")
+            else:
+                logger.debug(f"CDP reconnect failed: {e}")
 
     async def _on_new_page(self, page: Page):
         """Handle new pages (popup ad windows).
@@ -1594,6 +1601,14 @@ class StreamKeeper:
                 except Exception:
                     pass
 
+                # Reset recovery_count after sustained healthy state
+                hist = stream.health_monitor.history
+                if (hist.snapshots and
+                        hist.snapshots[-1].is_healthy and
+                        hist.seconds_since_recovery >= 300 and
+                        hist.recovery_count > 0):
+                    hist.recovery_count = 0
+
                 # Check if recovery is needed
                 if stream.health_monitor.needs_recovery() and not stream.recovery_in_progress:
                     reason = stream.health_monitor.get_recovery_reason()
@@ -1653,6 +1668,7 @@ class StreamKeeper:
                             await self._discord_notify(
                                 f"🔧 Auto-recovered (CDP play) — {stream.team} stream back"
                             )
+                        stream.health_monitor.history.recovery_count = 0
                         return
 
             # Level 1: Soft fix — play + unmute (direct page, non-iframe)
@@ -1668,6 +1684,7 @@ class StreamKeeper:
                         await self._discord_notify(
                             f"🔧 Auto-recovered (play+unmute) — {stream.team} stream back"
                         )
+                    stream.health_monitor.history.recovery_count = 0
                     return
 
             # Level 2: Reload the stream iframe / re-click source
@@ -1686,6 +1703,7 @@ class StreamKeeper:
                         await self._discord_notify(
                             f"🔄 Auto-recovered (reload) — {stream.team} stream back"
                         )
+                    stream.health_monitor.history.recovery_count = 0
                     return
 
             # Level 3: Try next mirror
@@ -1702,6 +1720,7 @@ class StreamKeeper:
                                 await self._discord_notify(
                                     f"🔀 Auto-recovered (mirror switch) — {stream.team} stream back"
                                 )
+                            stream.health_monitor.history.recovery_count = 0
                             return
 
             # Level 4: Full restart from scratch
@@ -1722,6 +1741,7 @@ class StreamKeeper:
                             await self._discord_notify(
                                 f"🔁 Auto-recovered (full restart) — {stream.team} stream back"
                             )
+                        stream.health_monitor.history.recovery_count = 0
                         return
 
             # If we get here, all recovery failed
