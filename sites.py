@@ -15,6 +15,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Optional
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import aiohttp
 from playwright.async_api import Page
@@ -38,6 +39,7 @@ class StreamSource:
     name: str
     url: Optional[str] = None
     element_index: int = 0  # Index in the list of source links
+    locator: Optional[str] = None  # Stable DOM identity for clickable sources
 
 
 class BaseSiteDriver(ABC):
@@ -609,6 +611,234 @@ class OnHockeyTVDriver(BaseSiteDriver):
         return False
 
 
+class GenericStreamingDriver(BaseSiteDriver):
+    """Generic driver for cross-origin-iframe streaming sites.
+
+    Used for sites where the video lives in an opaque iframe and the only
+    interaction is clicking source/mirror buttons. Sufficient to enable
+    L3 (mirror switch) recovery on arbitrary streaming pages without
+    needing per-site DOM contracts.
+
+    Backs viprow, livetv.sx, sportsurge, embedsports, streameast, and any
+    tab the user opened on an unknown streaming site.
+    """
+
+    def __init__(self, page: Page, config: dict, site_key: str = "generic"):
+        super().__init__(page, config, site_key)
+        self.base_url = self.site_config.get("base_url", "")
+        # Track iframe srcs we've already cycled through so next_source()
+        # doesn't replay the same dead mirror.
+        self._tried_iframe_srcs: set[str] = set()
+
+    async def navigate_to_games(self) -> bool:
+        if not self.base_url:
+            return True  # Already on a stream page (auto-attached)
+        try:
+            await self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+            await self._dismiss_initial_ads()
+            return True
+        except Exception as e:
+            logger.error(f"[{self.site_key}] navigate failed: {e}")
+            return False
+
+    async def find_game(self, team: str) -> Optional[GameInfo]:
+        team_lower = team.lower()
+        games = await self.page.evaluate("""(teamName) => {
+            const out = [];
+            const links = document.querySelectorAll('a');
+            for (const link of links) {
+                const text = (link.innerText || link.textContent || '').trim();
+                if (text && text.toLowerCase().includes(teamName.toLowerCase()) && text.length < 200) {
+                    out.push({ text: text.substring(0, 150), href: link.href });
+                }
+            }
+            return out;
+        }""", team)
+        if not games:
+            logger.warning(f"[{self.site_key}] no games found for {team}")
+            return None
+        g = games[0]
+        game = GameInfo(title=g["text"], teams=[team], url=g.get("href"))
+        self.current_game = game
+        return game
+
+    async def open_game(self, game: GameInfo) -> bool:
+        if not game.url:
+            return False
+        try:
+            await self.page.goto(game.url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+            await self._dismiss_initial_ads()
+            return True
+        except Exception as e:
+            logger.error(f"[{self.site_key}] open_game failed: {e}")
+            return False
+
+    async def list_sources(self) -> list[StreamSource]:
+        """Enumerate clickable mirrors AND distinct iframe srcs on the page."""
+        candidates = await self.page.evaluate("""() => {
+            const out = [];
+            // Clickable mirror/source buttons
+            const sels = [
+                'a[href*="stream"]', 'a[href*="player"]', 'a[href*="embed"]',
+                'a[href*="watch"]', 'a[href*="source"]', 'a[href*="link"]',
+                'button[class*="source"]', 'button[class*="server"]',
+                'button[class*="mirror"]', '[class*="stream-link"]',
+                '.source-item a', '.stream-option a', '.server-item',
+                'li[class*="server"] a', 'li[class*="source"] a',
+            ];
+            const seen = new Set();
+            let idx = 0;
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    const key = (el.href || '') + '|' + text;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    if (text && text.length < 80) {
+                        const locator = `streamkeeper-${idx}`;
+                        el.setAttribute('data-streamkeeper-source-id', locator);
+                        out.push({ name: text.substring(0, 60), href: el.href || null, index: idx++, locator });
+                    }
+                }
+            }
+            // Also expose distinct iframe srcs as fallback "sources"
+            for (const ifr of document.querySelectorAll('iframe')) {
+                const src = ifr.src || '';
+                if (src && !src.startsWith('about:') && !seen.has(src)) {
+                    seen.add(src);
+                    out.push({ name: `iframe ${idx}`, href: src, index: idx++, locator: null });
+                }
+            }
+            return out;
+        }""")
+        self.available_sources = [
+            StreamSource(
+                name=c["name"],
+                url=c.get("href"),
+                element_index=c["index"],
+                locator=c.get("locator"),
+            )
+            for c in candidates
+        ]
+        logger.info(f"[{self.site_key}] found {len(self.available_sources)} candidate sources")
+        return self.available_sources
+
+    async def load_stream(self, source_index: int = 0) -> bool:
+        self.current_source_index = source_index
+        if not self.available_sources:
+            await self.list_sources()
+        if self.available_sources and source_index < len(self.available_sources):
+            src = self.available_sources[source_index]
+            logger.info(f"[{self.site_key}] loading source #{source_index}: {src.name}")
+            try:
+                if src.url and src.url.startswith("http"):
+                    self._tried_iframe_srcs.add(src.url)
+                    await self.page.goto(src.url, wait_until="domcontentloaded", timeout=30000)
+                elif src.locator:
+                    element = await self.page.query_selector(
+                        f'[data-streamkeeper-source-id="{src.locator}"]'
+                    )
+                    if element:
+                        await element.click()
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.warning(f"[{self.site_key}] load source failed: {e}")
+
+        await self._dismiss_initial_ads()
+
+        for _ in range(10):
+            if await self._has_video_element():
+                logger.info(f"[{self.site_key}] video element found")
+                await self.page.evaluate("""() => {
+                    for (const v of document.querySelectorAll('video')) {
+                        v.muted = false; v.volume = 1.0; v.play().catch(() => {});
+                    }
+                }""")
+                return True
+            await asyncio.sleep(2)
+        logger.warning(f"[{self.site_key}] no video after source load")
+        return False
+
+    async def next_source(self) -> bool:
+        """Cycle to the next mirror, re-enumerating live if our cached list is exhausted.
+
+        This is what makes auto-recovery work for tabs the user opened in their
+        own browser — we re-scan the page DOM for fresh iframes/buttons each call.
+        """
+        # Try the cached list first
+        if self.available_sources and self.current_source_index + 1 < len(self.available_sources):
+            return await super().next_source()
+
+        # Cache exhausted — re-enumerate, skipping anything we've already tried
+        await self.list_sources()
+        for i, s in enumerate(self.available_sources):
+            if s.url and s.url not in self._tried_iframe_srcs:
+                self.current_source_index = i
+                return await self.load_stream(i)
+        logger.warning(f"[{self.site_key}] no fresh sources available")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Site discovery
+# ---------------------------------------------------------------------------
+
+# Domain substring → canonical site key. Order matters only for logging clarity.
+STREAMING_DOMAINS: dict[str, str] = {
+    "streamed.": "streamed.pk",
+    "onhockey.": "onhockey.tv",
+    "viprow.": "viprow",
+    "vipbox.": "viprow",
+    "vipleague.": "viprow",
+    "livetv.sx": "livetv.sx",
+    "livetvon.": "livetv.sx",
+    "livetv7": "livetv.sx",
+    "livetv8": "livetv.sx",
+    "embedsports.": "embedsports",
+    "sportsurge.": "sportsurge",
+    "streameast.": "streameast",
+    "crackstreams.": "crackstreams",
+    "methstreams.": "methstreams",
+    "buffstreams.": "buffstreams",
+    "daddylivehd.": "daddylive",
+    "daddylive.": "daddylive",
+}
+
+
+def infer_site_from_url(url: str) -> Optional[str]:
+    """Return the canonical site key for a URL, or None if not recognized."""
+    if not url:
+        return None
+    try:
+        hostname = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    provider_host = hostname.removeprefix("www.")
+    for needle, key in STREAMING_DOMAINS.items():
+        # Some providers rotate TLDs, so entries ending in a dot intentionally
+        # match the provider label at the start of the hostname. Other entries
+        # match a complete hostname label, never paths or query strings.
+        if (
+            needle.endswith(".")
+            and provider_host.count(".") == 1
+            and provider_host.startswith(needle)
+        ):
+            return key
+        if not needle.endswith(".") and (
+            hostname == needle or hostname.endswith(f".{needle}")
+        ):
+            return key
+    return None
+
+
+def is_streaming_url(url: str) -> bool:
+    return infer_site_from_url(url) is not None
+
+
 def get_driver(page: Page, config: dict, site: str) -> BaseSiteDriver:
     """Factory function to get the right driver for a site."""
     drivers = {
@@ -617,7 +847,13 @@ def get_driver(page: Page, config: dict, site: str) -> BaseSiteDriver:
         "onhockey.tv": OnHockeyTVDriver,
         "onhockey": OnHockeyTVDriver,
     }
-    driver_cls = drivers.get(site.lower())
-    if not driver_cls:
-        raise ValueError(f"Unknown site: {site}. Available: {list(drivers.keys())}")
-    return driver_cls(page, config)
+    site_lower = site.lower()
+    driver_cls = drivers.get(site_lower)
+    if driver_cls:
+        return driver_cls(page, config)
+    # Anything we know about as a streaming domain but don't have a bespoke
+    # driver for falls back to the generic driver — this gives us mirror
+    # cycling and recovery on viprow, livetv.sx, sportsurge, etc.
+    if site_lower in {v for v in STREAMING_DOMAINS.values()} or site_lower == "generic":
+        return GenericStreamingDriver(page, config, site_lower)
+    raise ValueError(f"Unknown site: {site}. Available: {list(drivers.keys())} + generic")

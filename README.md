@@ -10,7 +10,7 @@ StreamKeeper is a Playwright-based Python automation tool that navigates to your
 StreamKeeper (Mithrandir Agent: "Watcher")
 ├── Discord Bot Interface     # Command & control via Discord
 ├── Stream Orchestrator       # Main event loop & recovery logic
-├── Site Drivers              # Per-site navigation (streamed.pk, onhockey.tv)
+├── Site Drivers              # Bespoke drivers plus generic domain auto-detection
 ├── Health Monitor            # Video element polling, audio checks
 ├── Ad Handler                # Network interception + overlay dismissal
 └── Playwright Browser        # Headed Chromium w/ uBlock Origin
@@ -18,7 +18,7 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 
 ## Features
 
-- **Discord-controlled**: `/watch Blues` to start, `/status` to check, `/switch` to change streams
+- **Discord-controlled**: `!watch Blues` to start, `!status` to check, `!switch` to change streams
 - **Ad blocking**: Dual-layer — network route interception + uBlock Origin extension
 - **Stream health monitoring**: Polls HTML5 `<video>` element for stalls, freezes, audio loss
 - **Auto-recovery**: Graduated recovery — unmute → replay → reload iframe → reload page → try next mirror
@@ -75,11 +75,18 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 ## How It Works
 
 ### Stream Discovery
-1. Navigates to streamed.pk (or onhockey.tv)
+1. Navigates to streamed.pk/onhockey.tv, or attaches to a supported stream tab already open in Chromium
 2. Searches game listings for your team name
 3. Clicks into the game page
 4. Dismisses ad overlays
 5. Locates the video player (iframe or direct `<video>` element)
+
+Generic auto-detection currently recognizes VIPRow/VIPBox/VIPLeague, LiveTV,
+EmbedSports, Sportsurge, StreamEast, CrackStreams, MethStreams, BuffStreams,
+and DaddyLive domain aliases. Start Chromium with remote debugging enabled so
+StreamKeeper can attach to an existing tab. Cross-origin iframe contents cannot
+always be inspected directly; the generic driver navigates to discovered iframe
+sources when possible, but site DOM changes may still require manual selection.
 
 ### Health Monitoring Loop (every 5 seconds)
 1. Check `video.readyState` — is there enough data to play?
