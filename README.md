@@ -139,3 +139,25 @@ On this laptop, Playwright Firefox 146's native Wayland binary crashes with a `w
 - Uses persistent browser context so extension settings and cookies survive restarts
 - Site-specific selectors will need periodic tuning as these sites change their DOM
 - Use `playwright codegen <url>` to quickly capture updated selectors
+
+### Firefox playback stability (2026-10-13)
+
+Cleanup now preserves player iframes (including `/embed/admin/` URLs) and their
+containers. Health and play commands inspect cross-origin Playwright frames in
+Firefox. Recovery waits for a sustained failure and uses one stage per attempt;
+automatic monitoring excludes directory and off-site advertisement pages.
+Direct URL startup no longer clicks arbitrary source links.
+
+Run `python3 -m unittest test_health_monitor test_sites test_layout` for 17
+hermetic checks, including a routed Firefox cross-origin canvas-video fixture.
+Grok and AGY reviewed the patch. Material startup and evidence gaps were closed.
+The final Grok cross-origin auto-attachment finding assumed CDP was required;
+`AutoAttachTests.test_cross_origin_video_attaches_without_cdp` disproves that
+assumption by executing the production loop with an embedded video and no CDP.
+Repeated mirror attempts deliberately try additional mirrors; frozen-state
+tracking clears when playback advances, not merely when readyState is high.
+
+Real Viking/Bayern embeds still returned “Remove sandbox attributes on the
+iframe tag” in isolated Firefox, including a top-level Admin page without
+extensions or watcher scripts. This repair does not claim that source playback
+is restored or that removing iframe protections will fix it.

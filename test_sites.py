@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from sites import GenericStreamingDriver, OnHockeyTVDriver, StreamedPKDriver
-from sites import get_driver, infer_site_from_url, is_streaming_url
+from sites import get_driver, infer_site_from_url, is_streaming_url, is_auto_watch_url
 
 
 class SiteInferenceTests(unittest.TestCase):
@@ -17,6 +17,11 @@ class SiteInferenceTests(unittest.TestCase):
         self.assertIsNone(infer_site_from_url("not a url"))
         self.assertIsNone(infer_site_from_url(""))
         self.assertFalse(is_streaming_url("https://example.com/streamed.pk"))
+
+    def test_auto_watch_excludes_directories_and_ad_destinations(self):
+        for url in ("https://streamed.pk/", "https://streamed.pk/schedule", "https://www.vivint.com/ad"):
+            self.assertFalse(is_auto_watch_url(url))
+        self.assertTrue(is_auto_watch_url("https://streamed.pk/watch/game/admin/1"))
 
     def test_factory_selects_bespoke_and_generic_drivers(self):
         page = object()

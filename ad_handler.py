@@ -111,7 +111,7 @@ class AdHandler:
         site_config = self._get_site_config(page.url)
         overlay_selector = site_config.get("selectors", {}).get(
             "ad_overlay",
-            ".overlay, .ad-overlay, [class*='popup'], [class*='modal'], [id*='ad']"
+            ".ad-overlay, .ad-popup, .advertisement"
         )
         close_selector = site_config.get("selectors", {}).get(
             "close_button",
@@ -120,7 +120,10 @@ class AdHandler:
 
         # Strategy 1: Click close buttons on overlays
         try:
-            close_buttons = await page.query_selector_all(close_selector)
+            close_buttons = await page.query_selector_all(
+                ', '.join(f'{overlay.strip()} {close.strip()}' for overlay in overlay_selector.split(',')
+                          for close in close_selector.split(','))
+            )
             for btn in close_buttons:
                 if await btn.is_visible():
                     try:
@@ -148,7 +151,7 @@ class AdHandler:
                 );
                 // Check if it looks like an ad (not the video player)
                 const isAd = (
-                    !el.querySelector('video') &&
+                    !el.querySelector('video, iframe') &&
                     !el.closest('[class*="player"]') &&
                     (el.className + el.id).match(/ad|overlay|popup|modal|banner|promo/i)
                 );
@@ -157,16 +160,8 @@ class AdHandler:
                     removed++;
                 }
             }
-            // Also kill common ad iframes
-            const adIframes = document.querySelectorAll(
-                'iframe[src*="ad"], iframe[src*="pop"], iframe[src*="banner"],' +
-                'iframe[width="1"], iframe[height="1"]'
-            );
-            for (const iframe of adIframes) {
-                if (iframe.hasAttribute('data-sk-tab')) continue;
-                iframe.remove();
-                removed++;
-            }
+            // Embedded players often contain /admin/ in their URL. Never infer
+            // advertising from a substring or dimensions; network filters own it.
             return removed;
         }""")
 

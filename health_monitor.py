@@ -79,6 +79,10 @@ class HealthHistory:
         if len(self.snapshots) > self.max_snapshots:
             self.snapshots.pop(0)
 
+        # Loading/navigating frames start a fresh stall observation window.
+        if snap.state in (StreamState.NO_VIDEO, StreamState.LOADING, StreamState.UNKNOWN):
+            self.stall_start = None
+
         # Track if currentTime is advancing
         if snap.current_time > self.last_current_time + 0.5:
             self.last_advancing_time = snap.timestamp
@@ -242,12 +246,20 @@ class HealthMonitor:
         """Take a single health snapshot from the video element."""
         snap = HealthSnapshot(timestamp=time.time())
 
-        try:
-            result = await page.evaluate(HEALTH_CHECK_JS)
-        except Exception as e:
-            logger.warning(f"Health check JS failed: {e}")
-            snap.state = StreamState.ERROR
-            snap.error_message = str(e)
+        result = {"found": False}
+        unreadable = False
+        # Playwright can inspect cross-origin frames in Firefox as well as Chrome.
+        for index, frame in enumerate(page.frames):
+            try:
+                candidate = await frame.evaluate(HEALTH_CHECK_JS)
+                if candidate.get("found"):
+                    result = candidate
+                    break
+            except Exception:
+                if index == 0:
+                    unreadable = True  # Main document navigation is transient.
+        if not result.get("found") and unreadable:
+            snap.state = StreamState.LOADING
             self.history.add(snap)
             return snap
 
@@ -319,7 +331,7 @@ class HealthMonitor:
     async def force_unmute(self, page: Page) -> bool:
         """Force the video element to unmute and set volume to max."""
         try:
-            result = await page.evaluate("""() => {
+            script = ("""() => {
                 let video = document.querySelector('video');
                 if (!video) {
                     const iframes = document.querySelectorAll('iframe');
@@ -338,6 +350,14 @@ class HealthMonitor:
                 video.volume = 1.0;
                 return true;
             }""")
+            result = False
+            for frame in page.frames:
+                try:
+                    if await frame.evaluate(script):
+                        result = True
+                        break
+                except Exception:
+                    continue
             if result:
                 logger.info("Forced video unmute + volume 1.0")
             return result
@@ -348,7 +368,7 @@ class HealthMonitor:
     async def force_play(self, page: Page) -> bool:
         """Force the video element to play."""
         try:
-            result = await page.evaluate("""() => {
+            script = ("""() => {
                 let video = document.querySelector('video');
                 if (!video) {
                     const iframes = document.querySelectorAll('iframe');
@@ -368,6 +388,14 @@ class HealthMonitor:
                 video.volume = 1.0;
                 return true;
             }""")
+            result = False
+            for frame in page.frames:
+                try:
+                    if await frame.evaluate(script):
+                        result = True
+                        break
+                except Exception:
+                    continue
             if result:
                 logger.info("Forced video play + unmute")
             return result
@@ -380,13 +408,21 @@ class HealthMonitor:
         if not self.history.snapshots:
             return False
         latest = self.history.snapshots[-1]
-        return latest.state in (
+        unhealthy = (
             StreamState.STALLED,
             StreamState.FROZEN,
             StreamState.ERROR,
             StreamState.ENDED,
             StreamState.PAUSED,
         )
+        # Require a sustained failure, not a single buffering/user pause sample.
+        threshold = max(self.stall_threshold, self.poll_interval * 2)
+        recent = []
+        for snap in reversed(self.history.snapshots):
+            if snap.state not in unhealthy:
+                break
+            recent.append(snap)
+        return len(recent) >= 3 and latest.timestamp - recent[-1].timestamp >= threshold
 
     def get_recovery_reason(self) -> str:
         """Get human-readable reason for why recovery is needed."""

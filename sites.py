@@ -839,6 +839,17 @@ def is_streaming_url(url: str) -> bool:
     return infer_site_from_url(url) is not None
 
 
+def is_auto_watch_url(url: str) -> bool:
+    """Auto-watch player pages only; directory pages and ad destinations are excluded."""
+    site = infer_site_from_url(url)
+    if not site:
+        return False
+    path = urlsplit(url).path.rstrip("/")
+    if site == "streamed.pk":
+        return path.startswith("/watch/")
+    return bool(path) and path not in ("/schedule", "/live", "/sports")
+
+
 def get_driver(page: Page, config: dict, site: str) -> BaseSiteDriver:
     """Factory function to get the right driver for a site."""
     drivers = {

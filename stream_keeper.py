@@ -39,7 +39,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from ad_handler import AdHandler
 from api_server import StreamKeeperAPI
 from health_monitor import HealthMonitor, StreamState
-from sites import get_driver, BaseSiteDriver, STREAMING_DOMAINS, infer_site_from_url
+from sites import get_driver, BaseSiteDriver, STREAMING_DOMAINS, infer_site_from_url, is_auto_watch_url
 from display_layout import plan_layout
 from tab_view import fill_tab
 
@@ -369,9 +369,8 @@ class StreamKeeper:
                         has_video = page_url in cdp_video_urls
 
                     inferred_site = infer_site_from_url(page_url)
-                    is_streaming_page = inferred_site is not None
 
-                    if not has_video and not is_streaming_page:
+                    if not is_auto_watch_url(page_url) or not has_video:
                         continue
 
                     try:
@@ -602,35 +601,13 @@ class StreamKeeper:
                     for (const btn of playBtns) {
                         if (btn.offsetParent !== null) { btn.click(); break; }
                     }
-                    // Click stream source links (first available)
-                    const sources = document.querySelectorAll(
-                        'a[href*="stream"], a[href*="player"], .source-link, .stream-link'
-                    );
-                    for (const src of sources) {
-                        if (src.offsetParent !== null) { src.click(); break; }
-                    }
                 }""")
             except Exception:
                 pass
 
-            # Check for video element
-            has_video = await page.evaluate("""() => {
-                let video = document.querySelector('video');
-                if (!video) {
-                    const iframes = document.querySelectorAll('iframe');
-                    for (const iframe of iframes) {
-                        try {
-                            const doc = iframe.contentDocument || iframe.contentWindow?.document;
-                            if (doc) { video = doc.querySelector('video'); if (video) break; }
-                        } catch (e) {}
-                    }
-                }
-                if (!video) return false;
-                video.muted = false;
-                video.volume = 1.0;
-                video.play().catch(() => {});
-                return true;
-            }""")
+            # Inspect and start embedded videos across origins in both engines.
+            startup_health = HealthMonitor(self.config)
+            has_video = await startup_health.force_play(page)
 
             if has_video:
                 logger.info(f"[{stream_id}] Video found after {attempt+1} startup rounds")
@@ -1830,7 +1807,7 @@ class StreamKeeper:
                     return
 
             # Level 2: Reload the stream iframe / re-click source
-            if attempt <= 3:
+            if attempt == 2:
                 logger.info(f"Recovery L2 [{stream.id}]: Reload stream")
                 if stream.driver:
                     await stream.driver.reload_stream()
@@ -1849,7 +1826,7 @@ class StreamKeeper:
                     return
 
             # Level 3: Try next mirror
-            if attempt <= 4:
+            if attempt in (3, 4):
                 logger.info(f"Recovery L3 [{stream.id}]: Switch to next source")
                 if stream.driver:
                     success = await stream.driver.next_source()
@@ -1866,8 +1843,9 @@ class StreamKeeper:
                             return
 
             # Level 4: Full restart from scratch
-            logger.info(f"Recovery L4 [{stream.id}]: Full restart")
-            if stream.driver and stream.team:
+            if attempt >= 5:
+                logger.info(f"Recovery L4 [{stream.id}]: Full restart")
+            if attempt >= 5 and stream.driver and stream.team:
                 await stream.driver.navigate_to_games()
                 game = await stream.driver.find_game(stream.team)
                 if game:
@@ -1887,7 +1865,7 @@ class StreamKeeper:
                         return
 
             # If we get here, all recovery failed
-            logger.error(f"All recovery levels failed for [{stream.id}]")
+            logger.error(f"Recovery stage {attempt} did not restore playback for [{stream.id}]")
             if self._discord_notify:
                 await self._discord_notify(
                     f"⚠️ Recovery attempt #{attempt} failed for {stream.team} [`{stream.id}`].\n"
