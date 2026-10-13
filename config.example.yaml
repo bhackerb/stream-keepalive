@@ -14,6 +14,8 @@ discord:
 
 # Browser settings
 browser:
+  # Regular browsers require the companion extension; managed mode is opt-in.
+  control_mode: regular
   engine: "firefox"  # Default; requires: playwright install firefox. Chromium remains opt-in.
   fill_tab: true  # Expand player inside the tab; Escape restores the page
   firefox_user_data_dir: "./browser-data-firefox"  # Separate patched-Firefox profile
@@ -135,3 +137,9 @@ logging:
   file: "./logs/stream-keeper.log"
   max_size_mb: 10
   backup_count: 3
+
+# Regular-browser session controls (no special browser profiles).
+session:
+  max_open_streams: 20  # includes parked windows; TV/dock visible limits stay 4/10
+  start_muted: true
+  state_file: regular-session.json

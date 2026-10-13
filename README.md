@@ -161,3 +161,74 @@ Real Viking/Bayern embeds still returned “Remove sandbox attributes on the
 iframe tag” in isolated Firefox, including a top-level Admin page without
 extensions or watcher scripts. This repair does not claim that source playback
 is restored or that removing iframe protections will fix it.
+
+## Regular Firefox / Chrome companion
+
+`browser.control_mode: regular` uses your ordinary running browser and its cookies,
+permissions and ad blockers. StreamKeeper never launches, copies, restarts or kills
+that browser. Existing configurations without `control_mode` retain managed mode;
+new example configurations select regular mode. Use `python3 install_companion.py
+--enable` to build the extension, register the authenticated user-scoped native host,
+back up the local config, and select regular Firefox. Restart the StreamKeeper service
+once after enabling. A connected companion is required before windows can open.
+
+Chrome: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**,
+and select `build/companion/chrome`. Firefox: for development open
+`about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**, and select
+`build/companion/firefox/manifest.json`. Temporary Firefox installation lasts until
+Firefox restarts. For permanent use, submit `build/streamkeeper-firefox.zip` to Mozilla
+for **unlisted signing**, then install the resulting signed XPI. Do not disable
+signature enforcement. The generated Chrome ID is stable because the committed public
+key is fixed; no private key is retained. Native manifests grant only that extension
+and `streamkeeper@bhackerb.local` access. No API key is placed in either extension.
+
+The companion supports Streamed and its allowlisted player hosts. Other source-site
+URLs still need the optional managed adapter; regular mode does not claim generic
+control of arbitrary websites. Normal ad blocking remains the browser's responsibility;
+active uBlock and observed blocked requests are separate from playback evidence.
+Installing the companion does not install an ad blocker.
+
+POST `/session` with authenticated JSON:
+
+```json
+{"action":"start","sports":["hockey","baseball"],"browser":"firefox","display":"dock","hours":12,"favorites":["St. Louis Blues","Colorado Avalanche"]}
+```
+
+Actions: `plan`, `start`, `status`, `stop`. Live games rank favorites first, then the
+maximum source-level viewer count (unknown remains unknown, not zero). Channels with
+no kickoff date are excluded. Later starts are tracked for a fixed 1–24 hour window
+(default 12), with a 60-second catalog cycle and a bounded viewer lookup budget. Games
+waiting for the live listing remain in the pending list after their scheduled time.
+A listed game is not proof of video playback: inspect health for progressing video.
+
+TV shows at most 4 games; dock shows 6 widescreen + 4 vertical. Mixed sessions reserve at least one live slot per requested sport when capacity permits.
+A higher-ranked newcomer
+can park a lower-ranked session window: minimize and pause its video without navigation
+or reload. Returning a parked game resumes only a video that was playing when parked.
+The open-window budget defaults to 20 (`session.max_open_streams`) including parked
+windows; the display limits remain 4/10. Overflow is visible in the plan. The open
+laptop panel is excluded from dock layouts. Existing X11/KWin placement helpers handle
+the native browser windows. X11 requests placement without geometry readback; KWin
+verifies placement. Cutoff changes require a >20% and >5-viewer improvement; missing counts retain
+explicitly labeled last-known values. Current viewer changes alone do not reorder an unchanged set of
+visible windows. Missing catalog entries preserve already visible players.
+
+New owned streams start muted (`session.start_muted: true`) for autoplay and to avoid
+multiple audio tracks. Unmute the chosen game explicitly. Health polling never refreshes
+or switches sources. Explicit reload is limited to once per stream per 10 minutes.
+Session expiry preserves playing streams. A session stop closes only its owned streams;
+manual-owned streams and personal tabs remain. A user-closed game stays suppressed for
+that session. Browser-restored tabs are reclaimed only with their saved unpredictable
+URL marker. Lost ownership is surfaced and quarantined; restart the session to open
+replacements. Browser and stream windows survive daemon restarts.
+
+Validation (offline):
+
+```sh
+python3 -m unittest test_regular_browser test_session_planner test_health_monitor test_sites test_layout
+node --test companion/background.test.cjs
+```
+
+The companion has no screenshot support yet. Regular-mode API screenshots return an
+explicit unavailable response. Escape restores tab fill across authenticated extension
+frames; iframe sandbox attributes are never removed.

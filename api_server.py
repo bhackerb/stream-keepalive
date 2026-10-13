@@ -46,6 +46,8 @@ class StreamKeeperAPI:
 
     def _setup_routes(self):
         self.app.router.add_get("/health", self.handle_health)
+        self.app.router.add_get("/browser/bridge", self.handle_bridge)
+        self.app.router.add_post("/session", self.handle_session)
         self.app.router.add_get("/status", self.handle_status)
         self.app.router.add_post("/watch", self.handle_watch)
         self.app.router.add_post("/keepalive", self.handle_keepalive)
@@ -63,6 +65,12 @@ class StreamKeeperAPI:
         if request.path == "/health":
             return await handler(request)
 
+        # Companion control must fail closed, including legacy dev configuration.
+        if request.path in ("/browser/bridge", "/session") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+            return web.json_response({"error": "API authentication required"}, status=503)
+        if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
+            return web.json_response({"error": "Native bridge is local only"}, status=403)
+
         # All other endpoints require auth
         if not self.api_key or self.api_key == "YOUR_API_KEY":
             # No API key configured — allow all (dev mode)
@@ -76,6 +84,25 @@ class StreamKeeperAPI:
             )
 
         return await handler(request)
+
+    async def handle_bridge(self, request):
+        if not hasattr(self.keeper, "bridge"):
+            return web.json_response({"error": "Enable regular browser mode first"}, status=409)
+        return await self.keeper.bridge(request)
+
+    async def handle_session(self, request):
+        if not hasattr(self.keeper, "session_action"):
+            return web.json_response({"error": "Session mode requires regular browser control"}, status=409)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Expected session object")
+            return web.json_response(await self.keeper.session_action(body))
+        except (ValueError, TypeError) as exc:
+            return web.json_response({"success": False, "message": str(exc)}, status=400)
+        except Exception:
+            logger.exception("Session request failed")
+            return web.json_response({"success": False, "message": "Session control failed; existing streams preserved"}, status=502)
 
     async def handle_health(self, _request: web.Request) -> web.Response:
         """Simple health check — is the service running?"""
@@ -95,6 +122,7 @@ class StreamKeeperAPI:
             "displays": self.config.get("layout", {}).get("displays", {}),
             "layout": self.keeper.layout_status,
             "ads": self.keeper.ad_handler.stats,
+            **(self.keeper.extra_status() if hasattr(self.keeper, "extra_status") else {}),
         }
 
         if not self.keeper.active_streams:
@@ -146,6 +174,7 @@ class StreamKeeperAPI:
             "site": stream.site,
             "url": stream.url,
             "started_at": stream.started_at,
+            "parked": getattr(stream, "parked", False),
             "uptime_seconds": round(time.time() - stream.started_at),
             "health": {
                 "state": health["state"],

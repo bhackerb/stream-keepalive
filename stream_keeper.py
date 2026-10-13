@@ -2051,7 +2051,7 @@ class StreamKeeperBot:
 
 async def run_cli(config: dict):
     """Run StreamKeeper in CLI mode (no Discord)."""
-    keeper = StreamKeeper(config)
+    keeper = make_keeper(config)
 
     # Notification callback for CLI — just log it
     async def cli_notify(msg: str):
@@ -2134,6 +2134,15 @@ async def run_cli(config: dict):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def make_keeper(config):
+    if config.get("browser", {}).get("control_mode", "managed") == "regular":
+        if not config.get("api", {}).get("enabled"):
+            raise ValueError("Regular browser control requires api.enabled for native messaging")
+        from regular_browser import RegularBrowserKeeper
+        return RegularBrowserKeeper(config)
+    return StreamKeeper(config)
+
+
 async def main():
     # Load config
     config_path = "config.yaml"
@@ -2158,7 +2167,7 @@ async def main():
         mode = "cli"
 
     if mode == "discord":
-        keeper = StreamKeeper(config)
+        keeper = make_keeper(config)
         bot = StreamKeeperBot(config, keeper)
         api = StreamKeeperAPI(keeper, config)
 
@@ -2178,7 +2187,7 @@ async def main():
             await keeper.shutdown()
     elif config.get("api", {}).get("enabled"):
         # API-only mode — no Discord, no CLI, just the HTTP API
-        keeper = StreamKeeper(config)
+        keeper = make_keeper(config)
         api = StreamKeeperAPI(keeper, config)
 
         await keeper.start_browser()
@@ -2198,7 +2207,7 @@ async def main():
             await keeper.shutdown()
     else:
         # CLI mode
-        keeper = StreamKeeper(config)
+        keeper = make_keeper(config)
         api = StreamKeeperAPI(keeper, config)
         await api.start()
         await run_cli(config)
