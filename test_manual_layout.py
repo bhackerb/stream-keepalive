@@ -105,3 +105,37 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         self.k.suppressed.add('0');self.k.command=AsyncMock(return_value=True)
         await self.k.set_session_layout({**body,'group_epoch':2})
         self.assertFalse(self.k._releasing);self.assertNotIn('1',self.k.suppressed);self.assertIn('0',self.k.suppressed)
+    async def test_pregame_source_opens_early_only_with_real_stream_metadata(self):
+        from unittest.mock import patch
+        from test_session_planner import game
+        g=game(20);g['date']=1000000+5*60000;g['sources']=[{'source':'golf','id':'test'}]
+        async def catalog(path):
+            if path=='matches/all':return[g]
+            if path=='matches/live':return[]
+            return[{'streamNo':1,'language':'English','viewers':1}]
+        self.k._json=AsyncMock(side_effect=catalog)
+        with patch('regular_browser.time.time',return_value=1000):
+            plan=await self.k.discover({'sports':['hockey'],'preload_minutes':10})
+        self.assertEqual(len(plan['live']),1);self.assertTrue(plan['live'][0]['prestart']);self.assertFalse(plan['live'][0]['live'])
+        async def empty(path):return[g]if path=='matches/all'else[]
+        self.k._json=AsyncMock(side_effect=empty)
+        with patch('regular_browser.time.time',return_value=1000):
+            plan=await self.k.discover({'sports':['hockey'],'preload_minutes':10})
+        self.assertFalse(plan['live']);self.assertEqual(len(plan['pending']),1)
+    async def test_explicit_recovery_audits_inventory_and_replaces_only_the_assigned_lost_game(self):
+        self.k._ownership_lost.add('0');self.k.discover=AsyncMock(return_value=self.plan(1));self.k._place=AsyncMock(return_value={'success':True})
+        body={'mode':'manual','start':True,'group_id':'e'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[{'game_id':'0','display':'tv','slot':0}],'recover_ids':['0']}
+        await self.k.set_session_layout(body)
+        ops=self.k.command.await_args_list;self.assertEqual(ops[0].args[1],'inventory');self.assertEqual(ops[1].args[1],'open');self.assertTrue(ops[1].kwargs['allow_replacement']);self.assertNotIn('0',self.k._ownership_lost)
+    async def test_tv_hardware_limit_blocks_quadrant_even_for_manual_requests(self):
+        from display_layout import plan_layout
+        displays={**D,'tv':{**D['tv'],'max_streams':2}}
+        with self.assertRaises(ValueError):plan_layout(displays,'tv','grid',['a','b','c'])
+        with self.assertRaises(ValueError):validate_manual_layout({'presets':{'tv':4},'assignments':[]},displays)
+        self.assertEqual(len(plan_layout(displays,'tv','grid',['a','b'])),2)
+
+    async def test_failed_recovery_audit_preserves_quarantine(self):
+        self.k._ownership_lost.add('0');self.k.command=AsyncMock(return_value=False)
+        body={'mode':'manual','start':True,'group_id':'f'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[{'game_id':'0','display':'tv','slot':0}],'recover_ids':['0']}
+        with self.assertRaises(ValueError):await self.k.set_session_layout(body)
+        self.assertIn('0',self.k._ownership_lost);self.assertEqual(self.k.command.await_count,1)

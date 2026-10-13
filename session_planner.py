@@ -22,11 +22,13 @@ def validate_spec(spec):
     hours = spec.get('hours', 12)
     if type(hours) is not int or not 1 <= hours <= 24:
         raise ValueError('hours must be an integer from 1 to 24')
+    preload=spec.get('preload_minutes',10)
+    if type(preload)is not int or not 0<=preload<=60:raise ValueError('preload_minutes must be an integer from 0 to 60')
     favorites = spec.get('favorites', [])
     if not isinstance(favorites, list) or any(not isinstance(f, str) or not f.strip() or len(f) > 120 for f in favorites):
         raise ValueError('favorites must be team names')
     return dict(sports=list(dict.fromkeys(sports)), browser=browser, display=display,
-                hours=hours, favorites=favorites, timezone='America/Denver')
+                hours=hours, preload_minutes=preload, favorites=favorites, timezone='America/Denver')
 
 
 def favorite_match(match, favorites):
@@ -58,7 +60,7 @@ def build_plan(matches, live_ids, viewers, spec, displays, now_ms, until_ms=None
     spec = validate_spec(spec)
     end = until_ms if until_ms is not None else now_ms + spec['hours'] * 3600000
     names = [n for n in ('widescreen', 'laptop', 'vertical') if n!='laptop' or n in displays] if spec['display'] == 'dock' else [spec['display']]
-    capacity = sum(CAPACITIES[n] for n in names)
+    capacity = sum(min(CAPACITIES[n],displays.get(n,{}).get("max_streams",CAPACITIES[n])) for n in names)
     window_start = end - spec['hours'] * 3600000 if until_ms is not None else now_ms
     rows = []
     seen = set()

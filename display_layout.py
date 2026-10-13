@@ -18,7 +18,9 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
             raise ValueError(f"Display {name!r} requires integer x/y/width/height")
         if region["width"] <= 0 or region["height"] <= 0:
             raise ValueError("Display dimensions must be positive")
-        capacity = CAPACITIES[name] if mode == "grid" else (2 if mode == "side-by-side" else 1)
+        limit=region.get("max_streams",CAPACITIES[name])
+        if type(limit)is not int or not 1<=limit<=CAPACITIES[name]:raise ValueError("Invalid display stream limit")
+        capacity = limit if mode == "grid" else min(limit,2 if mode == "side-by-side" else 1)
         if name == "vertical" and mode == "side-by-side":
             raise ValueError("Side-by-side is supported on TV and widescreen")
         regions.append((name, region, capacity))

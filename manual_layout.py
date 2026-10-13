@@ -8,7 +8,7 @@ def validate_manual_layout(body,displays):
     assignments=body.get('assignments',[])
     if not isinstance(presets,dict)or not isinstance(assignments,list)or len(assignments)>14:raise ValueError('Invalid manual layout')
     for name,count in presets.items():
-        if name not in displays or name not in PRESETS or type(count)is not int or count not in PRESETS[name]:raise ValueError('Unknown display or invalid grid size')
+        if name not in displays or name not in PRESETS or type(count)is not int or count not in PRESETS[name]or count>displays[name].get('max_streams',CAPACITIES[name]):raise ValueError('Unknown display or invalid grid size')
         plan_layout(displays,name,'grid',[str(i)for i in range(count)])
     result=[];games=set();slots=set()
     for a in assignments:
