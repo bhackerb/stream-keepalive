@@ -14,7 +14,7 @@ discord:
 
 # Browser settings
 browser:
-  engine: "chromium"  # chromium or firefox (requires: playwright install firefox)
+  engine: "firefox"  # Default; requires: playwright install firefox. Chromium remains opt-in.
   fill_tab: true  # Expand player inside the tab; Escape restores the page
   firefox_user_data_dir: "./browser-data-firefox"  # Separate patched-Firefox profile
   firefox_display_backend: "auto"  # Use x11 on ben-laptop: patched Firefox Wayland crashes on its current KDE protocol

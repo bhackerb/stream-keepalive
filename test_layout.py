@@ -41,7 +41,7 @@ class LayoutTests(unittest.TestCase):
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_shared_window_rejected_before_moving(self):
-        keeper = StreamKeeper({"layout": {"displays": DISPLAYS}})
+        keeper = StreamKeeper({"browser": {"engine": "chromium"}, "layout": {"displays": DISPLAYS}})
         session = AsyncMock()
         session.send.return_value = {"windowId": 1}
         keeper.context = AsyncMock()

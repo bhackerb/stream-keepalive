@@ -101,7 +101,7 @@ class StreamKeeper:
         self.default_site: str = config.get("defaults", {}).get("site", "streamed.pk")
         self._playwright = None
         self._auto_keepalive_task: Optional[asyncio.Task] = None
-        self.browser_engine = config.get("browser", {}).get("engine", "chromium")
+        self.browser_engine = config.get("browser", {}).get("engine", "firefox")
         if self.browser_engine not in ("chromium", "firefox"):
             raise ValueError("browser.engine must be chromium or firefox")
         self._managed_pages = set()
