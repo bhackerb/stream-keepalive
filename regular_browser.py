@@ -46,21 +46,22 @@ class RegularBrowserKeeper:
         self.layout_status={'success':False,'message':'No companion connected'}
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=()
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set()
         self._load()
     @property
     def is_watching(self):return bool(self.active_streams)
     def _load(self):
         if self.state_path.exists():
             try:
-                state=json.loads(self.state_path.read_text());self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
+                state=json.loads(self.state_path.read_text());self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
                 for sid,r in state.get('streams',{}).items():self._add(sid,r)
+                self._releasing.intersection_update(self.active_streams)
                 if self.manual_layout:
                     try:self.manual_layout=validate_manual_layout(self.manual_layout,self.config.get('layout',{}).get('displays',{}))
                     except ValueError:self.manual_layout=None;self.session=None;self.errors=['Saved display layout no longer matches configuration; streams preserved. Reapply a new layout.']
             except (ValueError,TypeError,KeyError):log.warning('Invalid regular browser state; ignoring')
     def _save(self):
-        value={'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
+        value={'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
         self.state_path.parent.mkdir(parents=True,exist_ok=True);temp=self.state_path.with_suffix('.tmp')
         fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'w')as f:
@@ -118,19 +119,25 @@ class RegularBrowserKeeper:
                 if sid not in self.active_streams:self._add(sid,dict(r,browser=browser))
             for sid,s in list(self.active_streams.items()):
                 if s.browser==browser and sid not in records:
-                    self.active_streams.pop(sid,None);self._ownership_lost.add(sid)
+                    self.active_streams.pop(sid,None)
+                    if sid in self._releasing:self._releasing.discard(sid)
+                    else:self._ownership_lost.add(sid)
             for sid in m.get('lost',[]):
                 if isinstance(sid,str):self._ownership_lost.add(sid)
             self._browser_ready[browser]=True;self._save()
         elif m.get('event')=='ownership_lost':
             sid=m.get('stream_id');s=self.active_streams.get(sid)
             if isinstance(sid,str):
+                if s and s.browser!=browser:return
                 self._ownership_lost.add(sid)
-                if s and s.browser==browser:self.active_streams.pop(sid,None)
+                if s and s.browser==browser:self.active_streams.pop(sid,None);self._releasing.discard(sid)
                 self._save()
         elif m.get('event')=='closed':
-            sid=m.get('stream_id');s=self.active_streams.get(sid)
-            if s and s.browser==browser:self.active_streams.pop(sid,None);self.suppressed.add(sid);self._save()
+            sid=m.get('stream_id');
+            if sid in self._releasing and self.active_streams.get(sid) and self.active_streams[sid].browser==browser:
+                self.active_streams.pop(sid,None);self._releasing.discard(sid);self._save();return
+            s=self.active_streams.get(sid)
+            if s and s.browser==browser:self.active_streams.pop(sid,None);self._releasing.discard(sid);self.suppressed.add(sid);self._save()
         elif m.get('event')=='health':
             sid=m.get('stream_id');s=self.active_streams.get(sid);h=m.get('health')
             if not s or s.browser!=browser or not isinstance(h,dict):return
@@ -177,7 +184,7 @@ class RegularBrowserKeeper:
                     try:await self.command_for(target,'close')
                     except Exception as e:
                         log.warning('Stream close unavailable: %s',type(e).__name__);failed.append(target);continue
-                    self.active_streams.pop(target,None)
+                    self.active_streams.pop(target,None);self._releasing.discard(target)
             self._save()
         return ('Tracking stopped; could not close '+', '.join(failed))if failed else 'Stopped selected StreamKeeper-owned windows'
     async def force_reload(self,sid=None):
@@ -218,7 +225,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'control_mode':'regular','browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
+        return {'control_mode':'regular','browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
     async def _json(self,path):
         async with self._client.get('https://streamed.pk/api/'+path) as res:
             res.raise_for_status();value=await res.json()
@@ -262,7 +269,7 @@ class RegularBrowserKeeper:
                         try:await self.command_for(sid,'close')
                         except Exception as e:
                             log.warning('Stream close unavailable: %s',type(e).__name__);failed.append(sid);continue
-                        self.active_streams.pop(sid,None)
+                        self.active_streams.pop(sid,None);self._releasing.discard(sid)
                 self._save()
             return {'success':True,'message':'Session tracking stopped; other owned streams preserved','errors':['Could not close '+sid for sid in failed]}
         if action not in ('start','plan'):raise ValueError('action must be plan, start, status, or stop')
@@ -282,7 +289,7 @@ class RegularBrowserKeeper:
                 if time.time()-self._end_seen[sid]<60:continue
                 try:await self.command_for(sid,'close')
                 except (ValueError,TimeoutError):continue
-                self.active_streams.pop(sid,None);self.suppressed.add(sid)
+                self.active_streams.pop(sid,None);self._releasing.discard(sid);self.suppressed.add(sid)
             else:self._end_seen.pop(sid,None)
     async def _reconcile(self,plan,allow_replacements=False):
         if not self.session:return
@@ -362,18 +369,36 @@ class RegularBrowserKeeper:
             layout=validate_manual_layout(body,self.config.get('layout',{}).get('displays',{}))
             if type(body.get('start',False))is not bool:raise ValueError('start must be boolean')
             spec=validate_spec(body) if body.get('start')or body.get('sports') else None
+            group=body.get('group_id')
+            if group is not None and(not isinstance(group,str)or len(group)!=32 or any(c not in '0123456789abcdef'for c in group)):raise ValueError('Invalid group ID')
+            epoch=body.get('group_epoch',0)
+            if group and(type(epoch)is not int or epoch<0 or epoch<=self._group_epochs.get(group,-1)):raise ValueError('Stale or invalid shared-session epoch')
             if not body.get('start'):
                 self.saved_layout={**layout,'spec':spec};self._save()
                 return {'success':True,'message':'Layout draft saved; no windows changed','layout':self.saved_layout}
             if self.session and spec['browser']!=self.session['spec']['browser']:raise ValueError('Stop the active session before changing browsers')
             plan=await self.discover(spec)
             known={r['id']for r in plan['live']+plan['pending']}|set(self.active_streams)
+            if any(a['game_id']in self._releasing for a in layout['assignments']):raise ValueError('Previous source release still unconfirmed; wait for close or stop that owned stream')
             if any(a['game_id']not in known for a in layout['assignments']):raise ValueError('One or more games are outside the current live/later-start catalog; refresh the games list')
+            releases=body.get('release_ids',[])
+            if not isinstance(releases,list)or len(releases)>20 or any(not isinstance(i,str)for i in releases)or (releases and not group):raise ValueError('Invalid shared-session releases')
+            if set(releases)&{a['game_id']for a in layout['assignments']}:raise ValueError('Cannot release an assigned game')
+            if type(body.get('reset_suppression',False))is not bool or(body.get('reset_suppression')and not group):raise ValueError('Invalid suppression reset')
+            if body.get('reset_suppression')and group not in self._group_epochs:self.suppressed.difference_update(r['id']for r in plan['live']+plan['pending'])
+            # Commit the new desired layout before a potentially delayed close, so
+            # the old local loop cannot reopen departing games after an API timeout.
+            if group:self._group_epochs[group]=epoch
             self.saved_layout={**layout,'spec':spec};self.manual_layout=layout;self._manual_signature=()
-            self.session={'id':self.session['id']if self.session else uuid.uuid4().hex,'spec':spec,'until_ms':plan['until_ms']}
+            self.session={'id':self.session['id']if self.session else uuid.uuid4().hex,'spec':spec,'until_ms':plan['until_ms'],'group_id':group,'group_epoch':epoch}
             for a in layout['assignments']:
                 if a['game_id']in self.active_streams:self.active_streams[a['game_id']].session_id=self.session['id']
-            self.plan=plan;self._save()
+            self.plan=plan;self._releasing.update(sid for sid in releases if sid in self.active_streams);self._save()
+            for sid in releases:
+                if sid not in self.active_streams:continue
+                result=await self.command_for(sid,'close')
+                if result is not True:raise ValueError('Companion did not confirm source window close')
+                self.active_streams.pop(sid,None);self._releasing.discard(sid);self._save()
             try:await self._reconcile_manual(plan)
             except Exception as e:
                 log.exception('Manual layout partially applied; desired layout retained for retry')
@@ -383,7 +408,7 @@ class RegularBrowserKeeper:
     async def _reconcile_manual(self,plan,allow_replacements=False):
         self.errors=[];await self._retire_ended(plan);assignments=self.manual_layout['assignments'];wanted={a['game_id']for a in assignments}
         live={r['id']:r for r in plan['live']};visible={sid for sid in wanted if sid in live or sid in self.active_streams}
-        visible-=self.suppressed|self._ownership_lost
+        visible-=self.suppressed|self._ownership_lost|self._releasing
         for sid,s in list(self.active_streams.items()):
             if s.session_id:
                 park=sid not in visible

@@ -68,3 +68,40 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
             self.k.command.assert_not_awaited()
         async with TestClient(TestServer(StreamKeeperAPI(self.k,{**self.config,'api':{'api_key':''}}).app))as c:
             self.assertEqual((await c.post('/session-layout',json={'mode':'auto'})).status,503)
+    async def test_shared_release_closes_confirmed_source_without_user_suppression_and_fences_old_epoch(self):
+        await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2));self.k._place=AsyncMock(return_value={'success':True})
+        body={'mode':'manual','start':True,'group_id':'a'*32,'group_epoch':2,'presets':{'tv':4},'assignments':[{'game_id':'0','display':'tv','slot':0}],'release_ids':['1']}
+        await self.k.set_session_layout(body);self.assertNotIn('1',self.k.active_streams);self.assertNotIn('1',self.k.suppressed)
+        with self.assertRaises(ValueError):await self.k.set_session_layout({**body,'group_epoch':1})
+        self.assertEqual(self.k.extra_status()['session']['group_epoch'],2)
+    async def test_laptop_panel_adds_two_slots_between_wide_and_vertical(self):
+        from display_layout import plan_layout
+        displays={**D,'laptop':{'x':4592,'y':592,'width':1970,'height':1231}}
+        layout=plan_layout(displays,'dock','grid',[str(i)for i in range(12)])
+        self.assertEqual([p['display']for p in layout],['widescreen']*6+['laptop']*2+['vertical']*4)
+    async def test_timed_out_release_keeps_new_desired_layout_and_late_close_is_not_user_suppression(self):
+        await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2))
+        self.k.command=AsyncMock(side_effect=TimeoutError('fixture'))
+        body={'mode':'manual','start':True,'group_id':'b'*32,'group_epoch':1,'presets':{'tv':4},'assignments':[],'release_ids':['1']}
+        with self.assertRaises(TimeoutError):await self.k.set_session_layout(body)
+        self.assertEqual(self.k.manual_layout['assignments'],[]);self.assertIn('1',self.k._releasing)
+        await self.k._event('firefox',{'event':'closed','stream_id':'1'})
+        self.assertNotIn('1',self.k.active_streams);self.assertNotIn('1',self.k.suppressed)
+        with self.assertRaises(ValueError):await self.k.set_session_layout(body)
+    async def test_concurrent_same_epoch_has_one_winner_and_invalid_groups_return_value_error(self):
+        import asyncio
+        self.k.discover=AsyncMock(return_value=self.plan(0))
+        body={'mode':'manual','start':True,'group_id':'c'*32,'group_epoch':1,'presets':{'tv':4},'assignments':[]}
+        results=await asyncio.gather(self.k.set_session_layout(body),self.k.set_session_layout(body),return_exceptions=True)
+        self.assertEqual(sum(isinstance(r,dict)for r in results),1);self.assertEqual(sum(isinstance(r,ValueError)for r in results),1)
+        for group in ([],{},'bad'):
+            with self.assertRaises(ValueError):await self.k.set_session_layout({**body,'group_id':group,'group_epoch':2})
+    async def test_release_retry_with_new_epoch_converges_and_preserves_unrelated_suppression(self):
+        await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2));self.k.suppressed.update(('other-sport-game','0'))
+        self.k.command=AsyncMock(return_value=False)
+        body={'mode':'manual','start':True,'group_id':'d'*32,'group_epoch':1,'reset_suppression':True,'presets':{'tv':4},'assignments':[],'release_ids':['1']}
+        with self.assertRaises(ValueError):await self.k.set_session_layout(body)
+        self.assertIn('1',self.k._releasing);self.assertIn('other-sport-game',self.k.suppressed);self.assertNotIn('0',self.k.suppressed)
+        self.k.suppressed.add('0');self.k.command=AsyncMock(return_value=True)
+        await self.k.set_session_layout({**body,'group_epoch':2})
+        self.assertFalse(self.k._releasing);self.assertNotIn('1',self.k.suppressed);self.assertIn('0',self.k.suppressed)

@@ -57,7 +57,7 @@ def reserve_sports(selected, ranked, sports, capacity):
 def build_plan(matches, live_ids, viewers, spec, displays, now_ms, until_ms=None):
     spec = validate_spec(spec)
     end = until_ms if until_ms is not None else now_ms + spec['hours'] * 3600000
-    names = ['widescreen', 'vertical'] if spec['display'] == 'dock' else [spec['display']]
+    names = [n for n in ('widescreen', 'laptop', 'vertical') if n!='laptop' or n in displays] if spec['display'] == 'dock' else [spec['display']]
     capacity = sum(CAPACITIES[n] for n in names)
     window_start = end - spec['hours'] * 3600000 if until_ms is not None else now_ms
     rows = []
