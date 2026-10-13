@@ -206,7 +206,16 @@ class StreamKeeper:
                 viewport=None,
                 no_viewport=True,
                 service_workers="block",
-                firefox_user_prefs={"media.autoplay.default": 0},
+                firefox_user_prefs={
+                    "media.autoplay.default": 0,
+                    # This is a user-facing browser: restore Mozilla add-on discovery/updates.
+                    "extensions.getAddons.cache.enabled": True,
+                    "extensions.getAddons.link.url": "https://addons.mozilla.org/%LOCALE%/firefox/",
+                    "extensions.getAddons.discovery.api_url": "https://services.addons.mozilla.org/api/v4/discovery/?lang=%LOCALE%&edition=%DISTRIBUTION%",
+                    "extensions.webservice.discoverURL": "https://addons.mozilla.org/en-US/firefox/",
+                    "extensions.update.enabled": True,
+                    "xpinstall.enabled": True,
+                },
                 env={**os.environ, **({"MOZ_ENABLE_WAYLAND": "0"} if browser_cfg.get("firefox_display_backend") == "x11" else {})},
             )
             await self.ad_handler.setup_network_blocking(self.context)
