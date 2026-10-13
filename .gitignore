@@ -3,6 +3,7 @@ config.yaml
 
 # Browser profile (large, personal)
 browser-data/
+browser-data-firefox/
 
 # uBlock Origin extension (binary, user-provided)
 extensions/
