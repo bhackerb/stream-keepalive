@@ -13,7 +13,7 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 ├── Site Drivers              # Bespoke drivers plus generic domain auto-detection
 ├── Health Monitor            # Video element polling, audio checks
 ├── Ad Handler                # Network interception + overlay dismissal
-└── Playwright Browser        # Headed Chromium w/ uBlock Origin
+└── Playwright Browser        # Headed Firefox by default; Chromium opt-in
 ```
 
 ## Features
@@ -25,7 +25,7 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 - **Adblock evidence:** Owned-browser routes run a reserved `.invalid` canary at startup. Status reports `network_enabled` and `network_verified`. Attached browsers keep the existing low-latency path without Python interception; their uBlock state is explicitly unverified rather than assumed. `extension_verified` remains false until extension-specific verification is implemented.
 
 - **Discord-controlled**: `!watch Blues` to start, `!status` to check, `!switch` to change streams
-- **Ad blocking**: Dual-layer — network route interception + uBlock Origin extension
+- **Ad blocking**: Verified network route interception; optional Chromium extension support. Full uBlock Origin is not installed in the managed Firefox profile.
 - **Stream health monitoring**: Polls HTML5 `<video>` element for stalls, freezes, audio loss
 - **Auto-recovery**: Graduated recovery — unmute → replay → reload iframe → reload page → try next mirror
 - **Audio watchdog**: Detects muted/silent streams and forces audio back on
@@ -34,9 +34,9 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 ## Prerequisites
 
 - Python 3.11+
-- Playwright (`pip install playwright && playwright install chromium`)
+- Playwright (`pip install playwright && playwright install firefox`)
 - discord.py
-- uBlock Origin (extracted extension directory)
+- Optional for Chromium: uBlock Origin (extracted extension directory)
 - A Discord bot token
 
 ## Setup
@@ -44,10 +44,10 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 1. **Install dependencies:**
    ```bash
    pip install playwright discord.py pyyaml --break-system-packages
-   playwright install chromium
+   playwright install firefox
    ```
 
-2. **Get uBlock Origin:**
+2. **Optional Chromium extension setup:**
    ```bash
    # Download from GitHub releases or extract from your Chrome profile
    # Place the extracted extension in ./extensions/ublock-origin/
