@@ -26,6 +26,7 @@ DEFAULT_BLOCKED_PATTERNS = [
     r"hilltopads", r"clickadu", r"pushground",
     r"ad-maven", r"admaven",
     r"wonderblockoffer", r"wildcasino",
+    r"(?:^|\.)wildfreedome\.com$", r"(?:^|\.)budgetezy\.org$",
     r"bet365", r"stake\.com", r"1xbet", r"betway",
     r"bongacams", r"chaturbate", r"livejasmin",
     r"popunder", r"clickaine", r"revcontent",
