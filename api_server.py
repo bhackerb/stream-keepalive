@@ -48,6 +48,7 @@ class StreamKeeperAPI:
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/browser/bridge", self.handle_bridge)
         self.app.router.add_post("/session", self.handle_session)
+        self.app.router.add_post("/session-layout", self.handle_session_layout)
         self.app.router.add_get("/status", self.handle_status)
         self.app.router.add_post("/watch", self.handle_watch)
         self.app.router.add_post("/keepalive", self.handle_keepalive)
@@ -66,7 +67,7 @@ class StreamKeeperAPI:
             return await handler(request)
 
         # Companion control must fail closed, including legacy dev configuration.
-        if request.path in ("/browser/bridge", "/session") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+        if request.path in ("/browser/bridge", "/session", "/session-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
             return web.json_response({"error": "API authentication required"}, status=503)
         if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
             return web.json_response({"error": "Native bridge is local only"}, status=403)
@@ -103,6 +104,15 @@ class StreamKeeperAPI:
         except Exception:
             logger.exception("Session request failed")
             return web.json_response({"success": False, "message": "Session control failed; existing streams preserved"}, status=502)
+
+    async def handle_session_layout(self,request):
+        if not hasattr(self.keeper,"set_session_layout"):
+            return web.json_response({"success":False,"message":"Enable regular browser mode first"},status=409)
+        try:return web.json_response(await self.keeper.set_session_layout(await request.json()))
+        except (ValueError,TypeError)as exc:return web.json_response({"success":False,"message":str(exc)},status=400)
+        except Exception:
+            logger.exception("Manual layout failed")
+            return web.json_response({"success":False,"message":"Manual layout failed; inspect current stream status"},status=502)
 
     async def handle_health(self, _request: web.Request) -> web.Response:
         """Simple health check — is the service running?"""

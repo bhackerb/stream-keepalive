@@ -1,11 +1,11 @@
 const test=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const vm=require('node:vm');
 function event(){const callbacks=[];return {addListener:f=>callbacks.push(f),fire:(...a)=>callbacks.forEach(f=>f(...a))};}
-async function harness(local={},session={}){
+async function harness(local={},session={},engine='firefox'){
  const sent=[],tabs=new Map([[1,{id:1,url:'https://personal.example/',title:'Personal',windowId:1}]]),removed=[];let next=10;
  const port={postMessage:m=>sent.push(m),onMessage:event(),onDisconnect:event()};
  const store=data=>({get:async k=>({[k]:data[k]}),set:async v=>Object.assign(data,v)});
  const tabValues={};
- const api={sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',browser_specific_settings:{gecko:{id:'fixture'}}}),onMessage:event()},
+ const api={sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',...(engine==='firefox'?{browser_specific_settings:{gecko:{id:'fixture'}}}:{})}),onMessage:event()},
   tabs:{get:async id=>{if(!tabs.has(id))throw Error('missing');return tabs.get(id);},query:async q=>{if(!q?.url)throw Error('Personal tab scan forbidden');return [...tabs.values()].filter(t=>t.url.startsWith(q.url.slice(0,-1)));},remove:async id=>{removed.push(id);tabs.delete(id);},sendMessage:async()=>true,reload:async()=>{throw Error('Unexpected reload');},onRemoved:event(),onUpdated:event()},
   windows:{update:async()=>{},create:async v=>{const id=next++;const tab={id,url:v.url,windowId:id};tabs.set(id,tab);return {id,tabs:[tab]};}},alarms:{create:()=>{},onAlarm:event()}};
  vm.runInNewContext(fs.readFileSync(__dirname+'/background.js','utf8'),{browser:api,console,setTimeout:()=>{},URL,Date,Promise,crypto:require('node:crypto').webcrypto});
@@ -66,7 +66,5 @@ test('window closing preserves durable proof for browser restoration',async()=>{
 });
 
 test('Chrome browser namespace alias cannot masquerade as Firefox',async()=>{
- const h=await harness();h.api.runtime.getManifest=()=>({version:'fixture'});
- // Chrome detection is based on manifest metadata, not namespace presence.
- const source=fs.readFileSync(__dirname+'/background.js','utf8');assert.ok(source.includes('!!api.runtime.getManifest().browser_specific_settings?.gecko'));
+ const h=await harness({}, {}, 'chromium');assert.equal(h.sent.find(m=>m.event==='hello').browser,'chromium');
 });
