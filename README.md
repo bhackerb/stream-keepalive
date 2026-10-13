@@ -18,6 +18,12 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 
 ## Features
 
+- **Firefox:** `browser.engine: firefox` launches Playwright's patched Firefox with a separate persistent profile and verified network blocking. Install its binary with `python3 -m playwright install firefox`. Regular desktop Firefox cannot be attached via Chromium CDP; loading uBlock via Chromium extension flags is unsupported in Firefox.
+- **Fill the tab:** `browser.fill_tab: true` expands the player and its iframe chain inside the existing tab in both browsers. Video nodes and player controls remain intact. Escape restores the page until manually re-enabled via `POST /tab-view`. This is independent of OS fullscreen, casting, and site theater buttons.
+- **Display layouts:** `POST /layout` takes `display` (`tv`, `widescreen`, `vertical`, `dock`), `mode` (`grid`, `side-by-side`, `focus`) and selected `stream_ids`. TV supports four, widescreen six, vertical four, and dock six plus four. Focus selects one stream; side-by-side selects two. Configure actual desktop coordinates in `layout.displays`; enable `auto_arrange` to reflow new/stopped streams. Selected streams must occupy separate windows; existing tabbed streams are rejected before movement.
+- **Desktop support:** Chromium uses CDP on X11; Firefox uses EWMH/X11 with python-xlib. KDE Wayland uses `layout.backend: kwin` with qdbus6/dbus-next for either browser, verifies the resulting geometry, and unloads its temporary script. Other Wayland compositors and Windows native tiling are not implemented.
+- **Adblock evidence:** Owned-browser routes run a reserved `.invalid` canary at startup. Status reports `network_enabled` and `network_verified`. Attached browsers keep the existing low-latency path without Python interception; their uBlock state is explicitly unverified rather than assumed. `extension_verified` remains false until extension-specific verification is implemented.
+
 - **Discord-controlled**: `!watch Blues` to start, `!status` to check, `!switch` to change streams
 - **Ad blocking**: Dual-layer — network route interception + uBlock Origin extension
 - **Stream health monitoring**: Polls HTML5 `<video>` element for stalls, freezes, audio loss
@@ -110,6 +116,18 @@ StreamKeeper is designed as the **Watcher** agent in your Mithrandir roster.
 It can be triggered by other agents or via Discord approval flows.
 
 ## Notes
+
+### Device mapping observed 2026-10-13
+
+bhbserv (X11): TV `HDMI-0`, 3840×2160 at (0,0), usable work area 3840×2080. Chromium runs at scale 2; configure `layout.cdp_scale: 2` to convert physical display pixels to CDP device-independent coordinates. Native two-window verification measured 960×1040 DIP windows covering the usable TV area, with responsive page viewports.
+
+ben-laptop (KDE Wayland): widescreen `DP-6`, 3440×1440 at (1152,383); vertical `DP-4`, 1152×2048 at (0,0). The scaled open laptop panel `eDP-1` stays available for controls. These are desktop coordinates, not assumed hardware arrangement. Recheck after docking or changing scale/resolution.
+
+On this laptop, Playwright Firefox 146's native Wayland binary crashes with a `wp_image_description_v1` protocol mismatch. Set `browser.firefox_display_backend: x11` to use XWayland; the KWin backend still controls its windows. A headed two-window Firefox smoke verified actual side-by-side geometry on the widescreen to within one desktop pixel. The verification windows used an isolated temporary profile and were closed afterward.
+
+### Verification
+
+`python3 -m unittest -v test_sites test_layout` is hermetic. `python3 verify_browser.py firefox` (or `chromium`) explicitly launches a browser against synthetic routed pages; it checks real installed-route ad blocking, nested iframe tab fill, resize and Escape/manual restore. It makes no streaming-site or LLM calls. Live sources and actual media codecs can still require site-specific troubleshooting.
 
 - Runs in **headed mode** (not headless) — you need a display since you're watching the game
 - Uses persistent browser context so extension settings and cookies survive restarts

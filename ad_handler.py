@@ -8,6 +8,7 @@ Two layers:
 
 import logging
 import re
+from urllib.parse import urlsplit
 from typing import Optional
 
 from playwright.async_api import Page, Route, BrowserContext
@@ -29,11 +30,11 @@ DEFAULT_BLOCKED_PATTERNS = [
     r"bongacams", r"chaturbate", r"livejasmin",
     r"popunder", r"clickaine", r"revcontent",
     r"mgid\.com", r"zergnet\.com",
-    r"amazonaws\.com.*ad", r"cloudfront.*ad",
 ]
 
 # Resource types that are almost always ads or tracking
 BLOCKED_RESOURCE_TYPES = {"beacon"}
+CANARY_URL = "https://doubleclick.net.streamkeeper.invalid/adblock-canary"
 
 
 class AdHandler:
@@ -43,11 +44,13 @@ class AdHandler:
         self.config = config
         self.blocked_count = 0
         self.overlays_dismissed = 0
+        self.network_enabled = False
+        self.network_verified = False
 
         # Build compiled regex from config + defaults
         extra_patterns = config.get("ads", {}).get("blocked_domain_patterns", [])
         all_patterns = DEFAULT_BLOCKED_PATTERNS + [
-            p.replace("*", ".*") for p in extra_patterns
+            re.escape(p).replace(r"\*", ".*") for p in extra_patterns
         ]
         self.block_regex = re.compile("|".join(all_patterns), re.IGNORECASE)
 
@@ -57,7 +60,19 @@ class AdHandler:
     async def setup_network_blocking(self, context: BrowserContext):
         """Install network-level ad blocking on a browser context."""
         await context.route("**/*", self._route_handler)
+        self.network_enabled = True
         logger.info("Network-level ad blocking installed on context")
+
+    async def verify_network_blocking(self, context):
+        """A reserved .invalid hostname probes the installed route, never a live ad service."""
+        page = await context.new_page()
+        try:
+            await page.goto(CANARY_URL, timeout=5000)
+        except Exception:
+            pass  # An aborted canary is expected; only the route handler proves it.
+        finally:
+            await page.close()
+        return self.network_verified
 
     async def setup_page_blocking(self, page: Page):
         """Install page-level ad blocking (for pages created outside initial context)."""
@@ -78,8 +93,10 @@ class AdHandler:
             return
 
         # Block by URL pattern
-        if self.block_regex.search(url):
+        if self.block_regex.search(urlsplit(url).hostname or ""):
             self.blocked_count += 1
+            if url == CANARY_URL:
+                self.network_verified = True
             logger.debug(f"Blocked [pattern]: {url[:80]}")
             await route.abort()
             return
@@ -121,6 +138,7 @@ class AdHandler:
             // Remove fixed/absolute positioned overlays covering the viewport
             const all = document.querySelectorAll('div, section, aside');
             for (const el of all) {
+                if (el.hasAttribute('data-sk-tab') || el.querySelector('[data-sk-tab]')) continue;
                 const style = window.getComputedStyle(el);
                 const isOverlay = (
                     (style.position === 'fixed' || style.position === 'absolute') &&
@@ -145,6 +163,7 @@ class AdHandler:
                 'iframe[width="1"], iframe[height="1"]'
             );
             for (const iframe of adIframes) {
+                if (iframe.hasAttribute('data-sk-tab')) continue;
                 iframe.remove();
                 removed++;
             }
@@ -164,7 +183,7 @@ class AdHandler:
     async def handle_new_page_popup(self, page: Page):
         """Close pages that look like ad popups."""
         url = page.url
-        if self.block_regex.search(url) or url in ("about:blank",):
+        if self.block_regex.search(urlsplit(url).hostname or ""):
             logger.info(f"Closing popup page: {url[:60]}")
             await page.close()
             return True
@@ -183,4 +202,8 @@ class AdHandler:
         return {
             "requests_blocked": self.blocked_count,
             "overlays_dismissed": self.overlays_dismissed,
+            "network_enabled": self.network_enabled,
+            "network_verified": self.network_verified,
+            "extension_verified": False,
+            "note": "Network routing installed" if self.network_enabled else "Attached browser: in-profile adblocker has not been verified",
         }

@@ -14,6 +14,10 @@ discord:
 
 # Browser settings
 browser:
+  engine: "chromium"  # chromium or firefox (requires: playwright install firefox)
+  fill_tab: true  # Expand player inside the tab; Escape restores the page
+  firefox_user_data_dir: "./browser-data-firefox"  # Separate patched-Firefox profile
+  firefox_display_backend: "auto"  # Use x11 on ben-laptop: patched Firefox Wayland crashes on its current KDE protocol
   user_data_dir: "./browser-data"  # Persistent browser profile
   ublock_origin_path: "./extensions/ublock-origin"  # Path to extracted uBlock Origin
   viewport_width: 1920
@@ -26,6 +30,22 @@ browser:
   extra_args:
     - "--autoplay-policy=no-user-gesture-required"
     - "--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies"
+
+streams:
+  max_streams: 10  # Dock: six widescreen + four vertical
+
+layout:
+  backend: "cdp"  # cdp (Chromium/X11), kwin (KDE Wayland, both browsers)
+  cdp_scale: 1  # Chromium window coordinates are DIPs: bhbserv's current browser scale is 2
+  auto_arrange: false  # Enable after mapping physical displays
+  default_display: "tv"
+  displays: {}  # Separate windows are created once displays are configured
+  # bhbserv currently reports HDMI-0: 3840x2160 at 0,0.
+  # displays:
+  #   tv: {x: 0, y: 0, width: 3840, height: 2160}
+  #   widescreen: {x: 0, y: 0, width: 3440, height: 1440}
+  #   vertical: {x: 3440, y: 0, width: 1080, height: 1920}
+  # Replace laptop coordinates with its actual desktop geometry; no guessed defaults.
 
 # Default preferences
 defaults:

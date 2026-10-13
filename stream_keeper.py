@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import logging
 import logging.handlers
+import math
 import os
 import sys
 import time
@@ -39,6 +40,8 @@ from ad_handler import AdHandler
 from api_server import StreamKeeperAPI
 from health_monitor import HealthMonitor, StreamState
 from sites import get_driver, BaseSiteDriver, STREAMING_DOMAINS, infer_site_from_url
+from display_layout import plan_layout
+from tab_view import fill_tab
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -98,9 +101,15 @@ class StreamKeeper:
         self.default_site: str = config.get("defaults", {}).get("site", "streamed.pk")
         self._playwright = None
         self._auto_keepalive_task: Optional[asyncio.Task] = None
+        self.browser_engine = config.get("browser", {}).get("engine", "chromium")
+        if self.browser_engine not in ("chromium", "firefox"):
+            raise ValueError("browser.engine must be chromium or firefox")
+        self._managed_pages = set()
+        self.layout_status = {"success": False, "message": "No layout applied"}
+        self._layout_lock = asyncio.Lock()
 
         # Limits
-        self.max_streams = config.get("streams", {}).get("max_streams", 8)
+        self.max_streams = config.get("streams", {}).get("max_streams", 10)
 
         # Recovery settings
         health_cfg = config.get("health", {})
@@ -189,6 +198,24 @@ class StreamKeeper:
 
         self._playwright = await async_playwright().start()
 
+        if self.browser_engine == "firefox":
+            # Firefox needs Playwright's patched binary, not a regular CDP browser.
+            self.context = await self._playwright.firefox.launch_persistent_context(
+                browser_cfg.get("firefox_user_data_dir", "./browser-data-firefox"),
+                headless=browser_cfg.get("headless", False),
+                viewport=None,
+                no_viewport=True,
+                service_workers="block",
+                firefox_user_prefs={"media.autoplay.default": 0},
+                env={**os.environ, **({"MOZ_ENABLE_WAYLAND": "0"} if browser_cfg.get("firefox_display_backend") == "x11" else {})},
+            )
+            await self.ad_handler.setup_network_blocking(self.context)
+            await self.ad_handler.verify_network_blocking(self.context)
+            self.context.on("page", self._on_new_page)
+            interval = self.config.get("keepalive", {}).get("auto_scan_interval_seconds", 30)
+            self._auto_keepalive_task = asyncio.create_task(self._auto_keepalive_loop(interval))
+            return
+
         # Build launch args
         args = [
             "--autoplay-policy=no-user-gesture-required",
@@ -244,9 +271,11 @@ class StreamKeeper:
                 headless=headless,
                 channel=channel,
                 args=args,
-                viewport={"width": viewport_w, "height": viewport_h},
+                viewport=None if self.config.get("layout", {}).get("displays") else {"width": viewport_w, "height": viewport_h},
+                no_viewport=bool(self.config.get("layout", {}).get("displays")),
                 ignore_default_args=["--disable-extensions"],
                 permissions=["geolocation"],
+                service_workers="block",
             )
 
         # Ad blocking: ONLY install Playwright route() interception when we
@@ -256,6 +285,7 @@ class StreamKeeper:
         # HLS video segments. Skip it entirely in CDP mode.
         if not cdp_connected:
             await self.ad_handler.setup_network_blocking(self.context)
+            await self.ad_handler.verify_network_blocking(self.context)
         else:
             logger.info("CDP mode: skipping Playwright route() ad blocking (relying on in-profile uBlock)")
 
@@ -367,6 +397,7 @@ class StreamKeeper:
                     logger.info(f"[auto-keepalive] Attached monitor to new stream: {label}")
 
                 if newly_attached:
+                    await self._auto_arrange()
                     logger.info(f"[auto-keepalive] Picked up {len(newly_attached)} new stream(s): {', '.join(newly_attached)}")
 
             except asyncio.CancelledError:
@@ -412,6 +443,8 @@ class StreamKeeper:
         Only auto-close pages that aren't tracked as active streams.
         """
         await asyncio.sleep(1)  # Let it load briefly
+        if page in self._managed_pages:
+            return
 
         # Check if this page belongs to an active stream (we created it)
         for stream in self.active_streams.values():
@@ -423,10 +456,90 @@ class StreamKeeper:
             logger.info(f"New page opened: {page.url[:80]}")
 
     async def _new_stream_page(self) -> Page:
-        """Create a new browser tab for a stream."""
+        """Create a separate window when layouts are enabled."""
         if not self.context:
             await self.start_browser()
-        return await self.context.new_page()
+        if self.config.get("layout", {}).get("displays"):
+            opener = self.context.pages[0] if self.context.pages else await self.context.new_page()
+            async with self.context.expect_page() as pending:
+                if self.browser_engine == "chromium":
+                    session = await self.context.new_cdp_session(opener)
+                    try:
+                        await session.send("Target.createTarget", {"url": "about:blank", "newWindow": True})
+                    finally:
+                        await session.detach()
+                else:
+                    await opener.evaluate("() => window.open('about:blank', '_blank', 'popup,width=960,height=540') && true")
+            page = await pending.value
+        else:
+            page = await self.context.new_page()
+        self._managed_pages.add(page)
+        page.on("close", lambda: self._managed_pages.discard(page))
+        return page
+
+    async def arrange_streams(self, display="tv", mode="grid", stream_ids=None):
+        """Validate every window before moving any; CDP is Chromium-only."""
+        async with self._layout_lock:
+            try:
+                ids = list(self.active_streams) if stream_ids is None else stream_ids
+                if not ids or any(sid not in self.active_streams for sid in ids):
+                    raise ValueError("Select existing active stream IDs")
+                placements = plan_layout(self.config.get("layout", {}).get("displays", {}), display, mode, ids)
+                if self.config.get("browser", {}).get("headless", False) and not self._cdp_url:
+                    raise ValueError("Window tiling requires a headed browser")
+                if self.config.get("layout", {}).get("backend") == "kwin":
+                    from kwin_layout import arrange_windows
+                    result = await arrange_windows(self.active_streams, placements)
+                    self.layout_status = {**result, "display": display, "mode": mode, "placements": placements}
+                    return self.layout_status
+                if self.browser_engine == "firefox":
+                    from x11_windows import window_for_page, move_window
+                    windows = [await window_for_page(self.active_streams[p["stream_id"]].page) for p in placements]
+                    if len(set(windows)) != len(windows):
+                        raise ValueError("Selected Firefox streams share a tabbed window; reopen them as separate windows")
+                    for placement, wid in zip(placements, windows):
+                        await asyncio.to_thread(move_window, wid, placement)
+                    self.layout_status = {"success": True, "message": f"Requested X11 placement for {len(ids)} stream(s)",
+                                          "display": display, "mode": mode, "placements": placements}
+                    return self.layout_status
+                windows = []
+                scale = self.config.get("layout", {}).get("cdp_scale", 1)
+                if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
+                    raise ValueError("layout.cdp_scale must be a positive finite number")
+                for placement in placements:
+                    session = await self.context.new_cdp_session(self.active_streams[placement["stream_id"]].page)
+                    try:
+                        window = await session.send("Browser.getWindowForTarget")
+                    finally:
+                        await session.detach()
+                    windows.append(window["windowId"])
+                if len(set(windows)) != len(windows):
+                    raise ValueError("Selected streams share a tabbed window; reopen them as separate windows")
+                for placement, window_id in zip(placements, windows):
+                    session = await self.context.new_cdp_session(self.active_streams[placement["stream_id"]].page)
+                    try:
+                        await session.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
+                        await session.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {
+                            "left": round(placement["x"] / scale), "top": round(placement["y"] / scale),
+                            "width": round(placement["width"] / scale), "height": round(placement["height"] / scale)}})
+                    finally:
+                        await session.detach()
+                self.layout_status = {"success": True, "message": f"Arranged {len(ids)} stream(s)", "display": display, "mode": mode, "placements": placements}
+            except Exception as exc:
+                self.layout_status = {"success": False, "message": str(exc)}
+            return self.layout_status
+
+    async def _auto_arrange(self):
+        layout = self.config.get("layout", {})
+        if layout.get("auto_arrange") and self.active_streams:
+            await self.arrange_streams(layout.get("default_display", "tv"), "grid")
+
+    async def set_tab_view(self, stream_id=None, enabled=True):
+        stream = self._resolve_stream(stream_id)
+        if not stream:
+            return {"success": False, "message": "No matching active stream"}
+        success = await fill_tab(stream.page, enabled)
+        return {"success": success, "message": "Tab view updated" if success else "No accessible video found yet"}
 
     # ------------------------------------------------------------------
     # watch / watch_url — multi-stream versions
@@ -529,6 +642,8 @@ class StreamKeeper:
         stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
         self.active_streams[stream_id] = stream
 
+        await self._auto_arrange()
+
         if has_video:
             return (
                 f"📺 Now watching: **{team}** [`{stream_id}`]\n"
@@ -551,6 +666,8 @@ class StreamKeeper:
 
     async def _get_iframe_targets_for_page(self, page_url: str) -> list[dict]:
         """Get iframe CDP targets belonging to a specific page URL."""
+        if not self._cdp_url:
+            return []
         import aiohttp as _aiohttp
         try:
             async with _aiohttp.ClientSession() as sess:
@@ -619,6 +736,8 @@ class StreamKeeper:
 
         Uses Input.dispatchMouseEvent (simulated click) to satisfy browser autoplay policy.
         """
+        if not self._cdp_url:
+            return False
         iframes = await self._get_iframe_targets_for_page(page_url)
 
         import aiohttp as _aiohttp
@@ -685,6 +804,8 @@ class StreamKeeper:
         1. Find the pooembed.eu iframe (JW Player) and click play + unmute
         2. Enable theater mode on the parent streamed.pk watch page
         """
+        if not self._cdp_url:
+            return False
         cdp_base = self._get_cdp_base()
         import aiohttp as _aiohttp
 
@@ -794,6 +915,8 @@ class StreamKeeper:
         return did_something
 
     async def _get_urls_with_video_cdp(self) -> set:
+        if not self._cdp_url:
+            return set()
         """Query CDP iframe targets directly to find which page URLs have video players.
 
         Handles doubly-nested cross-origin iframes that Playwright can't traverse.
@@ -976,6 +1099,7 @@ class StreamKeeper:
             stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
             self.active_streams[stream_id] = stream
             attached += 1
+        await self._auto_arrange()
 
         if attached == 0:
             return (
@@ -1070,7 +1194,7 @@ class StreamKeeper:
                     await ws.send_json({
                         "id": 1,
                         "method": "Target.createTarget",
-                        "params": {"url": watch_url}
+                        "params": {"url": watch_url, "newWindow": bool(self.config.get("layout", {}).get("displays"))}
                     })
                     resp = await asyncio.wait_for(ws.receive_json(), timeout=10)
                     target_id = resp.get("result", {}).get("targetId")
@@ -1193,7 +1317,7 @@ class StreamKeeper:
         try to connect to Chrome now. Allows watch() to use visible browser even if
         Stream Chrome wasn't running when StreamKeeper started.
         """
-        if self._cdp_url:
+        if self.browser_engine != "chromium" or self._cdp_url:
             return  # Already in CDP mode
         remote_debugging_url = self.config.get("browser", {}).get("remote_debugging_url")
         if not remote_debugging_url:
@@ -1218,6 +1342,8 @@ class StreamKeeper:
                 self.context = None
             # Connect via CDP
             self._cdp_url = remote_debugging_url
+            self.ad_handler.network_enabled = False
+            self.ad_handler.network_verified = False
             self._browser = await self._playwright.chromium.connect_over_cdp(remote_debugging_url)
             if self._browser.contexts:
                 self.context = self._browser.contexts[0]
@@ -1290,6 +1416,8 @@ class StreamKeeper:
         stream.monitor_task = asyncio.create_task(self._monitor_loop(stream))
         self.active_streams[stream_id] = stream
 
+        await self._auto_arrange()
+
         sources_count = len(driver.available_sources)
         game_title = game["title"] if isinstance(game, dict) else game.title
         return (
@@ -1351,6 +1479,8 @@ class StreamKeeper:
 
         # Remove from active streams
         self.active_streams.pop(stream_id, None)
+
+        await self._auto_arrange()
 
         logger.info(f"Stopped stream [{stream_id}]: {team}")
         return f"⏹️ Stopped watching {team} [`{stream_id}`] — {len(self.active_streams)} stream(s) remaining"
@@ -1561,7 +1691,7 @@ class StreamKeeper:
                 # If video element is unreachable (cross-origin iframe), use CDP
                 if snap.state == StreamState.NO_VIDEO:
                     consecutive_no_video += 1
-                    if consecutive_no_video >= 2 and stream.url and self.config.get("browser", {}).get("remote_debugging_url"):
+                    if consecutive_no_video >= 2 and stream.url and self._cdp_url:
                         # Try CDP to reach the video through cross-origin iframes
                         cdp_health = await self._check_video_health_cdp(stream.url)
                         if cdp_health:
@@ -1594,6 +1724,9 @@ class StreamKeeper:
                                 continue
                 else:
                     consecutive_no_video = 0
+
+                if self.config.get("browser", {}).get("fill_tab", True):
+                    await fill_tab(stream.page, automatic=True)
 
                 # Periodically dismiss any new ad overlays
                 try:
@@ -1656,7 +1789,7 @@ class StreamKeeper:
 
         try:
             # Level 0: CDP force play (for cross-origin iframe streams)
-            if attempt <= 2 and stream.url and self.config.get("browser", {}).get("remote_debugging_url"):
+            if attempt <= 2 and stream.url and self._cdp_url:
                 logger.info(f"Recovery L0 [{stream.id}]: CDP force play through iframe")
                 cdp_ok = await self._force_play_cdp(stream.url)
                 if cdp_ok:

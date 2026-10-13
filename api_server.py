@@ -54,6 +54,8 @@ class StreamKeeperAPI:
         self.app.router.add_post("/unmute", self.handle_unmute)
         self.app.router.add_post("/switch", self.handle_switch)
         self.app.router.add_get("/screenshot", self.handle_screenshot)
+        self.app.router.add_post("/layout", self.handle_layout)
+        self.app.router.add_post("/tab-view", self.handle_tab_view)
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
@@ -88,11 +90,18 @@ class StreamKeeperAPI:
     async def handle_status(self, request: web.Request) -> web.Response:
         """Current stream status as JSON. Optional ?stream_id= for specific stream."""
         stream_id = request.query.get("stream_id")
+        capabilities = {
+            "browser_engine": self.keeper.browser_engine,
+            "displays": self.config.get("layout", {}).get("displays", {}),
+            "layout": self.keeper.layout_status,
+            "ads": self.keeper.ad_handler.stats,
+        }
 
         if not self.keeper.active_streams:
             return web.json_response({
                 "is_watching": False,
                 "streams": [],
+                **capabilities,
             })
 
         ads = self.keeper.ad_handler.stats
@@ -107,9 +116,10 @@ class StreamKeeperAPI:
             return web.json_response({
                 "is_watching": True,
                 "stream": self._stream_to_dict(stream),
+                **capabilities,
                 "ads": {
                     "requests_blocked": ads["requests_blocked"],
-                    "overlays_dismissed": ads["overlays_dismissed"],
+                    **ads,
                 },
             })
 
@@ -120,9 +130,10 @@ class StreamKeeperAPI:
             "active_count": len(streams),
             "max_streams": self.keeper.max_streams,
             "streams": streams,
+            **capabilities,
             "ads": {
                 "requests_blocked": ads["requests_blocked"],
-                "overlays_dismissed": ads["overlays_dismissed"],
+                **ads,
             },
         })
 
@@ -148,6 +159,34 @@ class StreamKeeperAPI:
                 "recovery_count": health["recovery_count"],
             },
         }
+
+    async def handle_layout(self, request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Expected JSON object")
+            ids = body.get("stream_ids")
+            if ids is not None and (not isinstance(ids, list) or not all(isinstance(s, str) for s in ids)):
+                raise ValueError("stream_ids must be a list of strings")
+            display, mode = body.get("display", "tv"), body.get("mode", "grid")
+            if not isinstance(display, str) or not isinstance(mode, str):
+                raise ValueError("display and mode must be strings")
+            result = await self.keeper.arrange_streams(display, mode, ids)
+            return web.json_response(result, status=200 if result["success"] else 400)
+        except (ValueError, TypeError):
+            return web.json_response({"success": False, "message": "Invalid layout request"}, status=400)
+
+    async def handle_tab_view(self, request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or type(body.get("enabled", True)) is not bool:
+                raise ValueError("enabled must be boolean")
+            sid = body.get("stream_id")
+            if sid is not None and not isinstance(sid, str):
+                raise ValueError("stream_id must be a string")
+            return web.json_response(await self.keeper.set_tab_view(sid, body.get("enabled", True)))
+        except (ValueError, TypeError):
+            return web.json_response({"success": False, "message": "Invalid tab-view request"}, status=400)
 
     async def handle_keepalive(self, _request: web.Request) -> web.Response:
         """Scan all open tabs and attach health monitors to any with video elements."""
