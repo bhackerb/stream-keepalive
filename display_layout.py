@@ -37,8 +37,9 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
             row_columns = min(columns, n - row * columns)
             x0 = region["width"] * col // row_columns
             x1 = region["width"] * (col + 1) // row_columns
-            y0 = region["height"] * row // rows
-            y1 = region["height"] * (row + 1) // rows
+            # Row height follows its stream count, keeping partial-row areas equal.
+            y0 = region["height"] * (row * columns) // n
+            y1 = region["height"] * (row * columns + row_columns) // n
             result.append({"stream_id": sid, "display": name, "x": region["x"] + x0,
                            "y": region["y"] + y0, "width": x1 - x0, "height": y1 - y0})
     return result
