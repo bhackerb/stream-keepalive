@@ -25,7 +25,7 @@ StreamKeeper (Mithrandir Agent: "Watcher")
 - **Adblock evidence:** Owned-browser routes run a reserved `.invalid` canary at startup. Status reports `network_enabled` and `network_verified`. Attached browsers keep the existing low-latency path without Python interception; their uBlock state is explicitly unverified rather than assumed. `extension_verified` remains false until extension-specific verification is implemented.
 
 - **Discord-controlled**: `!watch Blues` to start, `!status` to check, `!switch` to change streams
-- **Ad blocking**: Verified network route interception; optional Chromium extension support. Full uBlock Origin is not installed in the managed Firefox profile.
+- **Ad blocking**: Verified network route interception plus full uBlock Origin in the deployed managed Firefox profiles. New profiles need the Mozilla package installed separately; optional Chromium extension support remains available.
 - **Stream health monitoring**: Polls HTML5 `<video>` element for stalls, freezes, audio loss
 - **Auto-recovery**: Graduated recovery — unmute → replay → reload iframe → reload page → try next mirror
 - **Audio watchdog**: Detects muted/silent streams and forces audio back on
@@ -116,6 +116,12 @@ StreamKeeper is designed as the **Watcher** agent in your Mithrandir roster.
 It can be triggered by other agents or via Discord approval flows.
 
 ## Notes
+
+### Firefox add-ons
+
+The watcher restores Mozilla add-on discovery, installation and automatic extension updates instead of retaining Playwright's test-only add-on settings. Open `about:addons` to manage extensions, or visit [Mozilla's uBlock Origin page](https://addons.mozilla.org/en-US/firefox/addon/ublock-origin/).
+
+On 2026-10-13, Mozilla-hosted uBlock Origin 1.75.0 was installed in both managed profiles as `extensions/uBlock0@raymondhill.net.xpi`. The downloaded package matched the SHA256 published by Mozilla's API; each live profile reports active, not disabled, and `signedState: 2`. An isolated A/B browser check with the watcher's network route installed blocked a script matching a bundled EasyList rule while allowing a player script. The existing API `extension_verified` field is still conservative: this verification is separate from its automatic network canary.
 
 ### Device mapping observed 2026-10-13
 
