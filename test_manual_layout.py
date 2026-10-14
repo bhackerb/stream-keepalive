@@ -74,11 +74,11 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         await self.k.set_session_layout(body);self.assertNotIn('1',self.k.active_streams);self.assertNotIn('1',self.k.suppressed)
         with self.assertRaises(ValueError):await self.k.set_session_layout({**body,'group_epoch':1})
         self.assertEqual(self.k.extra_status()['session']['group_epoch'],2)
-    async def test_laptop_panel_adds_two_slots_between_wide_and_vertical(self):
+    async def test_laptop_panel_adds_four_slots_between_wide_and_vertical(self):
         from display_layout import plan_layout
         displays={**D,'laptop':{'x':4592,'y':592,'width':1970,'height':1231}}
-        layout=plan_layout(displays,'dock','grid',[str(i)for i in range(12)])
-        self.assertEqual([p['display']for p in layout],['widescreen']*6+['laptop']*2+['vertical']*4)
+        layout=plan_layout(displays,'dock','grid',[str(i)for i in range(14)])
+        self.assertEqual([p['display']for p in layout],['widescreen']*6+['laptop']*4+['vertical']*4)
     async def test_timed_out_release_keeps_new_desired_layout_and_late_close_is_not_user_suppression(self):
         await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2))
         self.k.command=AsyncMock(side_effect=TimeoutError('fixture'))
