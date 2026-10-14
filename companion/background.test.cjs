@@ -68,3 +68,17 @@ test('window closing preserves durable proof for browser restoration',async()=>{
 test('Chrome browser namespace alias cannot masquerade as Firefox',async()=>{
  const h=await harness({}, {}, 'chromium');assert.equal(h.sent.find(m=>m.event==='hello').browser,'chromium');
 });
+test('close drain reopen keeps one canonical copy and ignores a delayed old-tab close',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game/golf/1'});
+ const first=h.local.owned.game.tabId;assert.equal((await h.command('close',{stream_id:'game'})).result,true);
+ const inventory=await h.command('inventory');assert.equal(inventory.result.game,undefined);
+ await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game/golf/2'});
+ h.api.tabs.onRemoved.fire(first,{isWindowClosing:false});await h.settle();
+ assert.equal(h.tabs.size,2);assert.ok(h.local.owned.game);assert.equal(h.sent.filter(m=>m.event==='closed').length,0);
+ assert.match(h.tabs.get(h.local.owned.game.tabId).url,/golf\/2/);assert.equal(h.tabs.get(1).title,'Personal');
+});
+test('user close before recovery close produces refusal rather than a new tab',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game/golf/1'});
+ const first=h.local.owned.game.tabId;h.tabs.delete(first);h.api.tabs.onRemoved.fire(first,{isWindowClosing:false});await h.settle();
+ assert.ok((await h.command('close',{stream_id:'game'})).error);assert.equal(h.tabs.size,1);assert.ok(h.sent.some(m=>m.event==='closed'&&m.stream_id==='game'));
+});

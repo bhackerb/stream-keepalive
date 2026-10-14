@@ -1,6 +1,7 @@
 """Regular-browser control through an authenticated companion, without launching profiles.
 
-Health is report-only. Health polls cannot refresh, switch, or restart a game.
+Only sustained, fresh NO_VIDEO evidence permits bounded session recovery.
+Playing, paused, loading, stale, closed and ownership-lost streams never recover automatically.
 The session reconciler opens only new match IDs, and only retires explicitly ended
 media with decoded-frame evidence. Catalog disappearance alone never ends a game.
 """
@@ -29,6 +30,27 @@ def validate_url(url):
         raise ValueError('Regular mode supports HTTPS Streamed/player hosts only')
     return url
 
+def recovery_record(value):
+    if not isinstance(value,dict)or type(value.get('attempts'))is not int or not 0<=value['attempts']<=3:return None
+    if not isinstance(value.get('tried'),list)or len(value['tried'])>10:return None
+    record={'attempts':value['attempts'],'tried':value['tried']}
+    try:
+        for url in record['tried']:validate_url(url)
+        if 'url'in value:record['url']=validate_url(value['url'])
+    except (ValueError,TypeError):return None
+    for key in ('created_at','last_action'):
+        if key in value:
+            if type(value[key])not in(int,float)or not math.isfinite(value[key])or value[key]<0:return None
+            record[key]=value[key]
+    if 'pending_release'in value:
+        if type(value['pending_release'])is not bool:return None
+        record['pending_release']=value['pending_release']
+    if 'message'in value:
+        if not isinstance(value['message'],str)or len(value['message'])>500:return None
+        record['message']=value['message']
+    record.setdefault('created_at',time.time())
+    return record
+
 class CompanionPage:
     """Only exact layout title operations; no transport of arbitrary JavaScript."""
     def __init__(self,keeper,sid):self.keeper,self.sid=keeper,sid
@@ -46,22 +68,26 @@ class RegularBrowserKeeper:
         self.layout_status={'success':False,'message':'No companion connected'}
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set()
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={}
         self._load()
     @property
     def is_watching(self):return bool(self.active_streams)
     def _load(self):
         if self.state_path.exists():
             try:
-                state=json.loads(self.state_path.read_text());self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
+                state=json.loads(self.state_path.read_text());self._recovery={k:r for k,v in (state.get('recovery',{})if isinstance(state.get('recovery'),dict)else {}).items()if isinstance(k,str)and (r:=recovery_record(v))is not None};self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
                 for sid,r in state.get('streams',{}).items():self._add(sid,r)
+                for record in self._recovery.values():
+                    record.pop('since',None);record.pop('last_health',None)
                 self._releasing.intersection_update(self.active_streams)
                 if self.manual_layout:
                     try:self.manual_layout=validate_manual_layout(self.manual_layout,self.config.get('layout',{}).get('displays',{}))
                     except ValueError:self.manual_layout=None;self.session=None;self.errors=['Saved display layout no longer matches configuration; streams preserved. Reapply a new layout.']
             except (ValueError,TypeError,KeyError):log.warning('Invalid regular browser state; ignoring')
     def _save(self):
-        value={'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
+        self._recovery={sid:r for sid,r in self._recovery.items()if sid in self.active_streams or time.time()-r.get('last_action',r.get('created_at',time.time()))<86400}
+        for sid,stream in self.active_streams.items():stream.health_monitor.stats['recovery_count']=self._recovery.get(sid,{}).get('attempts',0)
+        value={'recovery':self._recovery,'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
         self.state_path.parent.mkdir(parents=True,exist_ok=True);temp=self.state_path.with_suffix('.tmp')
         fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'w')as f:
@@ -143,6 +169,10 @@ class RegularBrowserKeeper:
             sid=m.get('stream_id');s=self.active_streams.get(sid);h=m.get('health')
             if not s or s.browser!=browser or not isinstance(h,dict):return
             if any(type(h.get(k,0))not in(int,float)or not math.isfinite(h.get(k,0))for k in('width','height','current_time','volume','stall_seconds')):return
+            record=self._recovery.get(sid)
+            if record:
+                if h.get('state')!='NO_VIDEO' or time.time()-record.get('last_health',time.time())>=12:record.pop('since',None)
+                record['last_health']=time.time()
             key=(sid,m.get('frame_id'));self._frames[key]=(time.time(),h)
             rows=[v for (i,_),v in self._frames.items() if i==sid and time.time()-v[0]<12]
             best=max(rows,key=lambda v:(v[1].get('state')=='PLAYING',v[1].get('width',0)*v[1].get('height',0)))[1]
@@ -193,6 +223,8 @@ class RegularBrowserKeeper:
         for target in targets:
             if time.time()-self._reload_times.get(target,0)<600:return '❌ Reload budget: at most once per stream per 10 minutes'
             await self.command_for(target,'reload');self._reload_times[target]=time.time()
+            for key in list(self._frames):
+                if key[0]==target:del self._frames[key]
         return 'Explicit reload requested'
     async def force_unmute(self,sid=None):
         for target in ([sid] if sid else list(self.active_streams)):await self.command_for(target,'unmute')
@@ -226,7 +258,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'control_mode':'regular','browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
+        return {'control_mode':'regular','browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
     async def _json(self,path):
         async with self._client.get('https://streamed.pk/api/'+path) as res:
             res.raise_for_status();value=await res.json()
@@ -346,7 +378,7 @@ class RegularBrowserKeeper:
             if not sources:self.errors.append(row['title']+': source not yet available');continue
             source=sources[0]
             try:
-                url=row.get('playback_url') or 'https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(source['source'],safe='')+'/1'
+                url=self._recovery.get(row['id'],{}).get('url')or row.get('playback_url') or 'https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(source['source'],safe='')+'/1'
                 await self._open(row['id'],url,row['title'],browser,self.session['id'],allow_replacement=allow_replacements);available-=1
             except (ValueError,KeyError,TimeoutError) as e:self.errors.append(row['title']+': '+str(e))
         # Stable order between joins: viewers cannot cause continuous reshuffling.
@@ -433,7 +465,7 @@ class RegularBrowserKeeper:
             sources=row.get('sources')or[]
             if not sources:self.errors.append(row['title']+': waiting for a source');continue
             try:
-                url=row.get('playback_url')or 'https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(sources[0]['source'],safe='')+'/1'
+                url=self._recovery.get(sid,{}).get('url')or row.get('playback_url')or 'https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(sources[0]['source'],safe='')+'/1'
                 await self._open(sid,url,row['title'],browser,self.session['id'],allow_replacement=allow_replacements or sid in (replacement_ids or set()))
             except (ValueError,TimeoutError,KeyError)as e:self.errors.append(row['title']+': '+str(e))
         placements=manual_placements(self.manual_layout,self.config.get('layout',{}).get('displays',{}),visible&set(self.active_streams))
@@ -445,6 +477,99 @@ class RegularBrowserKeeper:
         for row in plan['pending']:row['scheduled_in_session']=row['id']in wanted
         plan.update(mode='manual',selected=[r for r in plan['live']if r['id']in wanted],overflow=[r for r in plan['live']if r['id']not in wanted],placements=placements)
         self._visible_ids=tuple(p['stream_id']for p in placements);self._save()
+
+    def _no_video(self,sid,now):
+        stream=self.active_streams.get(sid)
+        if not self.session or not stream or stream.session_id!=self.session['id'] or stream.parked:return False
+        if sid in self.suppressed or sid in self._ownership_lost or sid in self._releasing or sid not in self._visible_ids:return False
+        if not self._browser_ready.get(stream.browser):return False
+        rows=[v for (i,_),v in self._frames.items()if i==sid]
+        return bool(rows)and all(now-v[0]<12 and v[1].get('state')=='NO_VIDEO'for v in rows)
+
+    async def _recovery_sources(self,row,current,tried):
+        choices=[]
+        for source in (row.get('sources')or[])[:3]:
+            try:
+                streams=await self._json('stream/'+quote(source['source'],safe='')+'/'+quote(source['id'],safe=''))
+                for item in streams:
+                    if not isinstance(item,dict)or type(item.get('streamNo'))is not int or item['streamNo']<1:continue
+                    url='https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
+                    if url!=current and url not in tried:
+                        score=(item.get('language')=='English',bool(item.get('hd')),item.get('viewers')if type(item.get('viewers'))in(int,float)else 0)
+                        choices.append((score,url))
+            except (aiohttp.ClientError,asyncio.TimeoutError,ValueError,KeyError,TypeError):continue
+        return max(choices,key=lambda c:c[0])[1]if choices else None
+
+    async def _recover_no_video(self,plan):
+        # Called under the same lock as layout/stop. One action per minute tick,
+        # one refresh and at most two alternate players per match, across restarts.
+        live={r['id']:r for r in plan['live']}
+        for sid,record in list(self._recovery.items()):
+            if record.get('pending_release')and sid in self._releasing and sid in self.active_streams:
+                stream=self.active_streams[sid]
+                if not self._browser_ready.get(stream.browser):continue
+                try:
+                    audit=await self.command(stream.browser,'inventory')
+                    if not isinstance(audit,dict)or self._inventory_errors.get(stream.browser):continue
+                    # Ordered audit runs after any timed-out close. An owned tab
+                    # means close failed; absence proves release. Neither opens a copy.
+                    self._releasing.discard(sid);record['pending_release']=False;record.pop('since',None)
+                    if sid not in audit:
+                        self.active_streams.pop(sid,None)
+                        self._manual_signature=();self._layout_ids=()
+                        await self._reconcile(plan)
+                        record['message']='Previous close audited; saved source restored';self._save();return
+                    record['message']='Previous close audited; waiting for fresh video evidence';self._save()
+                except Exception:continue
+        for sid in list(self.active_streams):
+            now=time.time();record=self._recovery.get(sid)
+            if not self._no_video(sid,now)or sid not in live:
+                if record:
+                    record.pop('since',None)
+                    if self.active_streams[sid].health_monitor.stats.get('state')=='PLAYING':record['message']='Playback restored; remaining budget retained'
+                continue
+            if record is None:record=self._recovery[sid]={'attempts':0,'tried':[],'created_at':now,'message':'Waiting for video'}
+            record.setdefault('since',now)
+            if record['attempts']>=3:
+                record['message']='Automatic recovery exhausted; choose a source manually';continue
+            if now-record['since']<90 or now-record.get('last_action',0)<90:continue
+            stream=self.active_streams[sid];stage='audit'
+            try:
+                # Audit proves the exact owned tab still exists. Exceptions or
+                # inventory errors block any destructive command.
+                audit=await self.command(stream.browser,'inventory')
+                if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed')
+                if not self._no_video(sid,time.time()):continue
+                if record['attempts']==0:
+                    if time.time()-self._reload_times.get(sid,0)<600:continue
+                    record.update(attempts=1,last_action=time.time(),since=time.time(),message='One automatic refresh requested')
+                    self._save();await self.force_reload(sid)
+                else:
+                    url=await asyncio.wait_for(self._recovery_sources(live[sid],stream.url,record['tried']),20)
+                    if not self._no_video(sid,time.time()):continue
+                    if not url:
+                        record.update(last_action=time.time(),message='No alternate source available; waiting');continue
+                    # Close and drain inventory before reopening the same canonical
+                    # match ID, using the already signed companion's finite commands.
+                    record.update(attempts=record['attempts']+1,last_action=time.time(),since=time.time(),pending_release=True,url=url,message='Trying alternate source')
+                    record['tried']=list(dict.fromkeys([*record['tried'],stream.url,url]))
+                    self._releasing.add(sid);self._save()
+                    stage='close';closed=await self.command_for(sid,'close');stage='drain'
+                    if closed is not True:raise ValueError('Source close unconfirmed')
+                    audit=await self.command(stream.browser,'inventory')
+                    if not isinstance(audit,dict)or self._inventory_errors.get(stream.browser)or sid in audit:raise ValueError('Source release unconfirmed')
+                    self.active_streams.pop(sid,None);self._releasing.discard(sid);record.update(pending_release=False,url=url,last_action=time.time(),since=time.time());self._save()
+                    if sid in self.suppressed or sid in self._ownership_lost:continue
+                    for key in list(self._frames):
+                        if key[0]==sid:del self._frames[key]
+                    await self._open(sid,url,stream.team,stream.browser,stream.session_id)
+                    self._manual_signature=();self._layout_ids=()
+                    await self._reconcile(plan)
+                self._save();return
+            except Exception as e:
+                if stage=='close'and isinstance(e,ValueError):self._ownership_lost.add(sid) # Native ownership refusal must not reopen a user-closed tab.
+                record['message']='Recovery blocked: '+str(e);record['last_action']=time.time();self._save();return
+        self._save()
 
     async def _loop(self):
         while True:
@@ -458,7 +583,7 @@ class RegularBrowserKeeper:
                     self.session=None;self._save();continue # leave playing games alone
                 try:
                     plan=await self.discover(self.session['spec'],self.session['until_ms'])
-                    self.plan=plan;await self._reconcile(plan)
+                    self.plan=plan;await self._reconcile(plan);await self._recover_no_video(plan)
                 except Exception as e:
                     log.exception('Session poll failed; preserving playing windows')
                     self.errors=['Catalog unavailable; existing streams preserved: '+type(e).__name__]
