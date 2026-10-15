@@ -249,3 +249,41 @@ before replacing the owned window, then restores its display slot/fullscreen.
 No arbitrary personal tabs are adopted. A failed open retains the selected source
 and resets placement signatures for the active session to retry. Switching a source
 starts the replacement muted. This uses the existing signed companion unchanged.
+
+### Confirmed audio and buffering health
+
+Authenticated `POST /audio` accepts exactly one owned `stream_id`, a boolean
+`muted`, and optional finite `volume` from 0 to 1. For example:
+`{"stream_id":"game-id","muted":false,"volume":0.5}`. Success requires
+confirmation from each permitted player frame and the browser's tab mute state.
+Failed or partial confirmations return `success: false`; some frames or tab audio
+may already have changed. Changes are not atomic, and rollback after ownership
+loss would risk touching an unowned tab. Refresh health before retrying. Success
+requires at least one video element, so an audio-only advertisement cannot count
+as player confirmation. Audio commands retain the existing startup mute policy;
+replacement sources still start according to session configuration. The daemon
+never changes personal or unowned tabs.
+
+`GET /status` exposes `audio_capabilities` per browser. Mute and volume require
+companion 0.2.0 advertising `audio-v1`; the signed 0.1.0 add-on continues its
+existing Unmute command and receives no unsupported audio commands. Build the
+updated package with `python3 build_companion.py`. Firefox requires Mozilla
+unlisted signing of `build/streamkeeper-firefox.zip` before permanent installation.
+The build does not sign, install, or replace any existing add-on.
+
+The controller reports `BUFFERING` only after it observed media time and, when
+available, decoded frames advance, followed by at least 15 seconds of reported
+stalling. Initial loading, pauses, old evidence, and ended playback do not qualify.
+Visible session streams can use the existing bounded recovery cascade after 90
+seconds of sustained fresh buffering evidence and progress within the previous
+five minutes: one reload, then up to two catalog alternatives. Ownership audits,
+close confirmation, and inventory drain guard source replacement. Progress is
+cleared by reload, source replacement, and reconnection, so initial loading after
+those actions needs new playback evidence. Source URLs remain restricted to the
+existing companion allowlist; generic managed-browser site support does not imply
+regular-browser support.
+
+In companion0.2.0, the legacy Unmute action intentionally also clears the owned
+browser tab's mute flag. Otherwise the newly introduced tab mute could keep an
+explicitly unmuted video silent. It retains the existing permissive frame message
+behavior; the stricter confirmed API applies only to the new audio control.

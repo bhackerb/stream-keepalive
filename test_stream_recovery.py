@@ -159,3 +159,98 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             return True
         self.k.command=AsyncMock(side_effect=commands);await self.tick(1200)
         self.assertNotIn('0',self.k._releasing);self.assertEqual(self.k.active_streams['0'].url,'https://streamed.pk/watch/0/golf/2')
+
+class BufferingTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp=fixtures.RegularTests.asyncSetUp
+    asyncTearDown=fixtures.RegularTests.asyncTearDown
+    plan=fixtures.RegularTests.plan
+    setup_stream=RecoveryTests.setup_stream
+    async def health(self,now,current,state='LOADING',frames=20,stall=0,**extra):
+        with patch('regular_browser.time.time',return_value=now):
+            await self.k._event('firefox',{'event':'health','stream_id':'0','frame_id':0,'health':{'state':state,'current_time':current,'width':1280,'height':720,'decoded_frames':frames,'stall_seconds':stall,**extra}})
+    async def test_loading_needs_observed_prior_video_progress_before_buffering(self):
+        await self.setup_stream()
+        await self.health(1000,10,stall=100)
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'LOADING')
+        await self.health(1003,11,'PLAYING',frames=40)
+        for now in range(1006,1022,3):await self.health(now,11,frames=40,stall=now-1003)
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'BUFFERING')
+        self.k.command.assert_not_awaited()
+    async def test_buffering_recovers_only_after_sustained_fresh_proven_stall(self):
+        await self.setup_stream();await self.health(1000,10,'PLAYING');await self.health(1003,11,'PLAYING',frames=40)
+        for now in range(1006,1111,3):
+            await self.health(now,11,frames=40,stall=now-1003)
+            with patch('regular_browser.time.time',return_value=now):await self.k._recover_no_video(self.p)
+        self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['inventory','reload'])
+        self.assertEqual(self.k._recovery['0']['attempts'],1)
+        self.assertNotIn(('0',0),self.k._progress)
+    async def test_paused_ended_old_progress_and_decode_freeze_do_not_recover(self):
+        for extra in [{'paused':True},{'ended':True}]:
+            self.k._frames.clear();self.k._progress.clear()
+            await self.setup_stream();await self.health(1000,10,'PLAYING');await self.health(1003,11,'PLAYING',frames=40)
+            await self.health(1020,11,frames=40,stall=17,**extra)
+            self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'LOADING')
+        self.k._frames.clear();self.k._progress.clear()
+        await self.setup_stream();await self.health(1000,10,'PLAYING');await self.health(1003,11,'PLAYING',frames=20)
+        self.assertNotIn(('0',0),self.k._progress)
+        await self.health(1020,11,stall=17);self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'LOADING')
+        self.k._progress[('0',0)]=700;await self.health(1023,11,stall=320)
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'LOADING');self.k.command.assert_not_awaited()
+
+    async def seed_buffering(self):
+        await self.setup_stream();self.k._frames.clear();self.k._progress.clear();self.k._recovery.clear();self.k._reload_times.clear()
+        await self.health(1000,10,'PLAYING');await self.health(1003,11,'PLAYING',frames=40)
+        await self.health(1018,11,frames=40,stall=15)
+        with patch('regular_browser.time.time',return_value=1018):await self.k._recover_no_video(self.p)
+        self.assertEqual(self.k._recovery['0']['since'],1018)
+
+    async def sustain_until(self,start,end,checkpoints=()):
+        for now in sorted(set(range(start,end+1,3))|set(checkpoints)|{end}):
+            await self.health(now,11,frames=40,stall=now-1003)
+            if now in checkpoints:
+                with patch('regular_browser.time.time',return_value=now):await self.k._recover_no_video(self.p)
+                if now<end:self.k.command.assert_not_awaited()
+
+    async def test_exact_sustained_buffering_boundaries_60_85_89_90_seconds(self):
+        await self.seed_buffering()
+        await self.sustain_until(1021,1107,(1078,1103,1107))
+        self.k.command.assert_not_awaited()
+        await self.health(1108,11,frames=40,stall=105)
+        with patch('regular_browser.time.time',return_value=1108):await self.k._recover_no_video(self.p)
+        self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['inventory','reload'])
+
+    async def test_loading_and_playing_each_reset_the_sustained_buffering_timer(self):
+        for state in ('LOADING','PLAYING'):
+            with self.subTest(state=state):
+                await self.seed_buffering();await self.sustain_until(1021,1075)
+                await self.health(1078,11,state,frames=40,stall=0)
+                self.assertNotIn('since',self.k._recovery['0'])
+                await self.health(1081,11,frames=40,stall=78)
+                with patch('regular_browser.time.time',return_value=1081):await self.k._recover_no_video(self.p)
+                self.assertEqual(self.k._recovery['0']['since'],1081)
+                await self.sustain_until(1084,1170,(1108,1141,1166,1170))
+                self.k.command.assert_not_awaited()
+                await self.health(1171,11,frames=40,stall=168)
+                with patch('regular_browser.time.time',return_value=1171):await self.k._recover_no_video(self.p)
+                self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['inventory','reload'])
+
+    async def test_progress_older_than_300_seconds_blocks_alternate_even_after_90_seconds(self):
+        await self.seed_buffering()
+        await self.sustain_until(1021,1214)
+        self.k._recovery['0'].update(attempts=1,since=1214,last_action=1100)
+        self.k._recovery_sources=AsyncMock(return_value='https://streamed.pk/watch/0/golf/2')
+        # At exactly five minutes, this evidence remains BUFFERING but has only
+        # 89 seconds of the current failure. One second later progress expires.
+        await self.sustain_until(1217,1303)
+        self.assertEqual(self.k._recovery['0']['since'],1214)
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'BUFFERING')
+        with patch('regular_browser.time.time',return_value=1303):await self.k._recover_no_video(self.p)
+        self.k.command.assert_not_awaited()
+        await self.health(1304,11,frames=40,stall=301)
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'LOADING')
+        with patch('regular_browser.time.time',return_value=1304):await self.k._recover_no_video(self.p)
+        self.k.command.assert_not_awaited();self.k._recovery_sources.assert_not_awaited()
+        # Eligibility independently rejects even a raw BUFFERING report when its
+        # last observed progress is over five minutes old.
+        self.k._frames[('0',0)][1]['state']='BUFFERING'
+        self.assertFalse(self.k._recoverable_failure('0',1304))

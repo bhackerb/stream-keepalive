@@ -82,3 +82,52 @@ test('user close before recovery close produces refusal rather than a new tab',a
  const first=h.local.owned.game.tabId;h.tabs.delete(first);h.api.tabs.onRemoved.fire(first,{isWindowClosing:false});await h.settle();
  assert.ok((await h.command('close',{stream_id:'game'})).error);assert.equal(h.tabs.size,1);assert.ok(h.sent.some(m=>m.event==='closed'&&m.stream_id==='game'));
 });
+
+test('audio confirms every exact player frame and tab mute, never personal tabs',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ const calls=[];h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:2,url:'https://embed.st/embed/game'}]};
+ h.api.tabs.sendMessage=async(id,m,options)=>{calls.push({id,m,options});return {confirmed:true,media_count:options.frameId===2?1:0,video_count:options.frameId===2?1:0,muted:m.muted,volume:m.volume};};
+ h.api.tabs.update=async(id,value)=>{h.tabs.get(id).mutedInfo={muted:value.muted};};
+ const r=await h.command('audio',{stream_id:'game',muted:false,volume:.3});assert.equal(r.result.confirmed,true);assert.equal(r.result.media_count,1);
+ assert.deepEqual(calls.map(c=>[c.id,c.options.frameId]),[[10,0],[10,2]]);assert.equal(h.tabs.get(1).mutedInfo,undefined);
+});
+test('audio rejects legacy arbitrary replies, invalid inputs, no media and lost ownership',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'}]};
+ for(const invalid of [{muted:1},{muted:false,volume:NaN},{muted:true,volume:2}])assert.match((await h.command('audio',{stream_id:'game',...invalid})).error,/Invalid/);
+ for(const result of [true,{confirmed:true,media_count:0,muted:true}]){h.api.tabs.sendMessage=async()=>result;assert.ok((await h.command('audio',{stream_id:'game',muted:true})).error);}
+ h.tabs.get(10).url='https://personal.example/';assert.ok((await h.command('audio',{stream_id:'game',muted:true})).error);
+});
+test('health from an allowlisted child of a navigated unowned tab is refused',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.tabs.get(10).url='https://personal.example/';
+ let reply;h.api.runtime.onMessage.fire({sk:true,op:'health',health:{state:'PLAYING'}},{tab:h.tabs.get(10),url:'https://embed.st/embed/game',frameId:2},r=>{reply=r;});await h.settle();
+ assert.equal(reply.owned,false);assert.equal(h.sent.filter(m=>m.event==='health').length,0);
+});
+
+test('volume fails closed for unsupported nested frames without mutating media',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:2,url:'https://unsupported.example/video'}]};
+ let messages=0;h.api.tabs.sendMessage=async()=>{messages++;return true;};
+ assert.match((await h.command('audio',{stream_id:'game',muted:false,volume:.5})).error,/unsupported embedded/);assert.equal(messages,0);
+});
+test('legacy unmute keeps permissive frame behavior and clears owned tab mute',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>{throw Error('Legacy unmute must not enumerate unsupported frames');}};
+ const messages=[];h.api.tabs.sendMessage=async(id,m,options)=>{messages.push({id,m,options});return true;};
+ h.api.tabs.update=async(id,value)=>{h.tabs.get(id).mutedInfo={muted:value.muted};};
+ const result=await h.command('unmute',{stream_id:'game'});assert.equal(result.result,true);
+ assert.equal(messages[0].id,10);assert.equal(messages[0].m.op,'unmute');assert.equal(messages[0].options,undefined);
+ assert.equal(h.tabs.get(10).mutedInfo.muted,false);assert.equal(h.tabs.get(1).mutedInfo,undefined);
+});
+test('audio-only frames never satisfy video confirmation and failed tab verification stays failure',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'}]};
+ h.api.tabs.sendMessage=async()=>({confirmed:true,media_count:1,video_count:0,muted:false});
+ assert.match((await h.command('audio',{stream_id:'game',muted:false})).error,/No player video/);
+ h.api.tabs.sendMessage=async()=>({confirmed:true,media_count:1,video_count:1,muted:false});
+ h.api.tabs.update=async()=>{throw Error('Tab changed during update; frame audio may have changed');};
+ const response=await h.command('audio',{stream_id:'game',muted:false});assert.ok(response.error);assert.equal(response.result,undefined);
+ // Explicit audio settings do not alter the existing startup mute policy.
+ assert.equal(h.local.owned.game.startMuted,true);
+});

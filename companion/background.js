@@ -54,6 +54,32 @@ async function frameCommand(tabId, value) {
   // tabs.sendMessage without frameId sends to all permitted content-script frames.
   return api.tabs.sendMessage(tabId, {sk:true,...value});
 }
+async function audioCommand(r,c) {
+  if(typeof c.muted!=='boolean' || ('volume'in c && (typeof c.volume!=='number' || !Number.isFinite(c.volume) || c.volume<0 || c.volume>1)))throw Error('Invalid audio settings');
+  const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});
+  if(!frames?.length || frames.length>50)throw Error('Player frames unavailable');
+  // Address each exact permitted frame. A broadcast can return only one arbitrary
+  // frame response and cannot prove that the player accepted the settings.
+  const targets=frames.filter(f=>allowed(f.url));
+  if(!targets.length)throw Error('No supported player frame');
+  if('volume'in c && frames.some(f=>!allowed(f.url) && f.url!=='about:blank'))throw Error('Volume unavailable for unsupported embedded frames');
+  if(!await provesTab(await api.tabs.get(r.tabId),r))throw Error('Stream ownership changed before audio update');
+  const replies=await Promise.all(targets.map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'audio',muted:c.muted,...('volume'in c?{volume:c.volume}:{})},{frameId:f.frameId})));
+  let count=0,videos=0;
+  for(const result of replies){
+    if(!result || result.confirmed!==true || !Number.isInteger(result.media_count) || result.media_count<0 || result.muted!==c.muted || ('volume'in c && result.volume!==c.volume))throw Error('Player audio confirmation unavailable');
+    if(!Number.isInteger(result.video_count) || result.video_count<0 || result.video_count>result.media_count)throw Error('Player video confirmation unavailable; audio may be partially changed');
+    count+=result.media_count;videos+=result.video_count;
+  }
+  if(count<1 || videos<1)throw Error('No player video confirmed audio settings; audio may be partially changed');
+  const current=await api.tabs.get(r.tabId);
+  if(!await provesTab(current,r))throw Error('Stream ownership changed during audio update');
+  // Browser tab muting also covers inaccessible or unsupported nested frames.
+  await api.tabs.update(r.tabId,{muted:c.muted});
+  const verified=await api.tabs.get(r.tabId);
+  if(!await provesTab(verified,r) || verified.mutedInfo?.muted!==c.muted)throw Error('Tab audio confirmation unavailable');
+  return {confirmed:true,muted:c.muted,...('volume'in c?{volume:c.volume}:{}),media_count:count,video_count:videos};
+}
 async function command(c) {
   const all = await owned(); const r=all[c.stream_id];
   if (c.op==='inventory') return inventory();
@@ -83,7 +109,14 @@ async function command(c) {
   if(c.op==='title') return tab.title || '';
   if(c.op==='marker') {if(typeof c.value!=='string' || c.value.length>300) throw Error('Invalid title'); return api.tabs.sendMessage(r.tabId,{sk:true,op:'marker',value:c.value},{frameId:0});}
   if(c.op==='fill') {r.fill=!!c.enabled;await save(); await frameCommand(r.tabId,{op:'fill',enabled:r.fill}).catch(()=>{});return true;}
-  if(c.op==='play' || c.op==='unmute') return frameCommand(r.tabId,{op:c.op});
+  if(c.op==='audio')return audioCommand(r,c);
+  if(c.op==='unmute'){
+    // Preserve the legacy permissive request; it does not promise audio confirmation.
+    const result=await frameCommand(r.tabId,{op:'unmute'});
+    if(!await provesTab(await api.tabs.get(r.tabId),r))throw Error('Owned stream is unavailable');
+    await api.tabs.update(r.tabId,{muted:false});return result;
+  }
+  if(c.op==='play') return frameCommand(r.tabId,{op:c.op});
   throw Error('Unsupported native command');
 }
 let queue=Promise.resolve();
@@ -96,7 +129,7 @@ function connect() {
       queue=queue.catch(()=>{}).then(async()=>{try {await send({id:c.id,result:await command(c)});} catch(e){await send({id:c.id,error:String(e.message||e)});}});
     });
     port.onDisconnect.addListener(()=>{console.warn('StreamKeeper native bridge:',api.runtime.lastError?.message || 'disconnected');port=null;connecting=false;setTimeout(connect,5000);});
-    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version});
+    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1']});
     void scheduleInventory();
   } catch { port=null;setTimeout(connect,5000); }
   connecting=false;
@@ -107,6 +140,9 @@ api.runtime.onMessage.addListener((m,sender,respond)=>{
     const all=await owned();const entry=Object.entries(all).find(([,r])=>r.tabId===sender.tab.id);
     if(!entry) return {owned:false};
     const [id,r]=entry;
+    if(!await provesTab(sender.tab,r))return {owned:false};
+    const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});
+    if(!frames?.some(f=>f.frameId===sender.frameId && f.url===sender.url))return {owned:false};
     if(m.op==='escape'){r.fill=false;await save();await frameCommand(r.tabId,{op:'fill',enabled:false}).catch(()=>{});}
     if(m.op==='health' && r.fill && m.health?.width>0){
       const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});

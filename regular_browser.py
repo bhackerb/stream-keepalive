@@ -1,7 +1,8 @@
 """Regular-browser control through an authenticated companion, without launching profiles.
 
-Only sustained, fresh NO_VIDEO evidence permits bounded session recovery.
-Playing, paused, loading, stale, closed and ownership-lost streams never recover automatically.
+Only sustained, fresh NO_VIDEO or previously progressing BUFFERING evidence permits
+bounded session recovery. Playing, paused, initial loading, stale, closed and
+ownership-lost streams never recover automatically.
 The session reconciler opens only new match IDs, and only retires explicitly ended
 media with decoded-frame evidence. Catalog disappearance alone never ends a game.
 """
@@ -68,7 +69,7 @@ class RegularBrowserKeeper:
         self.layout_status={'success':False,'message':'No companion connected'}
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={}
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={}
         self._load()
     @property
     def is_watching(self):return bool(self.active_streams)
@@ -94,6 +95,8 @@ class RegularBrowserKeeper:
             os.fchmod(f.fileno(),0o600);f.write(json.dumps(value,allow_nan=False))
         temp.replace(self.state_path)
     def _add(self,sid,r):
+        for key in list(self._frames):
+            if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
         health={'state':'DISCONNECTED','resolution':'unknown','current_time':'0','buffered_to':'unknown','audio':'unknown','muted':True,'volume':0,'stall_duration':'0','recovery_count':0}
         self.active_streams[sid]=SimpleNamespace(id=sid,team=r.get('label',sid),site='streamed',url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
     async def start_browser(self):
@@ -119,6 +122,9 @@ class RegularBrowserKeeper:
                         browser=m['browser'];old=self.connections.get(browser)
                         if old:await old.close()
                         self.connections[browser]=ws;self._browser_ready[browser]=False;self._manual_signature=()
+                        for key in list(self._frames):
+                            if self.active_streams.get(key[0],SimpleNamespace(browser=None)).browser==browser:del self._frames[key];self._progress.pop(key,None)
+                        self._companion_info[browser]={'version':str(m.get('version','unknown'))[:40],'capabilities':m.get('capabilities',[])if isinstance(m.get('capabilities'),list)else []}
                     elif m.get('id') in self.pending:
                         future=self.pending[m['id']]
                         if not future.done():
@@ -169,12 +175,22 @@ class RegularBrowserKeeper:
             sid=m.get('stream_id');s=self.active_streams.get(sid);h=m.get('health')
             if not s or s.browser!=browser or not isinstance(h,dict):return
             if any(type(h.get(k,0))not in(int,float)or not math.isfinite(h.get(k,0))for k in('width','height','current_time','volume','stall_seconds')):return
+            now=time.time();key=(sid,m.get('frame_id'));h=dict(h)
+            previous=self._frames.get(key);progress=self._progress.get(key)
+            if previous and now-previous[0]<12 and h.get('current_time',0)>previous[1].get('current_time',0):
+                before,after=previous[1].get('decoded_frames'),h.get('decoded_frames')
+                if before is None or after is None or (type(before)in(int,float)and type(after)in(int,float)and after>before):
+                    progress=self._progress[key]=now
+            # 0.1.0 reports LOADING after a stall, but only after excluding pause.
+            # Startup loading alone never proves that a stream was playing.
+            if h.get('state')=='LOADING' and progress is not None and 15<=now-progress<=300 and h.get('stall_seconds',0)>=15 and h.get('paused')is not True and not h.get('ended') and h.get('width',0)>0:
+                h['state']='BUFFERING'
             record=self._recovery.get(sid)
             if record:
-                if h.get('state')!='NO_VIDEO' or time.time()-record.get('last_health',time.time())>=12:record.pop('since',None)
-                record['last_health']=time.time()
-            key=(sid,m.get('frame_id'));self._frames[key]=(time.time(),h)
-            rows=[v for (i,_),v in self._frames.items() if i==sid and time.time()-v[0]<12]
+                if h.get('state')not in ('NO_VIDEO','BUFFERING') or now-record.get('last_health',now)>=12:record.pop('since',None)
+                record['last_health']=now
+            self._frames[key]=(now,h)
+            rows=[v for (i,_),v in self._frames.items() if i==sid and now-v[0]<12]
             best=max(rows,key=lambda v:(v[1].get('state')=='PLAYING',v[1].get('width',0)*v[1].get('height',0)))[1]
             s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),muted=bool(best.get('muted',True)),volume=best.get('volume',0),stall_duration=str(round(best.get('stall_seconds',0),1)))
     async def command(self,browser,op,**args):
@@ -224,11 +240,37 @@ class RegularBrowserKeeper:
             if time.time()-self._reload_times.get(target,0)<600:return '❌ Reload budget: at most once per stream per 10 minutes'
             await self.command_for(target,'reload');self._reload_times[target]=time.time()
             for key in list(self._frames):
-                if key[0]==target:del self._frames[key]
+                if key[0]==target:del self._frames[key];self._progress.pop(key,None)
         return 'Explicit reload requested'
     async def force_unmute(self,sid=None):
         for target in ([sid] if sid else list(self.active_streams)):await self.command_for(target,'unmute')
         return 'Unmute requested'
+    def audio_capabilities(self):
+        result={}
+        for browser in ('firefox','chromium'):
+            info=self._companion_info.get(browser,{})
+            available=bool(browser in self.connections and self._browser_ready.get(browser)and 'audio-v1'in info.get('capabilities',[]))
+            result[browser]={'available':available,'muted':available,'volume':available,'version':info.get('version'),'reason':None if available else 'Install/connect signed companion 0.2.0 or later for mute and volume control'}
+        return result
+
+    async def set_audio(self,sid,muted,volume=None):
+        if not isinstance(sid,str)or not sid or sid not in self.active_streams:raise ValueError('Choose an active owned stream')
+        if type(muted)is not bool:raise ValueError('muted must be boolean')
+        if volume is not None and (type(volume)not in(int,float)or not math.isfinite(volume)or not 0<=volume<=1):raise ValueError('volume must be a finite number from 0 to 1')
+        async with self._lock:
+            stream=self.active_streams.get(sid)
+            if not stream or sid in self._releasing or sid in self._ownership_lost:raise ValueError('Owned stream is unavailable')
+            if not self.audio_capabilities()[stream.browser]['available']:raise NotImplementedError('Mute and volume require signed companion 0.2.0 or later; existing Unmute remains available')
+            args={'muted':muted}
+            if volume is not None:args['volume']=volume
+            try:result=await self.command_for(sid,'audio',**args)
+            except (ValueError,TimeoutError)as exc:raise ValueError(str(exc)+'; some audio settings may have changed. Refresh status before retrying')from exc
+            if not isinstance(result,dict)or result.get('confirmed')is not True or result.get('muted')is not muted or type(result.get('media_count'))is not int or result['media_count']<1 or type(result.get('video_count'))is not int or not 1<=result['video_count']<=result['media_count'] or (volume is not None and (type(result.get('volume'))not in(int,float)or result.get('volume')!=volume)):
+                raise ValueError('Browser did not confirm all audio settings; some may have changed. Refresh status before retrying')
+            stream.health_monitor.stats['muted']=muted
+            if volume is not None:stream.health_monitor.stats['volume']=volume
+            return {'success':True,'stream_id':sid,'muted':muted,'volume':result.get('volume'),'confirmed':True,'message':'Browser confirmed audio settings'}
+
     async def player_sources(self,sid):
         if not isinstance(sid,str)or sid not in self.active_streams:raise ValueError('Choose an active owned game')
         matches=await asyncio.wait_for(self._json('matches/all'),10)
@@ -270,7 +312,7 @@ class RegularBrowserKeeper:
                 released=True;self._manual_signature=();self._layout_ids=()
                 if sid in self.suppressed or sid in self._ownership_lost:raise ValueError('Game was closed; replacement blocked')
                 for key in list(self._frames):
-                    if key[0]==sid:del self._frames[key]
+                    if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
                 await self._open(sid,url,stream.team,stream.browser,stream.session_id)
                 record['message']='Manual source opened'
                 self._manual_signature=();self._layout_ids=();self._save()
@@ -318,7 +360,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'control_mode':'regular','browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
+        return {'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
     async def _json(self,path):
         async with self._client.get('https://streamed.pk/api/'+path) as res:
             res.raise_for_status();value=await res.json()
@@ -538,13 +580,16 @@ class RegularBrowserKeeper:
         plan.update(mode='manual',selected=[r for r in plan['live']if r['id']in wanted],overflow=[r for r in plan['live']if r['id']not in wanted],placements=placements)
         self._visible_ids=tuple(p['stream_id']for p in placements);self._save()
 
-    def _no_video(self,sid,now):
+    def _recoverable_failure(self,sid,now):
         stream=self.active_streams.get(sid)
         if not self.session or not stream or stream.session_id!=self.session['id'] or stream.parked:return False
         if sid in self.suppressed or sid in self._ownership_lost or sid in self._releasing or sid not in self._visible_ids:return False
         if not self._browser_ready.get(stream.browser):return False
         rows=[v for (i,_),v in self._frames.items()if i==sid]
-        return bool(rows)and all(now-v[0]<12 and v[1].get('state')=='NO_VIDEO'for v in rows)
+        if not rows or any(now-v[0]>=12 for v in rows):return False
+        if all(v[1].get('state')=='NO_VIDEO'for v in rows):return True
+        buffering=[(key,v)for key,v in self._frames.items()if key[0]==sid and v[1].get('state')=='BUFFERING']
+        return bool(buffering)and all(v[1].get('state')in ('NO_VIDEO','BUFFERING')for v in rows)and all(key in self._progress and 15<=now-self._progress[key]<=300 and v[1].get('paused')is not True and not v[1].get('ended')for key,v in buffering)
 
     async def _recovery_sources(self,row,current,tried):
         choices=[]
@@ -583,7 +628,7 @@ class RegularBrowserKeeper:
                 except Exception:continue
         for sid in list(self.active_streams):
             now=time.time();record=self._recovery.get(sid)
-            if not self._no_video(sid,now)or sid not in live:
+            if not self._recoverable_failure(sid,now)or sid not in live:
                 if record:
                     record.pop('since',None)
                     if self.active_streams[sid].health_monitor.stats.get('state')=='PLAYING':record['message']='Playback restored; remaining budget retained'
@@ -599,14 +644,14 @@ class RegularBrowserKeeper:
                 # inventory errors block any destructive command.
                 audit=await self.command(stream.browser,'inventory')
                 if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed')
-                if not self._no_video(sid,time.time()):continue
+                if not self._recoverable_failure(sid,time.time()):continue
                 if record['attempts']==0:
                     if time.time()-self._reload_times.get(sid,0)<600:continue
                     record.update(attempts=1,last_action=time.time(),since=time.time(),message='One automatic refresh requested')
                     self._save();await self.force_reload(sid)
                 else:
                     url=await asyncio.wait_for(self._recovery_sources(live[sid],stream.url,record['tried']),20)
-                    if not self._no_video(sid,time.time()):continue
+                    if not self._recoverable_failure(sid,time.time()):continue
                     if not url:
                         record.update(last_action=time.time(),message='No alternate source available; waiting');continue
                     # Close and drain inventory before reopening the same canonical
@@ -621,7 +666,7 @@ class RegularBrowserKeeper:
                     self.active_streams.pop(sid,None);self._releasing.discard(sid);record.update(pending_release=False,url=url,last_action=time.time(),since=time.time());self._save()
                     if sid in self.suppressed or sid in self._ownership_lost:continue
                     for key in list(self._frames):
-                        if key[0]==sid:del self._frames[key]
+                        if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
                     await self._open(sid,url,stream.team,stream.browser,stream.session_id)
                     self._manual_signature=();self._layout_ids=()
                     await self._reconcile(plan)

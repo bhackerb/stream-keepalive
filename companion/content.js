@@ -15,6 +15,16 @@ function skExpand(target){
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){skEscaped=true;skRestore();if(skOwned)void skAPI.runtime.sendMessage({sk:true,op:'escape'}).catch(()=>{});}},true);
 skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
   if(!m?.sk)return false;
+  if(m.op==='audio'){
+    if(!skOwned || typeof m.muted!=='boolean' || ('volume'in m && (typeof m.volume!=='number' || !Number.isFinite(m.volume) || m.volume<0 || m.volume>1))){respond({confirmed:false});return false;}
+    const media=[...document.querySelectorAll('video,audio')];
+    try{
+      for(const v of media){v.muted=m.muted;if('volume'in m)v.volume=m.volume;}
+      const confirmed=media.every(v=>v.muted===m.muted && (!('volume'in m)||v.volume===m.volume));
+      respond({confirmed,muted:m.muted,...('volume'in m?{volume:m.volume}:{}),media_count:media.length,video_count:document.querySelectorAll('video').length});
+    }catch{respond({confirmed:false});}
+    return false;
+  }
   if(m.op==='fill_child' && skOwned && skFill && !skEscaped){const f=[...document.querySelectorAll('iframe')].find(f=>f.src===m.src || f.src.split('#')[0]===m.src.split('#')[0]);if(f)skExpand(f);}
   if(m.op==='marker' && window===window.top)document.title=m.value;
   if(m.op==='fill'){skFill=m.enabled;skEscaped=false;if(!skFill)skRestore();}
@@ -28,7 +38,7 @@ async function skTick(){
     const videos=[...document.querySelectorAll('video')];const v=videos.sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];
     const frames=v?.getVideoPlaybackQuality?.().totalVideoFrames ?? v?.webkitDecodedFrameCount ?? null;
     if(v && skLastTime!==null && v.currentTime>skLastTime && (frames===null || skLastFrames===null || frames>skLastFrames)){skLastProgress=Date.now();skEverProgress=true;}
-    const health=v?{state:v.error?'ERROR':v.paused?'PAUSED':skEverProgress&&v.readyState>=2&&Date.now()-skLastProgress<15000?'PLAYING':'LOADING',current_time:v.currentTime,decoded_frames:frames,ready_state:v.readyState,width:v.videoWidth,height:v.videoHeight,ended:v.ended&&skEverProgress&&(frames??0)>0,muted:v.muted,volume:v.volume,stall_seconds:(Date.now()-skLastProgress)/1000}: {state:'NO_VIDEO'};
+    const health=v?{state:v.error?'ERROR':v.paused?'PAUSED':skEverProgress&&v.readyState>=2&&Date.now()-skLastProgress<15000?'PLAYING':'LOADING',current_time:v.currentTime,decoded_frames:frames,ready_state:v.readyState,width:v.videoWidth,height:v.videoHeight,ended:v.ended&&skEverProgress&&(frames??0)>0,paused:v.paused,muted:v.muted,volume:v.volume,stall_seconds:(Date.now()-skLastProgress)/1000}: {state:'NO_VIDEO'};
     skLastTime=v?.currentTime??null;skLastFrames=frames;
     const reply=await skAPI.runtime.sendMessage({sk:true,op:'health',health});
     skOwned=!!reply?.owned;skFill=!!reply?.fill;
