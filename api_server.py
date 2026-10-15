@@ -57,6 +57,7 @@ class StreamKeeperAPI:
         self.app.router.add_post("/reload", self.handle_reload)
         self.app.router.add_post("/unmute", self.handle_unmute)
         self.app.router.add_post("/audio", self.handle_audio)
+        self.app.router.add_post("/restore-layout", self.handle_restore_layout)
         self.app.router.add_post("/switch", self.handle_switch)
         self.app.router.add_get("/player-sources", self.handle_player_sources)
         self.app.router.add_get("/screenshot", self.handle_screenshot)
@@ -70,7 +71,7 @@ class StreamKeeperAPI:
             return await handler(request)
 
         # Companion control must fail closed, including legacy dev configuration.
-        if request.path in ("/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+        if request.path in ("/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio", "/restore-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
             return web.json_response({"error": "API authentication required"}, status=503)
         if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
             return web.json_response({"error": "Native bridge is local only"}, status=403)
@@ -350,6 +351,18 @@ class StreamKeeperAPI:
             "success": not result.startswith("\u274c"),
             "message": result,
         })
+
+    async def handle_restore_layout(self,request):
+        if not hasattr(self.keeper,'restore_live_layout'):return web.json_response({'success':False,'message':'Restore requires regular browser control'},status=409)
+        try:
+            body=await request.json()
+            if not isinstance(body,dict)or not isinstance(body.get('display'),str):raise ValueError('display is required')
+            result=await self.keeper.restore_live_layout(body['display'])
+            return web.json_response(result,status=200 if result.get('success') else 409)
+        except (ValueError,TimeoutError)as exc:return web.json_response({'success':False,'message':str(exc)},status=409)
+        except Exception:
+            logger.exception('Live layout restore failed')
+            return web.json_response({'success':False,'message':'Live layout could not be restored; refresh status and retry'},status=409)
 
     async def handle_audio(self,request):
         if not hasattr(self.keeper,'set_audio'):

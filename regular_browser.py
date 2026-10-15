@@ -333,6 +333,41 @@ class RegularBrowserKeeper:
     async def set_tab_view(self,sid,enabled):
         for target in ([sid] if sid else list(self.active_streams)):await self.command_for(target,'fill',enabled=enabled)
         return {'success':True,'message':'Tab fill setting updated'}
+    async def restore_live_layout(self,display):
+        """Reapply current intent only: never open, close, transfer, or rank games."""
+        async with self._lock:
+            if display not in self.config.get('layout',{}).get('displays',{}):raise ValueError('Unknown display')
+            if not self.session:raise ValueError('No active viewing session')
+            placements=[p for p in (self.plan or {}).get('placements',[]) if p.get('display')==display]
+            if not placements:raise ValueError('No live placement on this display')
+            if any(p['stream_id'] not in self.active_streams or self.active_streams[p['stream_id']].parked or p['stream_id'] in self._releasing or p['stream_id'] in self._ownership_lost for p in placements):raise ValueError('Live display is changing; refresh status before restoring')
+            for p in placements:
+                if await self.command_for(p['stream_id'],'fill',enabled=True) is not True:raise ValueError('Player fill request was not accepted; layout unchanged')
+            previous=(self.plan or {}).get('placements',[])
+            result=await self._place(placements)
+            if result['success']:
+                self.layout_status={**result,'placements':[p for p in previous if p.get('display')!=display]+placements}
+                return {**self.layout_status,'message':'Live display restored; current games and draft preserved'}
+            self.layout_status={**result,'placements':previous}
+            return result
+
+    async def _maintain_tv_focus(self):
+        # Only the active full-size TV slot is maintained. Escape disables fill
+        # in the companion; respect that explicit exit until Restore is clicked.
+        if not self.session or self.config.get('layout',{}).get('backend')=='kwin':return
+        placements=[p for p in (self.plan or {}).get('placements',[])if p.get('display')=='tv']
+        tv=self.config.get('layout',{}).get('displays',{}).get('tv',{})
+        if len(placements)!=1:return
+        p=placements[0];sid=p['stream_id'];s=self.active_streams.get(sid)
+        if not all(p.get(k)==tv.get(k)for k in ('x','y','width','height')) or not s or s.session_id!=self.session['id'] or s.parked or sid in self._releasing or sid in self._ownership_lost or not self._browser_ready.get(s.browser):return
+        records=await self.command(s.browser,'inventory')
+        if not isinstance(records,dict) or self._inventory_errors.get(s.browser) or records.get(sid,{}).get('fill') is not True:return
+        if self.active_streams.get(sid) is not s or sid in self._releasing or sid in self._ownership_lost:return
+        from x11_windows import window_for_page,window_matches,wait_window_matches,move_window
+        wid=await window_for_page(s.page)
+        if not await asyncio.to_thread(window_matches,wid,p,fullscreen=True):
+            await asyncio.to_thread(move_window,wid,p,fullscreen=True)
+            if not await asyncio.to_thread(wait_window_matches,wid,p,fullscreen=True):raise ValueError('TV focus geometry not confirmed')
     async def arrange_streams(self,display,mode,ids=None):
         try:
             placements=plan_layout(self.config.get('layout',{}).get('displays',{}),display,mode,ids or list(self.active_streams))
@@ -346,7 +381,7 @@ class RegularBrowserKeeper:
                 from kwin_layout import arrange_windows
                 result=await arrange_windows(self.active_streams,placements)
             else:
-                from x11_windows import window_for_page,move_window
+                from x11_windows import window_for_page,move_window,wait_window_matches
                 # Identify every window before moving any; never move a shared personal window.
                 windows=[await window_for_page(self.active_streams[p['stream_id']].page)for p in placements]
                 if len(set(windows))!=len(windows):raise ValueError('Streams must occupy separate windows')
@@ -355,7 +390,8 @@ class RegularBrowserKeeper:
                     # A reserved half-slot stays tiled even if its other game is pending.
                     focus=sum(q.get('display')=='tv'for q in placements)==1 and p.get('display')=='tv' and all(p.get(k)==tv.get(k)for k in ('x','y','width','height'))
                     await asyncio.to_thread(move_window,wid,p,fullscreen=focus)
-                result={'success':True,'message':'X11 placement requested (no geometry readback)'}
+                    if focus and not await asyncio.to_thread(wait_window_matches,wid,p,fullscreen=True):raise ValueError('TV focus geometry not confirmed')
+                result={'success':True,'message':'X11 placement requested; full-TV focus geometry confirmed when applicable'}
             self.layout_status={**result,'placements':placements};return self.layout_status
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
@@ -692,3 +728,8 @@ class RegularBrowserKeeper:
                 except Exception as e:
                     log.exception('Session poll failed; preserving playing windows')
                     self.errors=['Catalog unavailable; existing streams preserved: '+type(e).__name__]
+                self.errors=[e for e in self.errors if not e.startswith('TV focus repair deferred:')]
+                try:await self._maintain_tv_focus()
+                except Exception as e:
+                    log.exception('TV focus repair deferred; preserving games')
+                    self.errors.append('TV focus repair deferred: '+str(e))

@@ -39,6 +39,33 @@ async def window_for_page(page):
         await page.evaluate("title => document.title = title", title)
 
 
+def window_matches(wid, bounds, fullscreen=False):
+    """Read actual client geometry/state; do not move or activate the window."""
+    from Xlib.display import Display
+    from Xlib import X
+    display = Display()
+    try:
+        root = display.screen().root
+        window = display.create_resource_object('window', wid)
+        geometry = window.get_geometry()
+        position = root.translate_coords(window, 0, 0)
+        state = window.get_full_property(display.intern_atom('_NET_WM_STATE'), X.AnyPropertyType)
+        focused = state is not None and display.intern_atom('_NET_WM_STATE_FULLSCREEN') in state.value
+        return focused == fullscreen and all(abs(a-b) <= 2 for a,b in zip(
+            (position.x, position.y, geometry.width, geometry.height),
+            (bounds['x'], bounds['y'], bounds['width'], bounds['height'])))
+    finally:
+        display.close()
+
+
+def wait_window_matches(wid, bounds, fullscreen=False):
+    """Allow the window manager one second to settle asynchronous geometry."""
+    for _ in range(50):
+        if window_matches(wid,bounds,fullscreen):return True
+        time.sleep(.02)
+    return False
+
+
 def move_window(wid, bounds, fullscreen=None):
     from Xlib.display import Display
     from Xlib import X, Xatom, protocol
@@ -76,7 +103,7 @@ def move_window(wid, bounds, fullscreen=None):
             window.change_property(motif, motif, 32, [2, 0, 0, 0, 0])
             display.sync()
             time.sleep(0.1)  # Let the WM process type/decorations before fullscreen.
-        if fullscreen is True and is_fullscreen:
+        if fullscreen is True and is_fullscreen and window_matches(wid,bounds,fullscreen=True):
             return
         if fullscreen is not None and is_fullscreen:
             # Explicit add/remove is idempotent; never toggle a user's other windows.

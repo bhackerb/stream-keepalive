@@ -161,7 +161,7 @@ class TVFocusPlacementTests(unittest.IsolatedAsyncioTestCase):
             k.active_streams={'a':SimpleNamespace(page='page-a'),'b':SimpleNamespace(page='page-b')}
             identify=AsyncMock(side_effect=[11,11,12,11,11,12])
             move=Mock()
-            with patch.dict(sys.modules,{'x11_windows':SimpleNamespace(window_for_page=identify,move_window=move)}):
+            with patch.dict(sys.modules,{'x11_windows':SimpleNamespace(window_for_page=identify,move_window=move,wait_window_matches=Mock(return_value=True))}):
                 self.assertTrue((await k._place([dict(stream_id='a',display='tv',**tv)]))['success'])
                 self.assertTrue(move.call_args.kwargs['fullscreen'])
                 half={**tv,'width':1920}

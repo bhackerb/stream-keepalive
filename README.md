@@ -287,3 +287,9 @@ In companion0.2.0, the legacy Unmute action intentionally also clears the owned
 browser tab's mute flag. Otherwise the newly introduced tab mute could keep an
 explicitly unmuted video silent. It retains the existing permissive frame message
 behavior; the stricter confirmed API applies only to the new audio control.
+
+### Recover a live display without changing the draft
+
+Authenticated `POST /restore-layout` with `{ "display": "tv" }` (or a configured monitor name) reapplies only that active session's current placements and tab fill. It never opens/closes games, applies a draft, or changes sources. Gwaihir exposes this on each monitor header.
+
+The existing sixty-second session tick maintains a single full-size X11 TV slot using actual fullscreen and geometry readback. Half slots, parked/transferring/lost games, and disconnected companions are skipped. Escape sets companion fill=false and suspends automatic focus repair; Restore live focus re-enables it. F11/window-manager exits while fill remains enabled are treated as focus drift. No companion update is required.
