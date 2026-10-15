@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 
-def script_source(plans, service, dry_run=False):
+def script_source(plans, service, dry_run=False, borderless=None):
     return """
     const plans = %s;
     const windows = workspace.windowList();
@@ -19,18 +19,20 @@ def script_source(plans, service, dry_run=False):
         if (!%s) selected.forEach((matches, i) => {
             const w = matches[0]; const p = plans[i];
             w.fullScreen = false; w.setMaximize(false, false);
+            const borderless = %s;
+            if (borderless !== null) w.noBorder = borderless;
             w.frameGeometry = {x:p.x, y:p.y, width:p.width, height:p.height};
         });
         result = {success:true, windows:selected.map((m, i) => ({
-            marker:plans[i].marker, geometry:{x:m[0].frameGeometry.x, y:m[0].frameGeometry.y,
+            marker:plans[i].marker, borderless:m[0].noBorder, geometry:{x:m[0].frameGeometry.x, y:m[0].frameGeometry.y,
             width:m[0].frameGeometry.width, height:m[0].frameGeometry.height}
         }))};
     }
     callDBus(%s, '/Result', 'org.streamkeeper.Layout', 'Report', JSON.stringify(result));
-    """ % (json.dumps(plans), json.dumps(dry_run), json.dumps(service))
+    """ % (json.dumps(plans), json.dumps(dry_run), json.dumps(borderless), json.dumps(service))
 
 
-async def run_script(plans, dry_run=False):
+async def run_script(plans, dry_run=False, borderless=None):
     from dbus_next.aio import MessageBus
     from dbus_next.service import ServiceInterface, method
     command = shutil.which("qdbus6") or shutil.which("qdbus")
@@ -67,7 +69,7 @@ async def run_script(plans, dry_run=False):
         bus.export("/Result", Result())
         with tempfile.TemporaryDirectory(prefix="streamkeeper-kwin-") as directory:
             path = Path(directory) / "layout.js"
-            path.write_text(script_source(plans, service, dry_run))
+            path.write_text(script_source(plans, service, dry_run, borderless))
             script_id = await qdbus("/Scripting", "org.kde.kwin.Scripting.loadScript", str(path), plugin)
             if not script_id.isdigit():
                 raise ValueError("KWin refused the temporary placement script")
@@ -82,7 +84,7 @@ async def run_script(plans, dry_run=False):
             bus.disconnect()
 
 
-async def arrange_windows(streams, placements):
+async def arrange_windows(streams, placements, borderless=None):
     tagged = []
     try:
         plans = []
@@ -98,7 +100,7 @@ async def arrange_windows(streams, placements):
         result = await run_script(plans, dry_run=True)
         if not result["success"]:
             return result
-        result = await run_script(plans)
+        result = await run_script(plans, borderless=borderless)
         if not result["success"]:
             return result
         await asyncio.sleep(0.2)
@@ -107,6 +109,7 @@ async def arrange_windows(streams, placements):
             return measured
         matches = all(all(abs(window["geometry"][key] - plan[key]) <= 2 for key in ("x", "y", "width", "height"))
                       for window, plan in zip(measured["windows"], plans))
+        if borderless is not None:matches=matches and all(w.get('borderless') is borderless for w in measured['windows'])
         return {"success": matches, "message": "KWin placement verified" if matches else "KWin constrained one or more windows; requested layout was not achieved",
                 "windows": measured["windows"]}
     finally:

@@ -27,7 +27,7 @@ class LiveFocusTests(unittest.IsolatedAsyncioTestCase):
  async def test_restore_preserves_other_displays_and_never_opens_or_closes(self):
   self.k.layout_status={'success':False,'message':'Earlier placement failed'}
   result=await self.k.restore_live_layout('tv');self.assertTrue(result['success']);self.assertIn(self.other,self.k.layout_status['placements'])
-  self.k.command_for.assert_awaited_once_with('game','fill',enabled=True);self.move.assert_called_once_with(42,self.p,fullscreen=True)
+  self.k.command_for.assert_awaited_once_with('game','fill',enabled=True);self.move.assert_called_once_with(42,self.p,fullscreen=True,borderless=True)
  async def test_restore_rejects_missing_session_or_released_player(self):
   self.k._ownership_lost.add('game')
   with self.assertRaises(ValueError):await self.k.restore_live_layout('tv')

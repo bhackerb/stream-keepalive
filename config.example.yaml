@@ -37,6 +37,7 @@ streams:
   max_streams: 10  # Dock: six widescreen + four vertical
 
 layout:
+  borderless: true  # Regular owned stream windows; false restores native decorations.
   backend: "cdp"  # cdp (Chromium/X11), kwin (KDE Wayland, both browsers)
   cdp_scale: 1  # Chromium window coordinates are DIPs: bhbserv's current browser scale is 2
   auto_arrange: false  # Enable after mapping physical displays

@@ -164,13 +164,19 @@ class TVFocusPlacementTests(unittest.IsolatedAsyncioTestCase):
             with patch.dict(sys.modules,{'x11_windows':SimpleNamespace(window_for_page=identify,move_window=move,wait_window_matches=Mock(return_value=True))}):
                 self.assertTrue((await k._place([dict(stream_id='a',display='tv',**tv)]))['success'])
                 self.assertTrue(move.call_args.kwargs['fullscreen'])
+                self.assertTrue(move.call_args.kwargs['borderless'])
                 half={**tv,'width':1920}
                 await k._place([dict(stream_id='a',display='tv',**half),dict(stream_id='b',display='tv',**{**half,'x':1920})])
                 self.assertEqual([c.kwargs['fullscreen']for c in move.call_args_list],[True,False,False])
+                self.assertTrue(all(c.kwargs['borderless']for c in move.call_args_list))
                 await k._place([dict(stream_id='a',display='widescreen',**tv)])
                 self.assertFalse(move.call_args.kwargs['fullscreen'])
 
                 await k._place([dict(stream_id='a',display='tv',**tv),dict(stream_id='b',display='tv',**tv)])
                 self.assertEqual([c.kwargs['fullscreen']for c in move.call_args_list[-2:]],[False,False])
+                k.config['layout']['borderless']=False
+                identify.side_effect=None;identify.return_value=11
+                await k._place([dict(stream_id='a',display='widescreen',**tv)])
+                self.assertFalse(move.call_args.kwargs['borderless'])
 
 if __name__=='__main__':unittest.main()

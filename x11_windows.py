@@ -66,7 +66,7 @@ def wait_window_matches(wid, bounds, fullscreen=False):
     return False
 
 
-def move_window(wid, bounds, fullscreen=None):
+def move_window(wid, bounds, fullscreen=None, borderless=False):
     from Xlib.display import Display
     from Xlib import X, Xatom, protocol
     display = Display()
@@ -92,17 +92,20 @@ def move_window(wid, bounds, fullscreen=None):
         window_type = display.intern_atom("_NET_WM_WINDOW_TYPE")
         motif = display.intern_atom("_MOTIF_WM_HINTS")
         original = window.get_full_property(saved_type, X.AnyPropertyType)
-        if fullscreen and original is None:
+        if (fullscreen or borderless) and original is None:
             # Firefox companion popups are DIALOG windows. Muffin refuses their
             # fullscreen requests until they become normal, undecorated windows.
             old_type = window.get_full_property(window_type, X.AnyPropertyType)
             old_hints = window.get_full_property(motif, X.AnyPropertyType)
             window.change_property(saved_type, Xatom.ATOM, 32, list(old_type.value) if old_type is not None else [])
             window.change_property(saved_hints, motif, 32, list(old_hints.value) if old_hints is not None else [])
-            window.change_property(window_type, Xatom.ATOM, 32, [display.intern_atom("_NET_WM_WINDOW_TYPE_NORMAL")])
             window.change_property(motif, motif, 32, [2, 0, 0, 0, 0])
             display.sync()
             time.sleep(0.1)  # Let the WM process type/decorations before fullscreen.
+        if fullscreen:
+            window.change_property(window_type, Xatom.ATOM, 32, [display.intern_atom("_NET_WM_WINDOW_TYPE_NORMAL")])
+            display.sync()
+            time.sleep(0.1)
         if fullscreen is True and is_fullscreen and window_matches(wid,bounds,fullscreen=True):
             return
         if fullscreen is not None and is_fullscreen:
@@ -111,14 +114,20 @@ def move_window(wid, bounds, fullscreen=None):
             wait_fullscreen(False)
         if fullscreen is False and original is not None:
             for target, saved in ((window_type, saved_type), (motif, saved_hints)):
+                if borderless and target==motif:continue
                 old = window.get_full_property(saved, X.AnyPropertyType)
                 if old is not None and len(old.value):
                     window.change_property(target, Xatom.ATOM if target == window_type else motif, 32, list(old.value))
                 else:
                     window.delete_property(target)
-                window.delete_property(saved)
+                if not borderless:window.delete_property(saved)
             display.sync()
             time.sleep(0.1)
+        if borderless:
+            # Only explicitly owned grid windows opt in. Keep original hints so
+            # a later decorated placement can restore them without profile CSS.
+            window.change_property(motif, motif, 32, [2, 0, 0, 0, 0])
+            display.sync()
         send("_NET_WM_STATE", [0, display.intern_atom("_NET_WM_STATE_MAXIMIZED_VERT"), display.intern_atom("_NET_WM_STATE_MAXIMIZED_HORZ"), 2, 0])
         # Gravity 0, all four dimensions supplied, source application 2.
         send("_NET_MOVERESIZE_WINDOW", [(15 << 8) | (2 << 12), bounds["x"] & 0xffffffff,

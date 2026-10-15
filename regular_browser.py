@@ -376,10 +376,11 @@ class RegularBrowserKeeper:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     async def _place(self,placements):
         try:
+            borderless=self.config.get('layout',{}).get('borderless',True) is not False
             if any(p['stream_id'] not in self.active_streams for p in placements):raise ValueError('Unknown stream')
             if self.config.get('layout',{}).get('backend')=='kwin':
                 from kwin_layout import arrange_windows
-                result=await arrange_windows(self.active_streams,placements)
+                result=await arrange_windows(self.active_streams,placements,borderless=borderless)
             else:
                 from x11_windows import window_for_page,move_window,wait_window_matches
                 # Identify every window before moving any; never move a shared personal window.
@@ -389,7 +390,7 @@ class RegularBrowserKeeper:
                 for wid,p in zip(windows,placements):
                     # A reserved half-slot stays tiled even if its other game is pending.
                     focus=sum(q.get('display')=='tv'for q in placements)==1 and p.get('display')=='tv' and all(p.get(k)==tv.get(k)for k in ('x','y','width','height'))
-                    await asyncio.to_thread(move_window,wid,p,fullscreen=focus)
+                    await asyncio.to_thread(move_window,wid,p,fullscreen=focus,borderless=borderless)
                     if focus and not await asyncio.to_thread(wait_window_matches,wid,p,fullscreen=True):raise ValueError('TV focus geometry not confirmed')
                 result={'success':True,'message':'X11 placement requested; full-TV focus geometry confirmed when applicable'}
             self.layout_status={**result,'placements':placements};return self.layout_status
