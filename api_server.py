@@ -56,6 +56,7 @@ class StreamKeeperAPI:
         self.app.router.add_post("/reload", self.handle_reload)
         self.app.router.add_post("/unmute", self.handle_unmute)
         self.app.router.add_post("/switch", self.handle_switch)
+        self.app.router.add_get("/player-sources", self.handle_player_sources)
         self.app.router.add_get("/screenshot", self.handle_screenshot)
         self.app.router.add_post("/layout", self.handle_layout)
         self.app.router.add_post("/tab-view", self.handle_tab_view)
@@ -67,7 +68,7 @@ class StreamKeeperAPI:
             return await handler(request)
 
         # Companion control must fail closed, including legacy dev configuration.
-        if request.path in ("/browser/bridge", "/session", "/session-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+        if request.path in ("/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
             return web.json_response({"error": "API authentication required"}, status=503)
         if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
             return web.json_response({"error": "Native bridge is local only"}, status=403)
@@ -367,12 +368,21 @@ class StreamKeeperAPI:
         except Exception:
             body = {}
 
+        if not isinstance(body,dict)or not isinstance(body.get('stream_id',''),str):return web.json_response({'error':'Invalid game'},status=400)
         stream_id = body.get("stream_id", "").strip() or None
-        result = await self.keeper.switch_source(stream_id)
+        if hasattr(self.keeper,'player_sources'):
+            result = await self.keeper.switch_source(stream_id,body.get('url'))
+        elif body.get('url') is not None:return web.json_response({'error':'Source picker requires regular browser mode'},status=400)
+        else:result = await self.keeper.switch_source(stream_id)
         return web.json_response({
             "success": not result.startswith("\u274c"),
             "message": result,
         })
+
+    async def handle_player_sources(self,request):
+        if not hasattr(self.keeper,'player_sources'):return web.json_response({'error':'Source picker requires regular browser mode'},status=400)
+        try:return web.json_response(await self.keeper.player_sources(request.query.get('stream_id')))
+        except (ValueError,TimeoutError)as e:return web.json_response({'error':str(e)or'Source lookup timed out; try again'},status=400)
 
     async def handle_screenshot(self, request: web.Request) -> web.Response:
         """Take a screenshot. Optional ?stream_id=blues or screenshots all."""

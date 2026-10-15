@@ -241,3 +241,11 @@ reserved TV slots remain tiled. Fullscreen transitions require WM confirmation;
 failed transitions remain retryable layout errors. No signed add-on update is needed.
 Validation:63 focused Python checks, native Muffin full→half→full/idempotency,
 and actual 3840×2160 TV capture with both desktop panels absent.
+
+Sports page source changes use authenticated `/player-sources?stream_id=...` and
+`/switch` with an explicit game and listed URL. The regular-browser controller
+revalidates provider metadata, audits exact ownership, closes and confirms absence
+before replacing the owned window, then restores its display slot/fullscreen.
+No arbitrary personal tabs are adopted. A failed open retains the selected source
+and resets placement signatures for the active session to retry. Switching a source
+starts the replacement muted. This uses the existing signed companion unchanged.

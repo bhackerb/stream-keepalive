@@ -229,7 +229,63 @@ class RegularBrowserKeeper:
     async def force_unmute(self,sid=None):
         for target in ([sid] if sid else list(self.active_streams)):await self.command_for(target,'unmute')
         return 'Unmute requested'
-    async def switch_source(self,sid=None):return '❌ Select another source explicitly; automatic source switching is disabled'
+    async def player_sources(self,sid):
+        if not isinstance(sid,str)or sid not in self.active_streams:raise ValueError('Choose an active owned game')
+        matches=await asyncio.wait_for(self._json('matches/all'),10)
+        row=next((r for r in matches if isinstance(r,dict)and r.get('id')==sid),None)
+        if not row:raise ValueError('This game is no longer in the source catalog')
+        choices=[];seen=set()
+        for source in (row.get('sources')or[])[:3]:
+            if not isinstance(source,dict)or not isinstance(source.get('source'),str)or not isinstance(source.get('id'),str):continue
+            try:streams=await asyncio.wait_for(self._json('stream/'+quote(source['source'],safe='')+'/'+quote(source['id'],safe='')),8)
+            except (aiohttp.ClientError,asyncio.TimeoutError,ValueError):continue
+            for item in streams[:30]:
+                if not isinstance(item,dict)or type(item.get('streamNo'))is not int or item['streamNo']<1:continue
+                url='https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
+                if url in seen:continue
+                seen.add(url);choices.append(dict(url=url,source=source['source'],number=item['streamNo'],language=str(item.get('language')or'Unknown')[:50],hd=item.get('hd')is True,viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else None,current=url==self.active_streams.get(sid,SimpleNamespace(url=None)).url))
+        return dict(stream_id=sid,choices=choices)
+
+    async def switch_source(self,sid=None,url=None):
+        try:options=await asyncio.wait_for(self.player_sources(sid),20)
+        except (ValueError,TimeoutError,aiohttp.ClientError)as e:return '❌ '+(str(e)or'Source lookup timed out; try again')
+        async with self._lock:
+            released=False
+            try:
+                stream=self.active_streams.get(sid)
+                if not stream or stream.parked or sid in self._releasing or sid in self._ownership_lost:raise ValueError('Choose a visible, owned game with no pending transfer')
+                if not isinstance(url,str)or url not in {c['url']for c in options['choices']}:raise ValueError('Choose an available source from this game')
+                if url==stream.url:return 'Already using this source'
+                audit=await self.command(stream.browser,'inventory')
+                if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed; source unchanged')
+                if self.active_streams.get(sid)is not stream:raise ValueError('Game changed while loading sources')
+                placements=[p for p in self.layout_status.get('placements',[])if p['stream_id']in self.active_streams]
+                record=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
+                record.update(pending_release=True,url=url,last_action=time.time(),message='Manual source switch requested');record.pop('since',None)
+                self._releasing.add(sid);self._save()
+                if await self.command_for(sid,'close')is not True:raise ValueError('Source close unconfirmed; no replacement opened')
+                audit=await self.command(stream.browser,'inventory')
+                if not isinstance(audit,dict)or sid in audit or self._inventory_errors.get(stream.browser):raise ValueError('Source release unconfirmed; no replacement opened')
+                self.active_streams.pop(sid,None);self._releasing.discard(sid);record['pending_release']=False;self._save()
+                released=True;self._manual_signature=();self._layout_ids=()
+                if sid in self.suppressed or sid in self._ownership_lost:raise ValueError('Game was closed; replacement blocked')
+                for key in list(self._frames):
+                    if key[0]==sid:del self._frames[key]
+                await self._open(sid,url,stream.team,stream.browser,stream.session_id)
+                record['message']='Manual source opened'
+                self._manual_signature=();self._layout_ids=();self._save()
+                if placements:
+                    result=await self._place(placements)
+                    if not result['success']:return 'Source opened; layout retry pending: '+result['message']
+                return 'Source switched; fullscreen and display slot preserved'
+            except Exception as e:
+                if released:
+                    if sid in self.active_streams:
+                        record['message']='Source opened; layout retry pending';self._save()
+                        return '❌ Source opened; layout retry pending: '+(str(e)or'Controller timed out')
+                    record['message']='Manual source retry pending: '+str(e);self._save()
+                    return '❌ Source released; selected source saved for session retry: '+str(e)
+                return '❌ '+(str(e)or'Controller timed out; ownership confirmation required')
     async def take_screenshot(self,sid=None):return None
     async def get_status(self,sid=None):return json.dumps(self.extra_status())
     async def set_tab_view(self,sid,enabled):
