@@ -232,3 +232,12 @@ node --test companion/background.test.cjs
 The companion has no screenshot support yet. Regular-mode API screenshots return an
 explicit unavailable response. Escape restores tab fill across authenticated extension
 frames; iframe sandbox attributes are never removed.
+
+Single full-size TV slots in regular-browser mode automatically use native X11
+fullscreen. Firefox popup dialog windows are temporarily made normal and
+undecorated because Muffin rejects fullscreen dialogs. Original window type and
+decoration hints are restored when the stream returns to a tiled layout. Partial
+reserved TV slots remain tiled. Fullscreen transitions require WM confirmation;
+failed transitions remain retryable layout errors. No signed add-on update is needed.
+Validation:63 focused Python checks, native Muffin full→half→full/idempotency,
+and actual 3840×2160 TV capture with both desktop panels absent.

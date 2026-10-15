@@ -252,7 +252,11 @@ class RegularBrowserKeeper:
                 # Identify every window before moving any; never move a shared personal window.
                 windows=[await window_for_page(self.active_streams[p['stream_id']].page)for p in placements]
                 if len(set(windows))!=len(windows):raise ValueError('Streams must occupy separate windows')
-                for wid,p in zip(windows,placements):await asyncio.to_thread(move_window,wid,p)
+                tv=self.config.get('layout',{}).get('displays',{}).get('tv',{})
+                for wid,p in zip(windows,placements):
+                    # A reserved half-slot stays tiled even if its other game is pending.
+                    focus=sum(q.get('display')=='tv'for q in placements)==1 and p.get('display')=='tv' and all(p.get(k)==tv.get(k)for k in ('x','y','width','height'))
+                    await asyncio.to_thread(move_window,wid,p,fullscreen=focus)
                 result={'success':True,'message':'X11 placement requested (no geometry readback)'}
             self.layout_status={**result,'placements':placements};return self.layout_status
         except (ValueError,TimeoutError) as e:

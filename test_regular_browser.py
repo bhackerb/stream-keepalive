@@ -148,4 +148,29 @@ class RegularTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await c.get('/status')).status,401)
             response=await c.get('/status',headers={'Authorization':'Bearer test-key'})
             data=await response.json();self.assertEqual(data['control_mode'],'regular');self.assertFalse(data['browser_connections']['firefox'])
+
+
+class TVFocusPlacementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_full_tv_slot_enters_focus_and_all_windows_are_identified_first(self):
+        from types import SimpleNamespace
+        import sys
+        from unittest.mock import Mock
+        tv=dict(x=0,y=0,width=3840,height=2160)
+        with tempfile.TemporaryDirectory() as tmp:
+            k=RegularBrowserKeeper({'layout':{'displays':{'tv':tv}},'session':{'state_file':str(Path(tmp)/'state.json')}})
+            k.active_streams={'a':SimpleNamespace(page='page-a'),'b':SimpleNamespace(page='page-b')}
+            identify=AsyncMock(side_effect=[11,11,12,11,11,12])
+            move=Mock()
+            with patch.dict(sys.modules,{'x11_windows':SimpleNamespace(window_for_page=identify,move_window=move)}):
+                self.assertTrue((await k._place([dict(stream_id='a',display='tv',**tv)]))['success'])
+                self.assertTrue(move.call_args.kwargs['fullscreen'])
+                half={**tv,'width':1920}
+                await k._place([dict(stream_id='a',display='tv',**half),dict(stream_id='b',display='tv',**{**half,'x':1920})])
+                self.assertEqual([c.kwargs['fullscreen']for c in move.call_args_list],[True,False,False])
+                await k._place([dict(stream_id='a',display='widescreen',**tv)])
+                self.assertFalse(move.call_args.kwargs['fullscreen'])
+
+                await k._place([dict(stream_id='a',display='tv',**tv),dict(stream_id='b',display='tv',**tv)])
+                self.assertEqual([c.kwargs['fullscreen']for c in move.call_args_list[-2:]],[False,False])
+
 if __name__=='__main__':unittest.main()
