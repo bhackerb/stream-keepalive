@@ -2,7 +2,8 @@
 
 Only sustained, fresh NO_VIDEO or previously progressing BUFFERING evidence permits
 bounded session recovery. Playing, paused, initial loading, stale, closed and
-ownership-lost streams never recover automatically.
+ownership-lost streams never enter session recovery. Explicit resume and a single
+unmute-pause repair use only play, bounded by fresh primary-video progress.
 The session reconciler opens only new match IDs, and only retires explicitly ended
 media with decoded-frame evidence. Catalog disappearance alone never ends a game.
 """
@@ -24,6 +25,9 @@ from session_planner import build_plan, validate_spec, reserve_sports
 
 log=logging.getLogger('stream-keeper.regular')
 ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top')
+PLAYBACK_CONFIRM_TIMEOUT=6
+UNMUTE_OBSERVE_TIMEOUT=4
+PLAYBACK_POLL_INTERVAL=.1
 def validate_url(url):
     try:u=urlparse(url)
     except Exception:raise ValueError('Invalid stream URL')
@@ -253,6 +257,85 @@ class RegularBrowserKeeper:
             result[browser]={'available':available,'muted':available,'volume':available,'version':info.get('version'),'reason':None if available else 'Install/connect signed companion 0.2.0 or later for mute and volume control'}
         return result
 
+    def _playback_target(self,sid,expected=None):
+        stream=self.active_streams.get(sid)
+        if not stream or (expected is not None and stream is not expected) or stream.parked or sid in self._releasing or sid in self._ownership_lost or sid in self.suppressed:
+            raise ValueError('Choose a visible owned stream with no pending transfer')
+        connection=self.connections.get(stream.browser)
+        if not connection or connection.closed or not self._browser_ready.get(stream.browser):
+            raise ValueError('Browser companion disconnected; reconnect it before resuming')
+        return stream
+
+    def _primary_video(self,sid):
+        # Aggregate status favors PLAYING children; a small ad must never prove
+        # that the actual player resumed. The companion reports each frame's
+        # largest video, so select the largest fresh video across those frames.
+        now=time.time()
+        rows=[(key,row)for key,row in self._frames.items()if key[0]==sid and 0<=now-row[0]<6 and row[1].get('width',0)>0 and row[1].get('height',0)>0]
+        return max(rows,key=lambda item:(item[1][1]['width']*item[1][1]['height'],item[1][0]))if rows else None
+
+    @staticmethod
+    def _video_advanced(before,after):
+        if after.get('state')!='PLAYING' or after.get('paused')is True or after.get('ended'):return False
+        times=[before.get('current_time'),after.get('current_time')]
+        if any(type(v)not in(int,float)or not math.isfinite(v)for v in times)or times[1]<=times[0]:return False
+        frames=[before.get('decoded_frames'),after.get('decoded_frames')]
+        if any(v is not None and (type(v)not in(int,float)or not math.isfinite(v))for v in frames):return False
+        return None in frames or frames[1]>frames[0]
+
+    async def _resume_playback_locked(self,sid,stream):
+        # Health events do not take _lock and can supply evidence while this
+        # operation serializes against layout, release, and audio mutations.
+        self._playback_target(sid,stream)
+        initial=self._primary_video(sid)
+        previous={initial[0]:initial[1]}if initial else {}
+        minimum_area=initial[1][1]['width']*initial[1][1]['height']if initial else 0
+        requested_at=time.time();deadline=asyncio.get_running_loop().time()+PLAYBACK_CONFIRM_TIMEOUT
+        command=asyncio.create_task(self.command_for(sid,'play'))
+        try:
+            while True:
+                self._playback_target(sid,stream)
+                sample=self._primary_video(sid)
+                if sample:
+                    key,(observed,health)=sample
+                    prior=previous.get(key)
+                    if observed>requested_at and health['width']*health['height']>=minimum_area:
+                        if prior and observed>prior[0] and self._video_advanced(prior[1],health):
+                            return {'success':True,'stream_id':sid,'playback_confirmed':True,'message':'Playback resumed; fresh video progress confirmed'}
+                        previous[key]=(observed,health)
+                remaining=deadline-asyncio.get_running_loop().time()
+                if remaining<=0:break
+                await asyncio.sleep(min(PLAYBACK_POLL_INTERVAL,remaining))
+            return {'success':False,'stream_id':sid,'playback_confirmed':False,'message':'Playback was not confirmed. The browser or player may block remote play; click Play in this stream window, then refresh status.'}
+        finally:
+            if not command.done():command.cancel()
+            await asyncio.gather(command,return_exceptions=True)
+
+    async def resume_playback(self,sid):
+        if not isinstance(sid,str)or not sid:raise ValueError('stream_id is required')
+        async with self._lock:
+            try:return await self._resume_playback_locked(sid,self._playback_target(sid))
+            except ValueError as exc:return {'success':False,'stream_id':sid,'playback_confirmed':False,'message':str(exc)}
+
+    async def _protect_unmute_locked(self,sid,stream,started_at,confirmed_at,primary):
+        deadline=asyncio.get_running_loop().time()+UNMUTE_OBSERVE_TIMEOUT
+        while True:
+            try:self._playback_target(sid,stream)
+            except ValueError as exc:return {'playback_confirmed':False,'playback_warning':str(exc)}
+            sample=self._primary_video(sid)
+            if sample and sample[0]==primary[0] and sample[1][0]>started_at:
+                health=sample[1][1]
+                if health.get('state')=='PAUSED' or health.get('paused')is True:
+                    try:result=await self._resume_playback_locked(sid,stream)
+                    except ValueError as exc:result={'success':False,'message':str(exc)}
+                    if result['success']:return {'playback_confirmed':True}
+                    return {'playback_confirmed':False,'playback_warning':result['message']}
+                if sample[1][0]>confirmed_at and self._video_advanced(primary[1][1],health):
+                    return {'playback_confirmed':True}
+            remaining=deadline-asyncio.get_running_loop().time()
+            if remaining<=0:return {'playback_confirmed':False,'playback_warning':'Audio settings applied; fresh playback status was not confirmed. Refresh status and use Resume or click Play in this stream window if paused.'}
+            await asyncio.sleep(min(PLAYBACK_POLL_INTERVAL,remaining))
+
     async def set_audio(self,sid,muted,volume=None):
         if not isinstance(sid,str)or not sid or sid not in self.active_streams:raise ValueError('Choose an active owned stream')
         if type(muted)is not bool:raise ValueError('muted must be boolean')
@@ -261,6 +344,9 @@ class RegularBrowserKeeper:
             stream=self.active_streams.get(sid)
             if not stream or sid in self._releasing or sid in self._ownership_lost:raise ValueError('Owned stream is unavailable')
             if not self.audio_capabilities()[stream.browser]['available']:raise NotImplementedError('Mute and volume require signed companion 0.2.0 or later; existing Unmute remains available')
+            primary=self._primary_video(sid)
+            protect=not muted and primary and primary[1][1].get('state')=='PLAYING' and primary[1][1].get('paused')is not True and not primary[1][1].get('ended')
+            audio_started=time.time()
             args={'muted':muted}
             if volume is not None:args['volume']=volume
             try:result=await self.command_for(sid,'audio',**args)
@@ -269,7 +355,10 @@ class RegularBrowserKeeper:
                 raise ValueError('Browser did not confirm all audio settings; some may have changed. Refresh status before retrying')
             stream.health_monitor.stats['muted']=muted
             if volume is not None:stream.health_monitor.stats['volume']=volume
-            return {'success':True,'stream_id':sid,'muted':muted,'volume':result.get('volume'),'confirmed':True,'message':'Browser confirmed audio settings'}
+            playback=await self._protect_unmute_locked(sid,stream,audio_started,time.time(),primary)if protect else {}
+            message='Browser confirmed audio settings'
+            if playback.get('playback_warning'):message+='; '+playback['playback_warning']
+            return {'success':True,'stream_id':sid,'muted':muted,'volume':result.get('volume'),'confirmed':True,'message':message,**playback}
 
     async def player_sources(self,sid):
         if not isinstance(sid,str)or sid not in self.active_streams:raise ValueError('Choose an active owned game')

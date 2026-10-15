@@ -57,6 +57,7 @@ class StreamKeeperAPI:
         self.app.router.add_post("/reload", self.handle_reload)
         self.app.router.add_post("/unmute", self.handle_unmute)
         self.app.router.add_post("/audio", self.handle_audio)
+        self.app.router.add_post("/resume", self.handle_resume)
         self.app.router.add_post("/restore-layout", self.handle_restore_layout)
         self.app.router.add_post("/switch", self.handle_switch)
         self.app.router.add_get("/player-sources", self.handle_player_sources)
@@ -71,7 +72,7 @@ class StreamKeeperAPI:
             return await handler(request)
 
         # Companion control must fail closed, including legacy dev configuration.
-        if request.path in ("/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio", "/restore-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+        if request.path in ("/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio", "/resume", "/restore-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
             return web.json_response({"error": "API authentication required"}, status=503)
         if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
             return web.json_response({"error": "Native bridge is local only"}, status=403)
@@ -363,6 +364,24 @@ class StreamKeeperAPI:
         except Exception:
             logger.exception('Live layout restore failed')
             return web.json_response({'success':False,'message':'Live layout could not be restored; refresh status and retry'},status=409)
+
+    async def handle_resume(self,request):
+        try:
+            body=await request.json()
+            if not isinstance(body,dict)or set(body)!={'stream_id'}or not isinstance(body.get('stream_id'),str)or not body['stream_id'].strip():
+                raise ValueError('An exact stream_id is required')
+        except (ValueError,TypeError):
+            return web.json_response({'success':False,'playback_confirmed':False,'message':'An exact stream_id is required'},status=400)
+        if not hasattr(self.keeper,'resume_playback'):
+            return web.json_response({'success':False,'playback_confirmed':False,'message':'Resume requires regular browser control'},status=409)
+        try:
+            result=await self.keeper.resume_playback(body['stream_id'])
+            return web.json_response(result,status=200 if result.get('success') else 409)
+        except (ValueError,TimeoutError)as exc:
+            return web.json_response({'success':False,'playback_confirmed':False,'message':str(exc)},status=409)
+        except Exception:
+            logger.exception('Playback resume failed')
+            return web.json_response({'success':False,'playback_confirmed':False,'message':'Playback could not be confirmed; click Play in this stream window and refresh status'},status=409)
 
     async def handle_audio(self,request):
         if not hasattr(self.keeper,'set_audio'):

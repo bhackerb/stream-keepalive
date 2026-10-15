@@ -264,6 +264,21 @@ as player confirmation. Audio commands retain the existing startup mute policy;
 replacement sources still start according to session configuration. The daemon
 never changes personal or unowned tabs.
 
+Authenticated `POST /resume` accepts only `{"stream_id":"game-id"}` for one
+visible, connected, owned stream. It sends the signed companion's existing play
+operation once and waits up to six seconds for fresh primary-video media time
+and, when available, decoded frames to advance. A command acknowledgment alone
+never confirms playback. Blocked or unconfirmed playback returns HTTP 409 with
+`success: false` and guidance to click Play in that stream window. Resume keeps
+the source, window, mute, and volume settings.
+
+If a freshly playing stream pauses immediately after `POST /audio` unmutes it,
+the daemon observes fresh health for up to four seconds and attempts the same
+bounded play operation once. An already paused stream stays paused. Applied audio
+settings still return `confirmed: true`; failed playback recovery additionally
+returns `playback_confirmed: false` and an actionable `playback_warning`.
+The existing signed companion needs no update for resume or unmute protection.
+
 `GET /status` exposes `audio_capabilities` per browser. Mute and volume require
 companion 0.2.0 advertising `audio-v1`; the signed 0.1.0 add-on continues its
 existing Unmute command and receives no unsupported audio commands. Build the
