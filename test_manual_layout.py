@@ -9,7 +9,7 @@ class GeometryTests(unittest.TestCase):
         first=manual_placements(layout,D,{'now'});second=manual_placements(layout,D,{'now','later'})
         self.assertEqual(first[0],second[0]);self.assertEqual(second[1]['x'],3445)
     def test_conflicts_and_nonconfigured_slots_reject(self):
-        base={'presets':{'tv':4},'assignments':[{'game_id':'a','display':'tv','slot':0}]}
+        base={'presets':{'tv':1},'assignments':[{'game_id':'a','display':'tv','slot':0}]}
         for extra in ({'game_id':'a','display':'tv','slot':1},{'game_id':'b','display':'tv','slot':0},{'game_id':'b','display':'tv','slot':4},{'game_id':'b','display':'vertical','slot':0}):
             with self.assertRaises(ValueError):validate_manual_layout({**base,'assignments':base['assignments']+[extra]},D)
 class ManualTests(unittest.IsolatedAsyncioTestCase):
@@ -30,12 +30,12 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(c.args[1]=='open'for c in self.k.command.await_args_list))
     async def test_unknown_game_apply_fails_without_mutating_current_session(self):
         self.k.discover=AsyncMock(return_value=self.plan(1));prior=self.k.session.copy()
-        with self.assertRaises(ValueError):await self.k.set_session_layout({'mode':'manual','start':True,'presets':{'tv':4},'assignments':[{'game_id':'unknown','display':'tv','slot':0}]})
+        with self.assertRaises(ValueError):await self.k.set_session_layout({'mode':'manual','start':True,'presets':{'tv':1},'assignments':[{'game_id':'unknown','display':'tv','slot':0}]})
         self.assertEqual(self.k.session,prior)
     async def test_reapply_does_not_reopen_closed_or_lost_games(self):
         self.k.suppressed.add('0');self.k._ownership_lost.add('1')
         self.k.discover=AsyncMock(return_value=self.plan(2))
-        await self.k.set_session_layout({'mode':'manual','start':True,'presets':{'tv':4},'assignments':[{'game_id':'0','display':'tv','slot':0},{'game_id':'1','display':'tv','slot':1}]})
+        await self.k.set_session_layout({'mode':'manual','start':True,'presets':{'widescreen':4},'assignments':[{'game_id':'0','display':'widescreen','slot':0},{'game_id':'1','display':'widescreen','slot':1}]})
         self.k.command.assert_not_awaited();self.assertIn('0',self.k.suppressed);self.assertIn('1',self.k._ownership_lost)
     async def test_layout_roundtrip_preserves_windows_and_invalid_geometry_stops_tracking(self):
         from regular_browser import RegularBrowserKeeper
@@ -49,14 +49,14 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         changed=RegularBrowserKeeper({**self.config,'layout':{'displays':{'tv':D['tv']}}})
         self.assertIsNone(changed.session);self.assertIn('0',changed.active_streams)
     async def test_manual_to_auto_uses_fresh_catalog_and_browser_change_rejects(self):
-        self.k.manual_layout={'presets':{'tv':4},'assignments':[]}
+        self.k.manual_layout={'presets':{'tv':1},'assignments':[]}
         self.k.discover=AsyncMock(return_value=self.plan(2))
         await self.k.set_session_layout({'mode':'auto'})
         self.assertIsNone(self.k.manual_layout);self.k.discover.assert_awaited_once();self.assertEqual(len(self.k.active_streams),2)
-        with self.assertRaises(ValueError):await self.k.set_session_layout({'mode':'manual','start':True,'browser':'chromium','presets':{'tv':4},'assignments':[]})
+        with self.assertRaises(ValueError):await self.k.set_session_layout({'mode':'manual','start':True,'browser':'chromium','presets':{'tv':1},'assignments':[]})
     async def test_partial_apply_keeps_retryable_intent_and_reports_failure(self):
         self.k.discover=AsyncMock(return_value=self.plan(1));self.k._place=AsyncMock(side_effect=RuntimeError('fixture failure'))
-        result=await self.k.set_session_layout({'mode':'manual','start':True,'presets':{'tv':4},'assignments':[{'game_id':'0','display':'tv','slot':0}]})
+        result=await self.k.set_session_layout({'mode':'manual','start':True,'presets':{'tv':1},'assignments':[{'game_id':'0','display':'tv','slot':0}]})
         self.assertTrue(result['errors']);self.assertIn('partially applied',result['errors'][0]);self.assertIsNotNone(self.k.manual_layout);self.assertIn('0',self.k.active_streams)
         self.k._place=AsyncMock(return_value={'success':True});await self.k._reconcile(self.plan(1));self.assertEqual(self.k.errors,[])
     async def test_layout_endpoint_requires_auth_and_invalid_draft_does_not_mutate(self):
@@ -70,7 +70,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await c.post('/session-layout',json={'mode':'auto'})).status,503)
     async def test_shared_release_closes_confirmed_source_without_user_suppression_and_fences_old_epoch(self):
         await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2));self.k._place=AsyncMock(return_value={'success':True})
-        body={'mode':'manual','start':True,'group_id':'a'*32,'group_epoch':2,'presets':{'tv':4},'assignments':[{'game_id':'0','display':'tv','slot':0}],'release_ids':['1']}
+        body={'mode':'manual','start':True,'group_id':'a'*32,'group_epoch':2,'presets':{'tv':1},'assignments':[{'game_id':'0','display':'tv','slot':0}],'release_ids':['1']}
         await self.k.set_session_layout(body);self.assertNotIn('1',self.k.active_streams);self.assertNotIn('1',self.k.suppressed)
         with self.assertRaises(ValueError):await self.k.set_session_layout({**body,'group_epoch':1})
         self.assertEqual(self.k.extra_status()['session']['group_epoch'],2)
@@ -82,7 +82,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
     async def test_timed_out_release_keeps_new_desired_layout_and_late_close_is_not_user_suppression(self):
         await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2))
         self.k.command=AsyncMock(side_effect=TimeoutError('fixture'))
-        body={'mode':'manual','start':True,'group_id':'b'*32,'group_epoch':1,'presets':{'tv':4},'assignments':[],'release_ids':['1']}
+        body={'mode':'manual','start':True,'group_id':'b'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[],'release_ids':['1']}
         with self.assertRaises(TimeoutError):await self.k.set_session_layout(body)
         self.assertEqual(self.k.manual_layout['assignments'],[]);self.assertIn('1',self.k._releasing)
         await self.k._event('firefox',{'event':'closed','stream_id':'1'})
@@ -91,7 +91,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_same_epoch_has_one_winner_and_invalid_groups_return_value_error(self):
         import asyncio
         self.k.discover=AsyncMock(return_value=self.plan(0))
-        body={'mode':'manual','start':True,'group_id':'c'*32,'group_epoch':1,'presets':{'tv':4},'assignments':[]}
+        body={'mode':'manual','start':True,'group_id':'c'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[]}
         results=await asyncio.gather(self.k.set_session_layout(body),self.k.set_session_layout(body),return_exceptions=True)
         self.assertEqual(sum(isinstance(r,dict)for r in results),1);self.assertEqual(sum(isinstance(r,ValueError)for r in results),1)
         for group in ([],{},'bad'):
@@ -99,7 +99,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
     async def test_release_retry_with_new_epoch_converges_and_preserves_unrelated_suppression(self):
         await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2));self.k.suppressed.update(('other-sport-game','0'))
         self.k.command=AsyncMock(return_value=False)
-        body={'mode':'manual','start':True,'group_id':'d'*32,'group_epoch':1,'reset_suppression':True,'presets':{'tv':4},'assignments':[],'release_ids':['1']}
+        body={'mode':'manual','start':True,'group_id':'d'*32,'group_epoch':1,'reset_suppression':True,'presets':{'tv':1},'assignments':[],'release_ids':['1']}
         with self.assertRaises(ValueError):await self.k.set_session_layout(body)
         self.assertIn('1',self.k._releasing);self.assertIn('other-sport-game',self.k.suppressed);self.assertNotIn('0',self.k.suppressed)
         self.k.suppressed.add('0');self.k.command=AsyncMock(return_value=True)
@@ -131,11 +131,38 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         from display_layout import plan_layout
         displays={**D,'tv':{**D['tv'],'max_streams':2}}
         with self.assertRaises(ValueError):plan_layout(displays,'tv','grid',['a','b','c'])
-        with self.assertRaises(ValueError):validate_manual_layout({'presets':{'tv':4},'assignments':[]},displays)
-        self.assertEqual(len(plan_layout(displays,'tv','grid',['a','b'])),2)
+        with self.assertRaises(ValueError):validate_manual_layout({'presets':{'tv':2},'assignments':[]},displays)
+        with self.assertRaises(ValueError):plan_layout(displays,'tv','grid',['a','b'])
+        self.assertEqual(len(plan_layout(displays,'tv','grid',['a'])),1)
 
     async def test_failed_recovery_audit_preserves_quarantine(self):
         self.k._ownership_lost.add('0');self.k.command=AsyncMock(return_value=False)
         body={'mode':'manual','start':True,'group_id':'f'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[{'game_id':'0','display':'tv','slot':0}],'recover_ids':['0']}
         with self.assertRaises(ValueError):await self.k.set_session_layout(body)
         self.assertIn('0',self.k._ownership_lost);self.assertEqual(self.k.command.await_count,1)
+
+    async def test_explicit_reopen_clears_only_selected_suppression_even_without_local_assignment(self):
+        self.k.suppressed.update(('0','unrelated'));self.k.discover=AsyncMock(return_value=self.plan(1))
+        body={'mode':'manual','start':True,'group_id':'9'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[],'reopen_ids':['0']}
+        await self.k.set_session_layout(body)
+        self.assertNotIn('0',self.k.suppressed);self.assertIn('unrelated',self.k.suppressed);self.k.command.assert_awaited_once_with('firefox','inventory')
+        self.k.suppressed.add('0')
+        with self.assertRaises(ValueError):await self.k.set_session_layout(body)
+        self.assertIn('0',self.k.suppressed)
+    async def test_invalid_reopen_catalog_and_failed_inventory_preserve_suppression(self):
+        self.k.suppressed.update(('0','absent'));self.k.discover=AsyncMock(return_value=self.plan(1))
+        body={'mode':'manual','start':True,'group_id':'8'*32,'group_epoch':1,'presets':{'tv':1},'assignments':[],'reopen_ids':['absent']}
+        with self.assertRaises(ValueError):await self.k.set_session_layout(body)
+        self.assertEqual(self.k.suppressed,{'0','absent'})
+        self.k.command=AsyncMock(return_value=False)
+        with self.assertRaises(ValueError):await self.k.set_session_layout({**body,'reopen_ids':['0']})
+        self.assertEqual(self.k.suppressed,{'0','absent'});self.assertNotIn('8'*32,self.k._group_epochs)
+
+    async def test_legacy_tv_split_migration_preserves_session_and_owned_windows(self):
+        from regular_browser import RegularBrowserKeeper
+        await self.k._reconcile(self.plan(2))
+        self.k.manual_layout={'presets':{'tv':2},'assignments':[{'game_id':'0','display':'tv','slot':0},{'game_id':'1','display':'tv','slot':1}]}
+        self.k.saved_layout=dict(self.k.manual_layout);self.k._save()
+        fresh=RegularBrowserKeeper(self.config)
+        self.assertEqual(fresh.session,self.k.session);self.assertEqual(set(fresh.active_streams),{'0','1'})
+        self.assertEqual(fresh.manual_layout['presets'],{'tv':1});self.assertEqual([a['game_id']for a in fresh.manual_layout['assignments']],['0'])

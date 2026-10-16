@@ -19,14 +19,14 @@ class PlannerTests(unittest.TestCase):
     def test_channels_excluded_and_tv_overflow_visible(self):
         games=[game(i) for i in range(7)]+[game('network',0)]
         p=build_plan(games,{g['id'] for g in games},{},{'display':'tv'},D,1000000)
-        self.assertEqual(len(p['selected']),4); self.assertEqual(len(p['overflow']),3)
+        self.assertEqual(len(p['selected']),1); self.assertEqual(len(p['overflow']),6)
     def test_horizon_fixed_and_future_not_opened_early(self):
         p=build_plan([game(1,2000000),game(2,90000000)],set(),{}, {},D,1000000,until_ms=3000000)
         self.assertEqual([g['id'] for g in p['pending']],['1']); self.assertEqual(p['selected'],[])
     def test_mixed_sports_reserves_baseball_even_with_lower_viewer_count(self):
         games=[game(i)for i in range(5)]+[game('baseball',sport='baseball')]
-        p=build_plan(games,{g['id']for g in games},{**{str(i):100 for i in range(5)},'baseball':1},{'sports':['hockey','baseball'],'display':'tv'},D,1000000)
-        self.assertEqual(len(p['selected']),4)
+        p=build_plan(games,{g['id']for g in games},{**{str(i):100 for i in range(5)},'baseball':1},{'sports':['hockey','baseball'],'display':'dock'},D,1000000)
+        self.assertEqual(len(p['selected']),6)
         self.assertIn('baseball',[g['id']for g in p['selected']])
     def test_invalid_types(self):
         for spec in ({'hours':True},{'sports':'hockey'},{'favorites':'Blues'},{'browser':'unknown'}):

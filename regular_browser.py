@@ -81,6 +81,11 @@ class RegularBrowserKeeper:
         if self.state_path.exists():
             try:
                 state=json.loads(self.state_path.read_text());self._recovery={k:r for k,v in (state.get('recovery',{})if isinstance(state.get('recovery'),dict)else {}).items()if isinstance(k,str)and (r:=recovery_record(v))is not None};self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
+                # Migrate legacy TV splits without discarding group ownership or windows.
+                for layout in (self.manual_layout,self.saved_layout):
+                    if isinstance(layout,dict)and isinstance(layout.get('presets'),dict)and layout['presets'].get('tv',1)>1:
+                        layout['presets']['tv']=1
+                        layout['assignments']=[a for a in layout.get('assignments',[])if a.get('display')!='tv'or a.get('slot')==0]
                 for sid,r in state.get('streams',{}).items():self._add(sid,r)
                 for record in self._recovery.values():
                     record.pop('since',None);record.pop('last_health',None)
@@ -657,13 +662,17 @@ class RegularBrowserKeeper:
                 self.saved_layout={**layout,'spec':spec};self._save()
                 return {'success':True,'message':'Layout draft saved; no windows changed','layout':self.saved_layout}
             recoveries=body.get('recover_ids',[])
+            reopen=body.get('reopen_ids',[])
+            if not isinstance(reopen,list)or len(reopen)>14 or any(not isinstance(i,str)for i in reopen)or(reopen and not group):raise ValueError('Reopen requires explicit game IDs in a shared session')
             if not isinstance(recoveries,list)or len(recoveries)>14 or any(not isinstance(i,str)or i not in {a['game_id']for a in layout['assignments']}for i in recoveries)or(recoveries and not group):raise ValueError('Recovery requires explicit assigned game IDs in a shared session')
             if self.session and spec['browser']!=self.session['spec']['browser']:raise ValueError('Stop the active session before changing browsers')
-            if recoveries:
+            if recoveries or reopen:
                 audit=await self.command(spec['browser'],'inventory')
                 if audit is False or self._inventory_errors.get(spec['browser']):raise ValueError('Ownership inventory failed; replacement blocked')
             plan=await self.discover(spec)
-            known={r['id']for r in plan['live']+plan['pending']}|set(self.active_streams)
+            catalog_ids={r['id']for r in plan['live']+plan['pending']}
+            if any(i not in catalog_ids for i in reopen):raise ValueError('Reopen game is outside the current catalog')
+            known=catalog_ids|set(self.active_streams)
             if any(a['game_id']in self._releasing for a in layout['assignments']):raise ValueError('Previous source release still unconfirmed; wait for close or stop that owned stream')
             if any(a['game_id']not in known for a in layout['assignments']):raise ValueError('One or more games are outside the current live/later-start catalog; refresh the games list')
             releases=body.get('release_ids',[])
@@ -678,6 +687,7 @@ class RegularBrowserKeeper:
             self.session={'id':self.session['id']if self.session else uuid.uuid4().hex,'spec':spec,'until_ms':plan['until_ms'],'group_id':group,'group_epoch':epoch}
             for a in layout['assignments']:
                 if a['game_id']in self.active_streams:self.active_streams[a['game_id']].session_id=self.session['id']
+            self.suppressed.difference_update(reopen)
             self._ownership_lost.difference_update(recoveries)
             self.plan=plan;self._releasing.update(sid for sid in releases if sid in self.active_streams);self._save()
             for sid in releases:

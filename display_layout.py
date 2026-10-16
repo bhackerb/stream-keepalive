@@ -1,6 +1,6 @@
 """Deterministic stream layout planning; coordinates are desktop pixels."""
 
-CAPACITIES = {"tv": 4, "widescreen": 6, "vertical": 4, "laptop": 4}
+CAPACITIES = {"tv": 1, "widescreen": 6, "vertical": 4, "laptop": 4}
 
 
 def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) -> list[dict]:
@@ -19,7 +19,8 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
         if region["width"] <= 0 or region["height"] <= 0:
             raise ValueError("Display dimensions must be positive")
         limit=region.get("max_streams",CAPACITIES[name])
-        if type(limit)is not int or not 1<=limit<=CAPACITIES[name]:raise ValueError("Invalid display stream limit")
+        if type(limit)is not int or not 1<=limit<=(4 if name=="tv" else CAPACITIES[name]):raise ValueError("Invalid display stream limit")
+        limit=min(limit,CAPACITIES[name])
         capacity = limit if mode == "grid" else min(limit,2 if mode == "side-by-side" else 1)
         if name == "vertical" and mode == "side-by-side":
             raise ValueError("Side-by-side is supported on TV and widescreen")

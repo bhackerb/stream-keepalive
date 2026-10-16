@@ -1,7 +1,7 @@
 """Validated, fixed display slots for manual game placement and future reservations."""
 import re
 from display_layout import CAPACITIES,plan_layout
-PRESETS={'tv':(1,2,4),'widescreen':(1,2,4,6),'vertical':(1,2,3,4),'laptop':(1,2,4)}
+PRESETS={'tv':(1,),'widescreen':(1,2,4,6),'vertical':(1,2,3,4),'laptop':(1,2,4)}
 def validate_manual_layout(body,displays):
     if not isinstance(body,dict):raise ValueError('Expected layout object')
     presets=body.get('presets',{})

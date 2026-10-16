@@ -13,7 +13,7 @@ DISPLAYS = {"tv": {"x": 0, "y": 0, "width": 3840, "height": 2160},
 
 class LayoutTests(unittest.TestCase):
     def test_requested_capacities_and_even_coverage(self):
-        for display, count in [("tv", 4), ("widescreen", 6), ("vertical", 4), ("dock", 10)]:
+        for display, count in [("tv", 1), ("widescreen", 6), ("vertical", 4), ("dock", 10)]:
             placements = plan_layout(DISPLAYS, display, "grid", [str(i) for i in range(count)])
             self.assertEqual(len(placements), count)
             for name in {p["display"] for p in placements}:
@@ -26,8 +26,8 @@ class LayoutTests(unittest.TestCase):
                                         a["y"] + a["height"] <= b["y"] or b["y"] + b["height"] <= a["y"])
 
     def test_partial_row_odd_pixels_and_negative_origins(self):
-        displays = {"tv": {"x": -5, "y": 20, "width": 101, "height": 99}}
-        cells = plan_layout(displays, "tv", "grid", ["a", "b", "c"])
+        displays = {"widescreen": {"x": -5, "y": 20, "width": 101, "height": 99}}
+        cells = plan_layout(displays, "widescreen", "grid", ["a", "b", "c"])
         self.assertEqual(cells[-1]["width"], 101)
         self.assertEqual(sum(p["width"] * p["height"] for p in cells), 9999)
 
@@ -47,7 +47,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         keeper.context = AsyncMock()
         keeper.context.new_cdp_session.return_value = session
         keeper.active_streams = {s: SimpleNamespace(page=object()) for s in ["a", "b"]}
-        result = await keeper.arrange_streams("tv", "grid")
+        result = await keeper.arrange_streams("widescreen", "grid")
         self.assertFalse(result["success"])
         self.assertEqual([call.args[0] for call in session.send.await_args_list], ["Browser.getWindowForTarget"] * 2)
 

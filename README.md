@@ -331,3 +331,12 @@ The existing sixty-second session tick maintains a single full-size X11 TV slot 
 
 Regular-browser grid placement now requests borderless windows: X11 removes the owned window's native decorations while retaining its original type/hints for restoration; KWin sets noBorder on the exact identified stream windows and verifies the resulting geometry. This does not enter monitor fullscreen for tiled streams or modify regular browser profiles. A Firefox toolbar rendered inside a popup is separate from native window decoration and is not hidden by this change.
 Set `layout.borderless: false` in the native controller configuration to opt out on the next placement/Restore live layout. Regular windows default to borderless; managed placement keeps its previous decoration behavior.
+
+
+Explicit automatic-session reopening uses authenticated `POST /session-layout`
+with the current shared-session group and a strictly increasing epoch. The
+`reopen_ids` list clears only those catalog-valid game IDs from local user-close
+suppression, even when that controller is not their destination. Inventory must
+succeed first. `recover_ids` separately allows ownership recovery only for exact
+assigned game IDs. Ordinary ticks never clear closed-game suppression. TV layouts
+support one focused stream; legacy configured limits are clamped to one.
