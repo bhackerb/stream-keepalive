@@ -303,6 +303,18 @@ browser tab's mute flag. Otherwise the newly introduced tab mute could keep an
 explicitly unmuted video silent. It retains the existing permissive frame message
 behavior; the stricter confirmed API applies only to the new audio control.
 
+Firefox's default audible-autoplay block can pause a muted stream when remote
+audio controls unmute it; a remote Play request cannot override that permission.
+For the regular Firefox browser, open the Streamed page's Page Info → Permissions,
+clear **Use Default** for **Autoplay**, and select **Allow Audio and Video**.
+Keep the global default and popup blocking unchanged. For managed installation,
+merge `Permissions.Autoplay.Allow: ["https://streamed.pk"]` into the existing
+Firefox `policies` object (preserving extension installation settings); the policy
+takes effect on Firefox restart. It applies only to that exact origin. Check
+`about:policies` and test actual video progress through a mute/unmute cycle.
+No new signed companion is required for this permission fix. Other source origins
+need their own explicit allowance if they exhibit the same restriction.
+
 ### Recover a live display without changing the draft
 
 Authenticated `POST /restore-layout` with `{ "display": "tv" }` (or a configured monitor name) reapplies only that active session's current placements and tab fill. It never opens/closes games, applies a draft, or changes sources. Gwaihir exposes this on each monitor header.
