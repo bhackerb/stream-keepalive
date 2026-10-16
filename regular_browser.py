@@ -6,6 +6,9 @@ ownership-lost streams never enter session recovery. Explicit resume and a singl
 unmute-pause repair use only play, bounded by fresh primary-video progress.
 The session reconciler opens only new match IDs, and only retires explicitly ended
 media with decoded-frame evidence. Catalog disappearance alone never ends a game.
+New-tab layout readiness retries only saved title/marker operations for up to 40
+seconds after open, audited against its exact tab/window/token receipt. A pending
+layout never authorizes another open, reload, adoption, or an ownership bypass.
 """
 import asyncio
 import json
@@ -27,6 +30,9 @@ log=logging.getLogger('stream-keeper.regular')
 ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top')
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
+PLACEMENT_READY_TIMEOUT=40
+PLACEMENT_RETRY_INTERVAL=1
+PLACEMENT_COMMAND_TIMEOUT=3
 PLAYBACK_POLL_INTERVAL=.1
 def validate_url(url):
     try:u=urlparse(url)
@@ -56,14 +62,20 @@ def recovery_record(value):
     record.setdefault('created_at',time.time())
     return record
 
+class PlacementPending(ValueError):
+    """An exact newly opened owned tab has not installed its receiver yet."""
+    def __init__(self,sid):
+        self.stream_id=sid
+        super().__init__('Waiting for the newly opened owned stream tab to finish loading')
+
 class CompanionPage:
     """Only exact layout title operations; no transport of arbitrary JavaScript."""
     def __init__(self,keeper,sid):self.keeper,self.sid=keeper,sid
-    async def title(self):return await self.keeper.command_for(self.sid,'title')
+    async def title(self):return await self.keeper._layout_command(self.sid,'title')
     async def evaluate(self,source,value):
         if source not in ('marker => document.title = marker','title => document.title = title'):
             raise ValueError('Unsupported companion page operation')
-        return await self.keeper.command_for(self.sid,'marker',value=value)
+        return await self.keeper._layout_command(self.sid,'marker',value=value)
 
 class RegularBrowserKeeper:
     def __init__(self,config):
@@ -74,6 +86,7 @@ class RegularBrowserKeeper:
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={}
+        self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self._load()
     @property
     def is_watching(self):return bool(self.active_streams)
@@ -95,6 +108,7 @@ class RegularBrowserKeeper:
                     except ValueError:self.manual_layout=None;self.session=None;self.errors=['Saved display layout no longer matches configuration; streams preserved. Reapply a new layout.']
             except (ValueError,TypeError,KeyError):log.warning('Invalid regular browser state; ignoring')
     def _save(self):
+        self._placement_startup={sid:r for sid,r in self._placement_startup.items()if self.active_streams.get(sid)is r[0]}
         self._recovery={sid:r for sid,r in self._recovery.items()if sid in self.active_streams or time.time()-r.get('last_action',r.get('created_at',time.time()))<86400}
         for sid,stream in self.active_streams.items():stream.health_monitor.stats['recovery_count']=self._recovery.get(sid,{}).get('attempts',0)
         value={'recovery':self._recovery,'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
@@ -112,6 +126,7 @@ class RegularBrowserKeeper:
         self._client=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
         self._task=asyncio.create_task(self._loop())
     async def shutdown(self):
+        if self._placement_retry_task:self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
         if self._task:self._task.cancel();await asyncio.gather(self._task,return_exceptions=True)
         self._save()
         for ws in list(self.connections.values()):await ws.close()
@@ -223,8 +238,10 @@ class RegularBrowserKeeper:
     async def _open(self,sid,url,label,browser,session_id=None,allow_replacement=False):
         if sid in self.active_streams:return
         validate_url(url)
-        await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement)
+        record=await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement)
         self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id));self._save()
+        if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
+            self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
     async def watch_url(self,url,label=None):
         try:
             if len(self.active_streams)>=self.max_streams:raise ValueError('Stream capacity reached')
@@ -484,7 +501,84 @@ class RegularBrowserKeeper:
             return await self._place(placements)
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
+    async def _layout_command(self,sid,op,**args):
+        """Retry only title/marker readiness, retaining the companion's ownership fence.
+
+        Inventory can retain a just-created about:blank tab while mutation proof
+        still refuses it. Compare the exact open receipt before treating that
+        refusal (or a missing content receiver) as temporary. Never reopen it.
+        """
+        startup=self._placement_startup.get(sid)
+        remaining=startup[2]-asyncio.get_running_loop().time()if startup else 0
+        if startup and remaining<=0:
+            self._placement_startup.pop(sid,None)
+            raise ValueError('New owned stream tab did not become ready for placement within 40 seconds')
+        try:
+            if remaining>0:
+                return await asyncio.wait_for(self.command_for(sid,op,**args),min(PLACEMENT_COMMAND_TIMEOUT,remaining))
+            return await self.command_for(sid,op,**args)
+        except (ValueError,TimeoutError)as exc:
+            transient=isinstance(exc,TimeoutError)or str(exc)in (
+                'Owned stream is unavailable','Owned stream is still loading',
+                'Could not establish connection. Receiving end does not exist.',
+                'The message port closed before a response was received.')
+            if not transient or not startup or remaining<=0:raise
+            stream,receipt,deadline=startup
+            if self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing:raise
+            remaining=deadline-asyncio.get_running_loop().time()
+            if remaining<=0:raise
+            try:audit=await asyncio.wait_for(self.command(stream.browser,'inventory'),min(PLACEMENT_COMMAND_TIMEOUT,remaining))
+            except TimeoutError as audit_error:raise ValueError('Placement readiness audit timed out; ownership was not confirmed')from audit_error
+            current=audit.get(sid)if isinstance(audit,dict)else None
+            if self._inventory_errors.get(stream.browser)or not isinstance(current,dict)or any(current.get(k)!=receipt[k]for k in ('tabId','windowId','token')):
+                raise ValueError('Placement ownership audit failed; exact opened tab is unavailable')from exc
+            if self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing:raise
+            raise PlacementPending(sid)from exc
+
     async def _place(self,placements):
+        self._placement_generation+=1;generation=self._placement_generation
+        if self._placement_retry_task:
+            self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
+            self._placement_retry_task=None
+        result=await self._place_once(placements)
+        if result.get('pending'):
+            self._placement_retry_task=asyncio.create_task(self._retry_placement(placements,generation,self.session,self.manual_layout))
+        return result
+
+    async def _retry_placement(self,placements,generation,session,manual):
+        targets={p['stream_id']:self.active_streams.get(p['stream_id'])for p in placements}
+        while True:
+            await asyncio.sleep(PLACEMENT_RETRY_INTERVAL)
+            async with self._lock:
+                if generation!=self._placement_generation:return
+                if self.session is not session or self.manual_layout is not manual or any(self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing for sid,stream in targets.items()):
+                    self.layout_status={'success':False,'pending':False,'message':'Placement canceled because session or stream ownership changed'};return
+                try:
+                    # Revalidate the original open receipt even when the next
+                    # marker command succeeds; a restored/replaced tab is not
+                    # the tab accepted for this bounded retry.
+                    for sid in targets:
+                        startup=self._placement_startup.get(sid)
+                        if not startup:continue
+                        remaining=startup[2]-asyncio.get_running_loop().time()
+                        if remaining<=0:raise ValueError('New owned stream tab did not become ready for placement within 40 seconds')
+                        audit=await asyncio.wait_for(self.command(startup[0].browser,'inventory'),min(PLACEMENT_COMMAND_TIMEOUT,remaining))
+                        current=audit.get(sid)if isinstance(audit,dict)else None
+                        if self._inventory_errors.get(startup[0].browser)or not isinstance(current,dict)or any(current.get(k)!=startup[1][k]for k in ('tabId','windowId','token')):
+                            raise ValueError('Placement ownership audit failed; exact opened tab is unavailable')
+                    if any(self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing for sid,stream in targets.items()):raise ValueError('Placement ownership changed')
+                    result=await self._place_once(placements)
+                except Exception as exc:
+                    log.exception('New owned tab placement retry failed')
+                    result=self.layout_status={'success':False,'message':'Placement retry failed: '+(str(exc)or type(exc).__name__)}
+                if result.get('pending'):continue
+                if result['success']:
+                    if manual is not None:self._manual_signature=tuple((p['stream_id'],p['x'],p['y'],p['width'],p['height'])for p in placements)
+                    elif session is not None:self._layout_ids=tuple(p['stream_id']for p in placements)
+                elif not result.get('pending'):self.errors.append(result['message'])
+                self._save();return
+
+    async def _place_once(self,placements):
         try:
             borderless=self.config.get('layout',{}).get('borderless',True) is not False
             if any(p['stream_id'] not in self.active_streams for p in placements):raise ValueError('Unknown stream')
@@ -503,7 +597,13 @@ class RegularBrowserKeeper:
                     await asyncio.to_thread(move_window,wid,p,fullscreen=focus,borderless=borderless)
                     if focus and not await asyncio.to_thread(wait_window_matches,wid,p,fullscreen=True):raise ValueError('TV focus geometry not confirmed')
                 result={'success':True,'message':'X11 placement requested; full-TV focus geometry confirmed when applicable'}
+            if result['success']:
+                for p in placements:self._placement_startup.pop(p['stream_id'],None)
             self.layout_status={**result,'placements':placements};return self.layout_status
+        except PlacementPending as e:
+            confirmed=self.layout_status.get('placements',[])if self.layout_status.get('success')else self.layout_status.get('confirmed_placements',[])
+            pending=[p['stream_id']for p in placements if p['stream_id']in self._placement_startup]
+            self.layout_status={'success':False,'pending':True,'pending_stream_ids':pending or [e.stream_id],'confirmed_placements':confirmed,'message':str(e),'placements':placements};return self.layout_status
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
@@ -641,7 +741,7 @@ class RegularBrowserKeeper:
         if desired and tuple(desired)!=self._layout_ids:
             result=await self.arrange_streams(display,'grid',desired)
             if result['success']:self._layout_ids=tuple(desired)
-            else:self.errors.append(result['message'])
+            elif not result.get('pending'):self.errors.append(result['message'])
         self._save()
     async def set_session_layout(self,body):
         if not isinstance(body,dict)or body.get('mode')not in('manual','auto'):raise ValueError('mode must be manual or auto')
@@ -699,7 +799,7 @@ class RegularBrowserKeeper:
             except Exception as e:
                 log.exception('Manual layout partially applied; desired layout retained for retry')
                 self.errors.append('Layout partially applied; retained for next poll retry: '+type(e).__name__)
-            return {'success':True,'message':'Manual layout scheduled; future games keep their assigned slots','plan':plan,'errors':self.errors,'layout':layout}
+            return {'success':True,'message':'Manual layout scheduled; future games keep their assigned slots','plan':plan,'errors':self.errors,'placement_pending':bool(self.layout_status.get('pending')),'layout':layout}
 
     async def _reconcile_manual(self,plan,allow_replacements=False,replacement_ids=None):
         self.errors=[];await self._retire_ended(plan);assignments=self.manual_layout['assignments'];wanted={a['game_id']for a in assignments}
@@ -727,7 +827,7 @@ class RegularBrowserKeeper:
         if placements and signature!=self._manual_signature:
             result=await self._place(placements)
             if result['success']:self._manual_signature=signature
-            else:self.errors.append(result['message'])
+            elif not result.get('pending'):self.errors.append(result['message'])
         for row in plan['pending']:row['scheduled_in_session']=row['id']in wanted
         plan.update(mode='manual',selected=[r for r in plan['live']if r['id']in wanted],overflow=[r for r in plan['live']if r['id']not in wanted],placements=placements)
         self._visible_ids=tuple(p['stream_id']for p in placements);self._save()

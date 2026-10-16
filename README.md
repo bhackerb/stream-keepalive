@@ -340,3 +340,17 @@ suppression, even when that controller is not their destination. Inventory must
 succeed first. `recover_ids` separately allows ownership recovery only for exact
 assigned game IDs. Ordinary ticks never clear closed-game suppression. TV layouts
 support one focused stream; legacy configured limits are clamped to one.
+
+New regular-browser tabs may briefly lack their permitted content-script receiver.
+The native controller reports `layout.pending: true` and
+`placement_pending: true` in the accepted session-layout response during that
+startup window. It retries the saved placement every second for up to 40 seconds,
+only while authenticated inventory retains the exact tab, window and ownership
+token returned by open. It never opens a duplicate, reloads the page, restarts
+the browser, or relaxes companion ownership checks. Placement success is reported
+only after the existing native placement checks complete. Missing or changed
+ownership and expired readiness remain errors. Session changes and user closes
+cancel the retry. This uses the existing signed companion without an XPI update.
+
+Validation: `python3 -m unittest test_placement_readiness test_regular_browser
+test_manual_layout test_borderless_grid`.
