@@ -255,7 +255,12 @@ starts the replacement muted. This uses the existing signed companion unchanged.
 Authenticated `POST /audio` accepts exactly one owned `stream_id`, a boolean
 `muted`, and optional finite `volume` from 0 to 1. For example:
 `{"stream_id":"game-id","muted":false,"volume":0.5}`. Success requires
-confirmation from each permitted player frame and the browser's tab mute state.
+confirmation from each permitted player frame and the browser's tab mute state
+for mute-only commands. Volume commands target only the largest decoded video in
+the exact fresh primary-video frame; unrelated unsupported embeds are ignored.
+A missing, stale, unsupported, or video-less primary frame fails before mutation.
+The primary frame must still be on the companion allowlist and the tab must retain
+its ownership proof. Volume changes also confirm that exact frame and tab mute.
 Failed or partial confirmations return `success: false`; some frames or tab audio
 may already have changed. Changes are not atomic, and rollback after ownership
 loss would risk touching an unowned tab. Refresh health before retrying. Success
@@ -280,7 +285,10 @@ returns `playback_confirmed: false` and an actionable `playback_warning`.
 The existing signed companion needs no update for resume or unmute protection.
 
 `GET /status` exposes `audio_capabilities` per browser. Mute and volume require
-companion 0.2.0 advertising `audio-v1`; the signed 0.1.0 add-on continues its
+companion 0.2.0 advertising `audio-v1` for mute/unmute. Volume additionally requires
+0.2.1 advertising `primary-volume-v1`; older signed add-ons retain mute/unmute
+while volume is disabled with an upgrade explanation (`volume_reason`). The
+signed 0.1.0 add-on continues its
 existing Unmute command and receives no unsupported audio commands. Build the
 updated package with `python3 build_companion.py`. Firefox requires Mozilla
 unlisted signing of `build/streamkeeper-firefox.zip` before permanent installation.

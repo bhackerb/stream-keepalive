@@ -11,6 +11,8 @@ import test_audio_control as fixtures
 class ResumeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await fixtures.AudioTests.asyncSetUp(self)
+        self.k._frames.clear()
+        self.k._companion_info['firefox']={'version':'0.2.0','capabilities':['audio-v1']}
         self.patches=[patch('regular_browser.PLAYBACK_CONFIRM_TIMEOUT',.08),patch('regular_browser.UNMUTE_OBSERVE_TIMEOUT',.06),patch('regular_browser.PLAYBACK_POLL_INTERVAL',.005)]
         for item in self.patches:item.start()
         self.tasks=[]
@@ -110,7 +112,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
     async def test_unmute_new_pause_repairs_once_and_confirms_actual_progress(self):
         await self.health('PLAYING')
         self.audio_commands()
-        result=await self.k.set_audio('game',False,.3)
+        result=await self.k.set_audio('game',False)
         self.assertTrue(result['confirmed']);self.assertTrue(result['playback_confirmed'])
         self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['audio','play'])
 
@@ -124,14 +126,14 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             self.later(lambda:self.health('PLAYING',12,120))
             return True
         self.k.command.side_effect=command
-        result=await self.k.set_audio('game',False,.3)
+        result=await self.k.set_audio('game',False)
         self.assertTrue(result['playback_confirmed'])
         self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['audio','play'])
 
     async def test_unmute_blocked_play_keeps_audio_confirmation_and_truthful_warning(self):
         await self.health('PLAYING')
         self.audio_commands(recover=False)
-        result=await self.k.set_audio('game',False,.3)
+        result=await self.k.set_audio('game',False)
         self.assertTrue(result['success']);self.assertTrue(result['confirmed']);self.assertFalse(result['playback_confirmed'])
         self.assertIn('click Play',result['playback_warning']);self.assertIn(result['playback_warning'],result['message'])
         self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['audio','play'])
@@ -142,14 +144,14 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             if stale:
                 timestamp,health=self.k._frames[('game',1)];self.k._frames[('game',1)]=(timestamp-20,health)
             self.k.command.reset_mock();self.k.command.return_value={'confirmed':True,'muted':muted,'volume':.3,'media_count':1,'video_count':1}
-            result=await self.k.set_audio('game',muted,.3)
+            result=await self.k.set_audio('game',muted)
             self.assertTrue(result['confirmed']);self.assertNotIn('playback_warning',result)
-            self.k.command.assert_awaited_once_with('firefox','audio',stream_id='game',muted=muted,volume=.3)
+            self.k.command.assert_awaited_once_with('firefox','audio',stream_id='game',muted=muted)
 
     async def test_unmute_missing_fresh_sample_warns_without_guessing_or_retry(self):
         await self.health('PLAYING')
         self.k.command.return_value={'confirmed':True,'muted':False,'volume':.3,'media_count':1,'video_count':1}
-        result=await self.k.set_audio('game',False,.3)
+        result=await self.k.set_audio('game',False)
         self.assertTrue(result['confirmed']);self.assertFalse(result['playback_confirmed']);self.assertIn('fresh playback',result['playback_warning'])
         self.k.command.assert_awaited_once()
 

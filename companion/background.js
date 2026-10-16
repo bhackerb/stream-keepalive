@@ -60,11 +60,12 @@ async function audioCommand(r,c) {
   if(!frames?.length || frames.length>50)throw Error('Player frames unavailable');
   // Address each exact permitted frame. A broadcast can return only one arbitrary
   // frame response and cannot prove that the player accepted the settings.
-  const targets=frames.filter(f=>allowed(f.url));
-  if(!targets.length)throw Error('No supported player frame');
-  if('volume'in c && frames.some(f=>!allowed(f.url) && f.url!=='about:blank'))throw Error('Volume unavailable for unsupported embedded frames');
+  const volume='volume'in c;
+  if(volume && (!Number.isInteger(c.primary_frame_id)||c.primary_frame_id<0))throw Error('Primary video frame required; update the StreamKeeper controller for volume control');
+  const targets=volume?frames.filter(f=>f.frameId===c.primary_frame_id&&allowed(f.url)):frames.filter(f=>allowed(f.url));
+  if(!targets.length)throw Error(volume?'Primary video frame unavailable or unsupported; refresh player status':'No supported player frame');
   if(!await provesTab(await api.tabs.get(r.tabId),r))throw Error('Stream ownership changed before audio update');
-  const replies=await Promise.all(targets.map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'audio',muted:c.muted,...('volume'in c?{volume:c.volume}:{})},{frameId:f.frameId})));
+  const replies=await Promise.all(targets.map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'audio',muted:c.muted,...(volume?{volume:c.volume,primary_only:true}:{})},{frameId:f.frameId})));
   let count=0,videos=0;
   for(const result of replies){
     if(!result || result.confirmed!==true || !Number.isInteger(result.media_count) || result.media_count<0 || result.muted!==c.muted || ('volume'in c && result.volume!==c.volume))throw Error('Player audio confirmation unavailable');
@@ -78,7 +79,7 @@ async function audioCommand(r,c) {
   await api.tabs.update(r.tabId,{muted:c.muted});
   const verified=await api.tabs.get(r.tabId);
   if(!await provesTab(verified,r) || verified.mutedInfo?.muted!==c.muted)throw Error('Tab audio confirmation unavailable');
-  return {confirmed:true,muted:c.muted,...('volume'in c?{volume:c.volume}:{}),media_count:count,video_count:videos};
+  return {confirmed:true,muted:c.muted,...(volume?{volume:c.volume,primary_frame_id:c.primary_frame_id}:{}),media_count:count,video_count:videos};
 }
 async function command(c) {
   const all = await owned(); const r=all[c.stream_id];
@@ -129,7 +130,7 @@ function connect() {
       queue=queue.catch(()=>{}).then(async()=>{try {await send({id:c.id,result:await command(c)});} catch(e){await send({id:c.id,error:String(e.message||e)});}});
     });
     port.onDisconnect.addListener(()=>{console.warn('StreamKeeper native bridge:',api.runtime.lastError?.message || 'disconnected');port=null;connecting=false;setTimeout(connect,5000);});
-    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1']});
+    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1']});
     void scheduleInventory();
   } catch { port=null;setTimeout(connect,5000); }
   connecting=false;

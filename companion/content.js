@@ -17,11 +17,15 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
   if(!m?.sk)return false;
   if(m.op==='audio'){
     if(!skOwned || typeof m.muted!=='boolean' || ('volume'in m && (typeof m.volume!=='number' || !Number.isFinite(m.volume) || m.volume<0 || m.volume>1))){respond({confirmed:false});return false;}
-    const media=[...document.querySelectorAll('video,audio')];
+    // Volume targets only the fresh primary frame selected by the controller.
+    // Validate a decoded video before changing even mute state.
+    const primary=m.primary_only===true ? [...document.querySelectorAll('video')].filter(v=>v.videoWidth>0&&v.videoHeight>0).sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0] : null;
+    if(m.primary_only===true&&!primary){respond({confirmed:false});return false;}
+    const media=m.primary_only===true?[primary]:[...document.querySelectorAll('video,audio')];
     try{
       for(const v of media){v.muted=m.muted;if('volume'in m)v.volume=m.volume;}
       const confirmed=media.every(v=>v.muted===m.muted && (!('volume'in m)||v.volume===m.volume));
-      respond({confirmed,muted:m.muted,...('volume'in m?{volume:m.volume}:{}),media_count:media.length,video_count:document.querySelectorAll('video').length});
+      respond({confirmed,muted:m.muted,...('volume'in m?{volume:m.volume}:{}),media_count:media.length,video_count:m.primary_only===true?1:document.querySelectorAll('video').length});
     }catch{respond({confirmed:false});}
     return false;
   }

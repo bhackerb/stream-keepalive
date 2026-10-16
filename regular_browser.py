@@ -196,7 +196,13 @@ class RegularBrowserKeeper:
             self._frames[key]=(now,h)
             rows=[v for (i,_),v in self._frames.items() if i==sid and now-v[0]<12]
             best=max(rows,key=lambda v:(v[1].get('state')=='PLAYING',v[1].get('width',0)*v[1].get('height',0)))[1]
-            s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),muted=bool(best.get('muted',True)),volume=best.get('volume',0),stall_duration=str(round(best.get('stall_seconds',0),1)))
+            s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),stall_duration=str(round(best.get('stall_seconds',0),1)))
+            # Playback aggregation can favor a small PLAYING ad. Audio controls
+            # must describe the same fresh primary video that volume targets.
+            primary=self._primary_video(sid)
+            if primary:
+                audio=primary[1][1]
+                s.health_monitor.stats.update(muted=bool(audio.get('muted',True)),volume=audio.get('volume',0))
     async def command(self,browser,op,**args):
         ws=self.connections.get(browser)
         if not ws or ws.closed or not self._browser_ready.get(browser):raise ValueError(f'Install/connect the StreamKeeper companion in regular {browser} first')
@@ -254,7 +260,8 @@ class RegularBrowserKeeper:
         for browser in ('firefox','chromium'):
             info=self._companion_info.get(browser,{})
             available=bool(browser in self.connections and self._browser_ready.get(browser)and 'audio-v1'in info.get('capabilities',[]))
-            result[browser]={'available':available,'muted':available,'volume':available,'version':info.get('version'),'reason':None if available else 'Install/connect signed companion 0.2.0 or later for mute and volume control'}
+            volume=available and 'primary-volume-v1'in info.get('capabilities',[])
+            result[browser]={'available':available,'muted':available,'volume':volume,'version':info.get('version'),'reason':None if available else 'Install/connect signed companion 0.2.0 or later for mute control','volume_reason':None if volume else 'Install/connect signed companion 0.2.1 or later for primary-video volume control'}
         return result
 
     def _playback_target(self,sid,expected=None):
@@ -348,13 +355,22 @@ class RegularBrowserKeeper:
             protect=not muted and primary and primary[1][1].get('state')=='PLAYING' and primary[1][1].get('paused')is not True and not primary[1][1].get('ended')
             audio_started=time.time()
             args={'muted':muted}
-            if volume is not None:args['volume']=volume
+            if volume is not None:
+                if not self.audio_capabilities()[stream.browser]['volume']:raise NotImplementedError('Install/connect signed companion 0.2.1 or later for primary-video volume control; mute/unmute remains available')
+                if not primary or type(primary[0][1])is not int or primary[0][1]<0:raise ValueError('Fresh primary video unavailable; wait for the player and refresh status before changing volume')
+                args.update(volume=volume,primary_frame_id=primary[0][1])
             try:result=await self.command_for(sid,'audio',**args)
             except (ValueError,TimeoutError)as exc:raise ValueError(str(exc)+'; some audio settings may have changed. Refresh status before retrying')from exc
-            if not isinstance(result,dict)or result.get('confirmed')is not True or result.get('muted')is not muted or type(result.get('media_count'))is not int or result['media_count']<1 or type(result.get('video_count'))is not int or not 1<=result['video_count']<=result['media_count'] or (volume is not None and (type(result.get('volume'))not in(int,float)or result.get('volume')!=volume)):
+            if not isinstance(result,dict)or result.get('confirmed')is not True or result.get('muted')is not muted or type(result.get('media_count'))is not int or result['media_count']<1 or type(result.get('video_count'))is not int or not 1<=result['video_count']<=result['media_count'] or (volume is not None and (type(result.get('volume'))not in(int,float)or result.get('volume')!=volume or type(result.get('primary_frame_id'))is not int or result['primary_frame_id']!=args['primary_frame_id'])):
                 raise ValueError('Browser did not confirm all audio settings; some may have changed. Refresh status before retrying')
             stream.health_monitor.stats['muted']=muted
-            if volume is not None:stream.health_monitor.stats['volume']=volume
+            if volume is not None:
+                stream.health_monitor.stats['volume']=volume
+                # Retain confirmed audio until the primary's next heartbeat.
+                # Do not extend video freshness or alter progress evidence.
+                cached=self._frames.get(primary[0])
+                if cached:
+                    self._frames[primary[0]]=(cached[0],{**cached[1],'muted':muted,'volume':volume})
             playback=await self._protect_unmute_locked(sid,stream,audio_started,time.time(),primary)if protect else {}
             message='Browser confirmed audio settings'
             if playback.get('playback_warning'):message+='; '+playback['playback_warning']

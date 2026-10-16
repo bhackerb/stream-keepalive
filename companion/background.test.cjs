@@ -88,7 +88,7 @@ test('audio confirms every exact player frame and tab mute, never personal tabs'
  const calls=[];h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:2,url:'https://embed.st/embed/game'}]};
  h.api.tabs.sendMessage=async(id,m,options)=>{calls.push({id,m,options});return {confirmed:true,media_count:options.frameId===2?1:0,video_count:options.frameId===2?1:0,muted:m.muted,volume:m.volume};};
  h.api.tabs.update=async(id,value)=>{h.tabs.get(id).mutedInfo={muted:value.muted};};
- const r=await h.command('audio',{stream_id:'game',muted:false,volume:.3});assert.equal(r.result.confirmed,true);assert.equal(r.result.media_count,1);
+ const r=await h.command('audio',{stream_id:'game',muted:false});assert.equal(r.result.confirmed,true);assert.equal(r.result.media_count,1);
  assert.deepEqual(calls.map(c=>[c.id,c.options.frameId]),[[10,0],[10,2]]);assert.equal(h.tabs.get(1).mutedInfo,undefined);
 });
 test('audio rejects legacy arbitrary replies, invalid inputs, no media and lost ownership',async()=>{
@@ -105,11 +105,11 @@ test('health from an allowlisted child of a navigated unowned tab is refused',as
  assert.equal(reply.owned,false);assert.equal(h.sent.filter(m=>m.event==='health').length,0);
 });
 
-test('volume fails closed for unsupported nested frames without mutating media',async()=>{
+test('legacy volume payload without primary target fails before mutating media',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
  h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:2,url:'https://unsupported.example/video'}]};
  let messages=0;h.api.tabs.sendMessage=async()=>{messages++;return true;};
- assert.match((await h.command('audio',{stream_id:'game',muted:false,volume:.5})).error,/unsupported embedded/);assert.equal(messages,0);
+ assert.match((await h.command('audio',{stream_id:'game',muted:false,volume:.5})).error,/Primary video frame required/);assert.equal(messages,0);
 });
 test('legacy unmute keeps permissive frame behavior and clears owned tab mute',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
@@ -130,4 +130,29 @@ test('audio-only frames never satisfy video confirmation and failed tab verifica
  const response=await h.command('audio',{stream_id:'game',muted:false});assert.ok(response.error);assert.equal(response.result,undefined);
  // Explicit audio settings do not alter the existing startup mute policy.
  assert.equal(h.local.owned.game.startMuted,true);
+});
+
+test('primary volume ignores unrelated unsupported embeds but targets only supported exact frame',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:2,url:'https://embed.st/embed/game'},{frameId:3,url:'https://unsupported.example/ad'}]};
+ const calls=[];h.api.tabs.sendMessage=async(id,m,options)=>{calls.push({id,m,options});return {confirmed:true,muted:m.muted,volume:m.volume,media_count:1,video_count:1};};
+ h.api.tabs.update=async(id,value)=>{h.tabs.get(id).mutedInfo={muted:value.muted};};
+ const r=await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:2});
+ assert.equal(r.result.confirmed,true);assert.equal(r.result.primary_frame_id,2);assert.equal(calls.length,1);
+ assert.equal(calls[0].id,10);assert.equal(calls[0].options.frameId,2);assert.equal(calls[0].m.primary_only,true);assert.equal(h.tabs.get(1).mutedInfo,undefined);
+ assert.ok(h.sent[0].capabilities.includes('primary-volume-v1'));
+});
+test('missing unsupported invalid primary frame and ownership loss fail before audio mutation',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:3,url:'https://unsupported.example/video'}]};
+ let mutations=0;h.api.tabs.sendMessage=async()=>{mutations++;return true;};h.api.tabs.update=async()=>{mutations++;};
+ for(const frame of [undefined,-1,true,99,3])assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:frame})).error);
+ h.tabs.get(10).url='https://personal.example/';assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:0})).error);
+ assert.equal(mutations,0);
+});
+test('primary frame without video never changes tab audio or confirms success',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:2,url:'https://embed.st/embed/game'}]};
+ h.api.tabs.sendMessage=async()=>({confirmed:false});let tabsChanged=0;h.api.tabs.update=async()=>{tabsChanged++;};
+ assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:2})).error);assert.equal(tabsChanged,0);
 });
