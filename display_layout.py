@@ -6,7 +6,7 @@ CAPACITIES = {"tv": 1, "widescreen": 6, "vertical": 4, "laptop": 4}
 def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) -> list[dict]:
     if mode not in ("grid", "side-by-side", "focus"):
         raise ValueError("mode must be grid, side-by-side, or focus")
-    names = [n for n in ("widescreen", "laptop", "vertical") if n != "laptop" or n in displays] if display == "dock" else [display]
+    names = [n for n in ("widescreen", "laptop", "vertical") if n in displays] if display == "dock" else [display]
     if len(set(stream_ids)) != len(stream_ids):
         raise ValueError("stream_ids must be unique")
     regions = []
@@ -25,6 +25,7 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
         if name == "vertical" and mode == "side-by-side":
             raise ValueError("Side-by-side is supported on TV and widescreen")
         regions.append((name, region, capacity))
+    if not regions:raise ValueError("No connected displays available for this layout")
     if len(stream_ids) > sum(r[2] for r in regions):
         raise ValueError("Too many selected streams for this layout")
     result = []

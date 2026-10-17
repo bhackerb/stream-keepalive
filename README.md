@@ -354,3 +354,51 @@ cancel the retry. This uses the existing signed companion without an XPI update.
 
 Validation: `python3 -m unittest test_placement_readiness test_regular_browser
 test_manual_layout test_borderless_grid`.
+
+Connected displays and travel keepalive
+--------------------------------------
+
+Regular mode reads the active desktop before planning or placing windows: KDE
+Wayland uses `kscreen-doctor -j`, X11 uses `xrandr --query`. KDE's reported size
+and scale determine logical coordinates, including an undocked laptop at 0,0.
+A stale Wayland socket is replaced only when exactly one owned session socket is
+available. A failed probe pauses placement and preserves playing windows. Status
+separates `display_probe.state: unknown` from a verified disconnected output;
+`displays` and `connected_displays` contain verified connected outputs only.
+
+Bind configured logical displays with `layout.displays.<name>.output` (for example
+`eDP-1`); otherwise the internal panel is recognized by its connector, and other
+screens require an unambiguous match to their saved geometry. Static coordinates
+never establish connectivity. `POST /settings` accepts authenticated JSON:
+
+```json
+{"viewing_mode":"laptop-only","keepalive":{"enabled":true,"stream_id":"existing-game-id","profile":"travel"}}
+```
+
+Either top-level field may be supplied alone. `viewing_mode` is `all` or
+`laptop-only`; the latter restricts discovery and placement to the detected laptop
+panel. Settings persist in the regular session file. Saving settings does not
+move or close windows; apply the desired layout separately. Manual and shared
+layouts targeting excluded or disconnected displays are rejected.
+
+Local keepalive selects one existing visible owned stream. The laptop daemon and
+native companion communicate over loopback, so monitoring continues without
+bhbserv, Gwaihir, or a central catalog. Keep the local service and browser running.
+Travel observes sustained failure for two minutes, verifies the selected site's
+network availability and exact tab ownership, and refreshes only that same source.
+Network failures wait with exponential backoff up to fifteen minutes, without
+spending reload attempts. Refreshes wait ten, fifteen, then thirty minutes;
+subsequent failures remain at thirty minutes. Five continuous minutes of fresh,
+advancing primary playback reset the burst budget. There is no automatic source
+rotation, unmute, play of a paused video, replacement tab, or reopening after a
+user close or ownership loss. Initial loading and stale evidence do not trigger
+recovery. Status exposes `viewing.mode` and `keepalive` state, message, and retry time.
+
+While local keepalive is enabled, automatic local session ranking and layout changes
+are held. An explicit shared-session layout may move the protected game; an exact
+shared-session release disables its local care before closing it. Central automatic
+ranking must retain the selected game. Explicit Stop and browser closure remain authoritative. To disable care, send
+`{"keepalive":{"enabled":false}}`. Remote access to the full Gwaihir interface
+still requires a reachable server (for example through Tailscale); it is separate
+from local playback care. Validate without a desktop or network using
+`python3 -m unittest discover -q`.

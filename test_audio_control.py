@@ -5,13 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock,patch
 from aiohttp.test_utils import TestClient,TestServer
 from api_server import StreamKeeperAPI
 from regular_browser import RegularBrowserKeeper
 
 class AudioTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.display_patch=patch('regular_browser.probe_displays',AsyncMock(return_value={'state':'available','displays':{},'availability':{},'outputs':[]}))
+        self.display_patch.start();self.addCleanup(self.display_patch.stop)
         self.tmp=tempfile.TemporaryDirectory()
         self.config={'api':{'api_key':'test'},'session':{'state_file':str(Path(self.tmp.name)/'state.json')}}
         self.k=RegularBrowserKeeper(self.config)

@@ -42,7 +42,10 @@ layout:
   cdp_scale: 1  # Chromium window coordinates are DIPs: bhbserv's current browser scale is 2
   auto_arrange: false  # Enable after mapping physical displays
   default_display: "tv"
-  displays: {}  # Separate windows are created once displays are configured
+  displays: {}  # Logical names bind to live connected outputs; unknown probes block placement.
+  # Optional output connector makes mapping explicit, e.g.:
+  # laptop: {output: eDP-1, x: 0, y: 0, width: 1970, height: 1231}
+  # Actual connected geometry always replaces these saved coordinates.
   # bhbserv currently reports HDMI-0: 3840x2160 at 0,0.
   # displays:
   #   tv: {x: 0, y: 0, width: 3840, height: 2160}

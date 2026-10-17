@@ -46,6 +46,7 @@ class StreamKeeperAPI:
         self._start_time = time.time()
 
     def _setup_routes(self):
+        self.app.router.add_post("/settings", self.handle_settings)
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/browser/bridge", self.handle_bridge)
         self.app.router.add_post("/session", self.handle_session)
@@ -72,7 +73,7 @@ class StreamKeeperAPI:
             return await handler(request)
 
         # Companion control must fail closed, including legacy dev configuration.
-        if request.path in ("/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio", "/resume", "/restore-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+        if request.path in ("/settings", "/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio", "/resume", "/restore-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
             return web.json_response({"error": "API authentication required"}, status=503)
         if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
             return web.json_response({"error": "Native bridge is local only"}, status=403)
@@ -119,6 +120,11 @@ class StreamKeeperAPI:
             logger.exception("Manual layout failed")
             return web.json_response({"success":False,"message":"Manual layout failed; inspect current stream status"},status=502)
 
+    async def handle_settings(self,request):
+        if not hasattr(self.keeper,'settings_action'):return web.json_response({'success':False,'message':'Local settings require regular browser mode'},status=409)
+        try:return web.json_response(await self.keeper.settings_action(await request.json()))
+        except (ValueError,TypeError)as exc:return web.json_response({'success':False,'message':str(exc)},status=400)
+
     async def handle_health(self, _request: web.Request) -> web.Response:
         """Simple health check — is the service running?"""
         return web.json_response({
@@ -131,6 +137,7 @@ class StreamKeeperAPI:
 
     async def handle_status(self, request: web.Request) -> web.Response:
         """Current stream status as JSON. Optional ?stream_id= for specific stream."""
+        if hasattr(self.keeper,"refresh_displays"):await self.keeper.refresh_displays()
         stream_id = request.query.get("stream_id")
         capabilities = {
             "browser_engine": self.keeper.browser_engine,

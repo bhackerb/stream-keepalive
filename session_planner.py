@@ -17,7 +17,7 @@ def validate_spec(spec):
     if browser not in ('firefox', 'chromium'):
         raise ValueError('browser must be firefox or chromium')
     display = spec.get('display', 'dock')
-    if display not in ('dock', 'tv', 'widescreen', 'vertical'):
+    if display not in ('dock', 'tv', 'widescreen', 'vertical', 'laptop'):
         raise ValueError('Unknown display')
     hours = spec.get('hours', 12)
     if type(hours) is not int or not 1 <= hours <= 24:
@@ -59,7 +59,7 @@ def reserve_sports(selected, ranked, sports, capacity):
 def build_plan(matches, live_ids, viewers, spec, displays, now_ms, until_ms=None):
     spec = validate_spec(spec)
     end = until_ms if until_ms is not None else now_ms + spec['hours'] * 3600000
-    names = [n for n in ('widescreen', 'laptop', 'vertical') if n!='laptop' or n in displays] if spec['display'] == 'dock' else [spec['display']]
+    names = [n for n in ('widescreen', 'laptop', 'vertical') if n in displays] if spec['display'] == 'dock' else [spec['display']]
     capacity = sum(min(CAPACITIES[n],displays.get(n,{}).get("max_streams",CAPACITIES[n])) for n in names)
     window_start = end - spec['hours'] * 3600000 if until_ms is not None else now_ms
     rows = []

@@ -24,6 +24,8 @@ class NativeTests(unittest.TestCase):
             with self.assertRaises(ValueError):validate_url(url)
 class RegularTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.display_patch=patch('regular_browser.probe_displays',side_effect=lambda displays,*_: {'state':'available','displays':displays,'availability':{n:'connected'for n in displays},'outputs':[]})
+        self.display_patch.start();self.addCleanup(self.display_patch.stop)
         self.tmp=tempfile.TemporaryDirectory();self.config={'api':{'api_key':'test-key','enabled':True},'streams':{'max_streams':10},'layout':{'displays':D},'session':{'state_file':str(Path(self.tmp.name)/'state.json')}}
         self.k=RegularBrowserKeeper(self.config)
         self.k.command=AsyncMock(return_value=True)
@@ -156,7 +158,7 @@ class TVFocusPlacementTests(unittest.IsolatedAsyncioTestCase):
         import sys
         from unittest.mock import Mock
         tv=dict(x=0,y=0,width=3840,height=2160)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch('regular_browser.probe_displays',side_effect=lambda displays,*_: {'state':'available','displays':{**displays,'widescreen':tv},'outputs':[]}):
             k=RegularBrowserKeeper({'layout':{'displays':{'tv':tv}},'session':{'state_file':str(Path(tmp)/'state.json')}})
             k.active_streams={'a':SimpleNamespace(page='page-a'),'b':SimpleNamespace(page='page-b')}
             identify=AsyncMock(side_effect=[11,11,12,11,11,12])

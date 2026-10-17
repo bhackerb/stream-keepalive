@@ -11,6 +11,8 @@ import test_regular_browser as fixtures
 
 class PlacementReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.display_patch=patch('regular_browser.probe_displays',side_effect=lambda displays,*_: {'state':'available','displays':displays,'availability':{n:'connected'for n in displays},'outputs':[]})
+        self.display_patch.start();self.addCleanup(self.display_patch.stop)
         self.tmp=tempfile.TemporaryDirectory()
         self.k=RegularBrowserKeeper({'layout':{'backend':'kwin','displays':{
             'widescreen':dict(x=1152,y=383,width=3440,height=1440)}},

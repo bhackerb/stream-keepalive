@@ -1,7 +1,11 @@
 """Regular-browser control through an authenticated companion, without launching profiles.
 
 Only sustained, fresh NO_VIDEO or previously progressing BUFFERING evidence permits
-bounded session recovery. Playing, paused, initial loading, stale, closed and
+bounded session recovery. Explicit local keepalive protects one selected owned
+tab and needs no catalog or central-server connection; fresh playback, exact
+ownership, network checks, and bounded backoff guard same-source refreshes.
+Connected outputs supply all placement geometry; unavailable probes pause placement.
+Playing, paused, initial loading, stale, closed and
 ownership-lost streams never enter session recovery. Explicit resume and a single
 unmute-pause repair use only play, bounded by fresh primary-video progress.
 The session reconciler opens only new match IDs, and only retires explicitly ended
@@ -23,6 +27,7 @@ from urllib.parse import urlparse, quote
 import aiohttp
 from aiohttp import web
 from display_layout import plan_layout
+from display_probe import probe_displays
 from manual_layout import validate_manual_layout,manual_placements
 from session_planner import build_plan, validate_spec, reserve_sports
 
@@ -87,6 +92,9 @@ class RegularBrowserKeeper:
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={}
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
+        self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
+        self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
+        self._local_care={};self._display_checked=0
         self._load()
     @property
     def is_watching(self):return bool(self.active_streams)
@@ -94,6 +102,13 @@ class RegularBrowserKeeper:
         if self.state_path.exists():
             try:
                 state=json.loads(self.state_path.read_text());self._recovery={k:r for k,v in (state.get('recovery',{})if isinstance(state.get('recovery'),dict)else {}).items()if isinstance(k,str)and (r:=recovery_record(v))is not None};self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
+                if state.get('viewing_mode')in ('all','laptop-only'):self.viewing_mode=state['viewing_mode']
+                care=state.get('local_keepalive',{})
+                if isinstance(care,dict)and type(care.get('enabled'))is bool and care.get('profile')in ('standard','travel')and (not care['enabled']or isinstance(care.get('stream_id'),str)):
+                    self.local_keepalive={k:care[k]for k in ('enabled','profile','stream_id')if k in care}
+                saved_care=state.get('local_care',{})
+                if isinstance(saved_care,dict):
+                    self._local_care={k:v for k,v in saved_care.items()if k in ('attempts','last_action','next_retry')and type(v)in(int,float)and math.isfinite(v)and v>=0}
                 # Migrate legacy TV splits without discarding group ownership or windows.
                 for layout in (self.manual_layout,self.saved_layout):
                     if isinstance(layout,dict)and isinstance(layout.get('presets'),dict)and layout['presets'].get('tv',1)>1:
@@ -111,7 +126,7 @@ class RegularBrowserKeeper:
         self._placement_startup={sid:r for sid,r in self._placement_startup.items()if self.active_streams.get(sid)is r[0]}
         self._recovery={sid:r for sid,r in self._recovery.items()if sid in self.active_streams or time.time()-r.get('last_action',r.get('created_at',time.time()))<86400}
         for sid,stream in self.active_streams.items():stream.health_monitor.stats['recovery_count']=self._recovery.get(sid,{}).get('attempts',0)
-        value={'recovery':self._recovery,'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
+        value={'local_care':{k:v for k,v in self._local_care.items()if k in ('attempts','last_action','next_retry')},'viewing_mode':self.viewing_mode,'local_keepalive':self.local_keepalive,'recovery':self._recovery,'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
         self.state_path.parent.mkdir(parents=True,exist_ok=True);temp=self.state_path.with_suffix('.tmp')
         fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'w')as f:
@@ -122,8 +137,35 @@ class RegularBrowserKeeper:
             if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
         health={'state':'DISCONNECTED','resolution':'unknown','current_time':'0','buffered_to':'unknown','audio':'unknown','muted':True,'volume':0,'stall_duration':'0','recovery_count':0}
         self.active_streams[sid]=SimpleNamespace(id=sid,team=r.get('label',sid),site='streamed',url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
+    async def refresh_displays(self):
+        self.display_probe=await probe_displays(self.config.get('layout',{}).get('displays',{}),self.config.get('layout',{}).get('backend'))
+        self._display_checked=time.time()
+        return self.display_probe
+    def _displays(self):
+        if self.display_probe.get('state')!='available':raise ValueError('Connected display detection unavailable; existing windows preserved')
+        displays=self.display_probe.get('displays',{})
+        return {n:r for n,r in displays.items()if self.viewing_mode!='laptop-only'or n=='laptop'}
+    def _display_target(self,display):
+        return 'laptop'if self.viewing_mode=='laptop-only'else display
+    def _protected(self,sid):
+        return self.local_keepalive.get('enabled')and self.local_keepalive.get('stream_id')==sid
+    async def settings_action(self,body):
+        if not isinstance(body,dict)or set(body)-{'viewing_mode','keepalive'}:raise ValueError('Invalid local settings')
+        mode=body.get('viewing_mode',self.viewing_mode)
+        if mode not in ('all','laptop-only'):raise ValueError('viewing_mode must be all or laptop-only')
+        care=body.get('keepalive',self.local_keepalive)
+        if not isinstance(care,dict)or set(care)-{'enabled','stream_id','profile'}or type(care.get('enabled'))is not bool or care.get('profile','standard')not in ('standard','travel'):raise ValueError('Invalid keepalive settings')
+        async with self._lock:
+            if 'keepalive'in body and care['enabled']:
+                sid=care.get('stream_id');stream=self.active_streams.get(sid)if isinstance(sid,str)else None
+                if not stream or stream.parked or sid in self.suppressed|self._ownership_lost|self._releasing:raise ValueError('Select an existing visible owned stream for local keepalive')
+            self.viewing_mode=mode;self.local_keepalive={k:care[k]for k in ('enabled','stream_id','profile')if k in care};self.local_keepalive.setdefault('profile','standard')
+            self._local_care={};self._layout_ids=();self._manual_signature=();self._save()
+            await self.refresh_displays()
+            return {'success':True,'message':'Local viewing and keepalive settings saved',**self.extra_status()}
     async def start_browser(self):
         self._client=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+        await self.refresh_displays()
         self._task=asyncio.create_task(self._loop())
     async def shutdown(self):
         if self._placement_retry_task:self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
@@ -207,7 +249,7 @@ class RegularBrowserKeeper:
                     progress=self._progress[key]=now
             # 0.1.0 reports LOADING after a stall, but only after excluding pause.
             # Startup loading alone never proves that a stream was playing.
-            if h.get('state')=='LOADING' and progress is not None and 15<=now-progress<=300 and h.get('stall_seconds',0)>=15 and h.get('paused')is not True and not h.get('ended') and h.get('width',0)>0:
+            if h.get('state')=='LOADING' and progress is not None and 15<=now-progress and (now-progress<=300 or self._protected(sid)) and h.get('stall_seconds',0)>=15 and h.get('paused')is not True and not h.get('ended') and h.get('width',0)>0:
                 h['state']='BUFFERING'
             record=self._recovery.get(sid)
             if record:
@@ -463,7 +505,8 @@ class RegularBrowserKeeper:
     async def restore_live_layout(self,display):
         """Reapply current intent only: never open, close, transfer, or rank games."""
         async with self._lock:
-            if display not in self.config.get('layout',{}).get('displays',{}):raise ValueError('Unknown display')
+            await self.refresh_displays()
+            if display not in self._displays():raise ValueError('Display is disconnected, unverified, or excluded by viewing mode')
             if not self.session:raise ValueError('No active viewing session')
             placements=[p for p in (self.plan or {}).get('placements',[]) if p.get('display')==display]
             if not placements:raise ValueError('No live placement on this display')
@@ -483,7 +526,7 @@ class RegularBrowserKeeper:
         # in the companion; respect that explicit exit until Restore is clicked.
         if not self.session or self.config.get('layout',{}).get('backend')=='kwin':return
         placements=[p for p in (self.plan or {}).get('placements',[])if p.get('display')=='tv']
-        tv=self.config.get('layout',{}).get('displays',{}).get('tv',{})
+        tv=self._displays().get('tv',{})
         if len(placements)!=1:return
         p=placements[0];sid=p['stream_id'];s=self.active_streams.get(sid)
         if not all(p.get(k)==tv.get(k)for k in ('x','y','width','height')) or not s or s.session_id!=self.session['id'] or s.parked or sid in self._releasing or sid in self._ownership_lost or not self._browser_ready.get(s.browser):return
@@ -497,7 +540,8 @@ class RegularBrowserKeeper:
             if not await asyncio.to_thread(wait_window_matches,wid,p,fullscreen=True):raise ValueError('TV focus geometry not confirmed')
     async def arrange_streams(self,display,mode,ids=None):
         try:
-            placements=plan_layout(self.config.get('layout',{}).get('displays',{}),display,mode,ids or list(self.active_streams))
+            await self.refresh_displays()
+            placements=plan_layout(self._displays(),self._display_target(display),mode,ids or list(self.active_streams))
             return await self._place(placements)
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
@@ -580,6 +624,11 @@ class RegularBrowserKeeper:
 
     async def _place_once(self,placements):
         try:
+            await self.refresh_displays()
+            displays=self._displays()
+            for p in placements:
+                region=displays.get(p.get('display'))
+                if not region or p['x']<region['x']or p['y']<region['y']or p['x']+p['width']>region['x']+region['width']or p['y']+p['height']>region['y']+region['height']:raise ValueError('Placement targets an unavailable display or stale desktop geometry')
             borderless=self.config.get('layout',{}).get('borderless',True) is not False
             if any(p['stream_id'] not in self.active_streams for p in placements):raise ValueError('Unknown stream')
             if self.config.get('layout',{}).get('backend')=='kwin':
@@ -590,7 +639,7 @@ class RegularBrowserKeeper:
                 # Identify every window before moving any; never move a shared personal window.
                 windows=[await window_for_page(self.active_streams[p['stream_id']].page)for p in placements]
                 if len(set(windows))!=len(windows):raise ValueError('Streams must occupy separate windows')
-                tv=self.config.get('layout',{}).get('displays',{}).get('tv',{})
+                tv=displays.get('tv',{})
                 for wid,p in zip(windows,placements):
                     # A reserved half-slot stays tiled even if its other game is pending.
                     focus=sum(q.get('display')=='tv'for q in placements)==1 and p.get('display')=='tv' and all(p.get(k)==tv.get(k)for k in ('x','y','width','height'))
@@ -607,13 +656,15 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
+        return {'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
     async def _json(self,path):
         async with self._client.get('https://streamed.pk/api/'+path) as res:
             res.raise_for_status();value=await res.json()
             if not isinstance(value,list):raise ValueError('Invalid Streamed catalog response')
             return value
     async def discover(self,spec,until_ms=None):
+        await self.refresh_displays()
+        displays=self._displays();spec={**spec,'display':self._display_target(spec.get('display','dock'))}
         all_matches,live=await asyncio.gather(self._json('matches/all'),self._json('matches/live'))
         merged={m['id']:m for m in all_matches+live if isinstance(m,dict) and isinstance(m.get('id'),str)}
         selected=[m for m in merged.values()if m.get('category') in spec['sports'] and type(m.get('date'))in(int,float)and m['date']>0]
@@ -636,7 +687,7 @@ class RegularBrowserKeeper:
         try:await asyncio.wait_for(asyncio.gather(*(measure(m)for m in selected if m['id'] in live_ids or now_ms-1800000<=m['date']<=now_ms+lead)),20)
         except asyncio.TimeoutError:pass # Partial viewer evidence; still schedule later starts.
         ready_ids=live_ids|{m['id']for m in selected if m['id']in playback and now_ms-1800000<=m['date']<=now_ms+lead}
-        plan=build_plan(list(merged.values()),ready_ids,viewers,spec,self.config.get('layout',{}).get('displays',{}),int(time.time()*1000),until_ms)
+        plan=build_plan(list(merged.values()),ready_ids,viewers,spec,displays,int(time.time()*1000),until_ms)
         for row in plan['live']:
             row['playback_url']=playback.get(row['id']);row['source_ready']=bool(playback.get(row['id']));row['prestart']=row['id']not in live_ids and row['start_ms']>now_ms;row['live']=row['id']in live_ids
         return plan
@@ -669,7 +720,7 @@ class RegularBrowserKeeper:
         # Retire only a session-owned stream with explicit video end and prior progress.
         for sid,s in list(self.active_streams.items()):
             rows=[v for (i,_),v in self._frames.items()if i==sid and time.time()-v[0]<12 and v[1].get('width',0)>0]
-            if self.session and s.session_id==self.session['id'] and sid not in {r['id']for r in plan['live']} and rows and all(v[1].get('ended') is True for v in rows):
+            if not self._protected(sid) and self.session and s.session_id==self.session['id'] and sid not in {r['id']for r in plan['live']} and rows and all(v[1].get('ended') is True for v in rows):
                 self._end_seen.setdefault(sid,time.time())
                 if time.time()-self._end_seen[sid]<60:continue
                 try:await self.command_for(sid,'close')
@@ -678,6 +729,9 @@ class RegularBrowserKeeper:
             else:self._end_seen.pop(sid,None)
     async def _reconcile(self,plan,allow_replacements=False):
         if not self.session:return
+        await self.refresh_displays()
+        self._displays() # Block new opens/parking when live display evidence is unknown.
+        if self.local_keepalive.get('enabled'):return # Explicit local selection owns ongoing care until disabled.
         if self.manual_layout:return await self._reconcile_manual(plan,allow_replacements)
         browser=self.session['spec']['browser'];self.errors=[]
         rows={r['id']:r for r in plan['live']}
@@ -751,7 +805,8 @@ class RegularBrowserKeeper:
                 if self.session:
                     self.plan=await self.discover(self.session['spec'],self.session['until_ms']);await self._reconcile(self.plan)
                 return {'success':True,'message':'Automatic priority layout selected','errors':self.errors}
-            layout=validate_manual_layout(body,self.config.get('layout',{}).get('displays',{}))
+            await self.refresh_displays()
+            layout=validate_manual_layout(body,self._displays())
             if type(body.get('start',False))is not bool:raise ValueError('start must be boolean')
             spec=validate_spec(body) if body.get('start')or body.get('sports') else None
             group=body.get('group_id')
@@ -778,6 +833,8 @@ class RegularBrowserKeeper:
             releases=body.get('release_ids',[])
             if not isinstance(releases,list)or len(releases)>20 or any(not isinstance(i,str)for i in releases)or (releases and not group):raise ValueError('Invalid shared-session releases')
             if set(releases)&{a['game_id']for a in layout['assignments']}:raise ValueError('Cannot release an assigned game')
+            protected=self.local_keepalive.get('stream_id')if self.local_keepalive.get('enabled')else None
+            if protected and protected not in releases and protected not in {a['game_id']for a in layout['assignments']}:raise ValueError('Selected local keepalive stream must retain its assignment or receive an explicit release')
             if type(body.get('reset_suppression',False))is not bool or(body.get('reset_suppression')and not group):raise ValueError('Invalid suppression reset')
             if body.get('reset_suppression')and group not in self._group_epochs:self.suppressed.difference_update(r['id']for r in plan['live']+plan['pending'])
             # Commit the new desired layout before a potentially delayed close, so
@@ -789,6 +846,7 @@ class RegularBrowserKeeper:
                 if a['game_id']in self.active_streams:self.active_streams[a['game_id']].session_id=self.session['id']
             self.suppressed.difference_update(reopen)
             self._ownership_lost.difference_update(recoveries)
+            if protected in releases:self.local_keepalive={'enabled':False,'profile':self.local_keepalive.get('profile','standard')};self._local_care={}
             self.plan=plan;self._releasing.update(sid for sid in releases if sid in self.active_streams);self._save()
             for sid in releases:
                 if sid not in self.active_streams:continue
@@ -802,6 +860,9 @@ class RegularBrowserKeeper:
             return {'success':True,'message':'Manual layout scheduled; future games keep their assigned slots','plan':plan,'errors':self.errors,'placement_pending':bool(self.layout_status.get('pending')),'layout':layout}
 
     async def _reconcile_manual(self,plan,allow_replacements=False,replacement_ids=None):
+        await self.refresh_displays()
+        self._displays()
+        validate_manual_layout(self.manual_layout,self._displays()) # Validate before any browser mutations.
         self.errors=[];await self._retire_ended(plan);assignments=self.manual_layout['assignments'];wanted={a['game_id']for a in assignments}
         live={r['id']:r for r in plan['live']};visible={sid for sid in wanted if sid in live or sid in self.active_streams}
         visible-=self.suppressed|self._ownership_lost|self._releasing
@@ -822,7 +883,7 @@ class RegularBrowserKeeper:
                 url=self._recovery.get(sid,{}).get('url')or row.get('playback_url')or 'https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(sources[0]['source'],safe='')+'/1'
                 await self._open(sid,url,row['title'],browser,self.session['id'],allow_replacement=allow_replacements or sid in (replacement_ids or set()))
             except (ValueError,TimeoutError,KeyError)as e:self.errors.append(row['title']+': '+str(e))
-        placements=manual_placements(self.manual_layout,self.config.get('layout',{}).get('displays',{}),visible&set(self.active_streams))
+        placements=manual_placements(self.manual_layout,self._displays(),visible&set(self.active_streams))
         signature=tuple((p['stream_id'],p['x'],p['y'],p['width'],p['height'])for p in placements)
         if placements and signature!=self._manual_signature:
             result=await self._place(placements)
@@ -861,6 +922,7 @@ class RegularBrowserKeeper:
         # Called under the same lock as layout/stop. One action per minute tick,
         # one refresh and at most two alternate players per match, across restarts.
         live={r['id']:r for r in plan['live']}
+        if self.local_keepalive.get('enabled'):return
         for sid,record in list(self._recovery.items()):
             if record.get('pending_release')and sid in self._releasing and sid in self.active_streams:
                 stream=self.active_streams[sid]
@@ -928,14 +990,88 @@ class RegularBrowserKeeper:
                 record['message']='Recovery blocked: '+str(e);record['last_action']=time.time();self._save();return
         self._save()
 
+    def _care_video(self,sid):
+        primary=self._primary_video(sid)
+        if primary:return primary
+        rows=[(key,row)for key,row in self._frames.items()if key[0]==sid]
+        if rows and all(v[1].get('state')=='NO_VIDEO'for _,v in rows):return max(rows,key=lambda item:item[1][0])
+        return None
+    def _care_failure(self,sid,now):
+        primary=self._care_video(sid)
+        stream=self.active_streams.get(sid)
+        if not stream or stream.parked or not self._browser_ready.get(stream.browser)or not primary:return False
+        rows=[v for (i,_),v in self._frames.items()if i==sid]
+        if not rows or not all(0<=now-v[0]<12 and v[1].get('state')in ('NO_VIDEO','BUFFERING')and v[1].get('paused')is not True and not v[1].get('ended')for v in rows):return False
+        key,(_,health)=primary;progress=self._progress.get(key)
+        return health.get('state')!='BUFFERING'or progress is not None and now-progress>=15
+    async def _local_keepalive_tick(self):
+        """Care for one exact owned tab, without catalog/server discovery or source changes.
+
+        Fresh progressing primary media resets the burst budget only after five
+        continuous minutes. Failures back off through a fifteen minute ceiling;
+        exhausted bursts get one probe/reload per thirty minutes until playback
+        restores. Offline probes never consume reload attempts or change sources.
+        """
+        if not self.local_keepalive.get('enabled'):return
+        sid=self.local_keepalive.get('stream_id');stream=self.active_streams.get(sid);care=self._local_care;now=time.time()
+        if not stream or sid in self.suppressed|self._ownership_lost|self._releasing:
+            care.update(state='inactive',message='Selected stream closed or ownership unavailable; no reopen permitted');return
+        if not self._browser_ready.get(stream.browser):
+            care.pop('healthy_since',None);care.pop('failure_since',None);care.update(state='disconnected',message='Waiting for the local browser companion');return
+        primary=self._care_video(sid)
+        if not primary or now-primary[1][0]>=12:
+            care.pop('healthy_since',None);care.pop('failure_since',None);care.update(state='waiting',message='Waiting for fresh primary video evidence');return
+        key,(seen,health)=primary
+        progress=self._progress.get(key)
+        if health.get('state')=='PLAYING'and progress is not None and now-progress<12:
+            care.pop('failure_since',None)
+            if now-care.get('last_healthy',now)>12:care.pop('healthy_since',None)
+            care.setdefault('healthy_since',now);care['last_healthy']=now
+            if now-care['healthy_since']>=300:
+                care.update(attempts=0,next_retry=0);self._recovery.pop(sid,None)
+            care.update(state='healthy',message='Selected stream is progressing; local keepalive active');self._save();return
+        care.pop('healthy_since',None)
+        if not self._care_failure(sid,now):
+            care.pop('failure_since',None);care.update(state='waiting',message='Playback paused, loading, or not proven failed; no automatic action');return
+        care.setdefault('failure_since',now)
+        threshold=120 if self.local_keepalive.get('profile')=='travel'else 90
+        if now-care['failure_since']<threshold or now<care.get('next_retry',0):
+            care.update(state='cooldown',message='Sustained failure observation or recovery cooldown');return
+        if now-self._reload_times.get(sid,0)<600:return
+        care.update(state='checking',message='Checking network before recovery')
+        try:
+            if not self._client:raise ValueError('Local network client unavailable')
+            async with self._client.get(stream.url,timeout=aiohttp.ClientTimeout(total=8))as response:
+                if not 200<=response.status<400:raise ValueError('Selected stream site unavailable')
+        except (aiohttp.ClientError,asyncio.TimeoutError,ValueError):
+            delay=min(900,max(60,care.get('network_delay',30)*2));care.update(network_delay=delay,next_retry=now+delay,state='network-unavailable',message='Network or stream site unavailable; tab and exact source preserved');self._save();return
+        # A user close or pause during the network request still wins.
+        if self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing:return
+        if not self._care_failure(sid,time.time()):return
+        try:
+            audit=await self.command(stream.browser,'inventory')
+            if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Exact ownership audit unavailable')
+            if self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing:return
+            if not self._care_failure(sid,time.time()):return
+            attempts=min(3,care.get('attempts',0)+1);delay=1800 if attempts>=3 else (600 if attempts==1 else 900)
+            care.update(attempts=attempts,last_action=time.time(),next_retry=time.time()+delay,state='recovering',message='Refreshing the selected source; audio and user pause remain authoritative',network_delay=30)
+            self._save();await self.force_reload(sid)
+        except (ValueError,TimeoutError):
+            care.update(next_retry=time.time()+120,state='blocked',message='Exact owned tab could not be confirmed; no replacement opened');self._save()
+
     async def _loop(self):
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
             async with self._lock:
                 for sid,s in self.active_streams.items():
                     rows=[v for (i,_),v in self._frames.items() if i==sid]
                     if rows and time.time()-max(v[0] for v in rows)>15:s.health_monitor.stats['state']='STALE'
-                if not self.session:continue
+                try:await self._local_keepalive_tick()
+                except Exception:
+                    log.exception('Local keepalive deferred; selected tab preserved')
+                if not self.session or self.local_keepalive.get('enabled'):continue
+                if time.time()-getattr(self,'_last_catalog_poll',0)<60:continue
+                self._last_catalog_poll=time.time()
                 if time.time()*1000>self.session['until_ms']:
                     self.session=None;self._save();continue # leave playing games alone
                 try:
