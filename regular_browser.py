@@ -39,6 +39,10 @@ PLACEMENT_READY_TIMEOUT=40
 PLACEMENT_RETRY_INTERVAL=1
 PLACEMENT_COMMAND_TIMEOUT=3
 PLAYBACK_POLL_INTERVAL=.1
+def stream_rank(item):
+    # Most-watched source first; English and then HD only break ties. Unknown counts rank as zero.
+    viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else 0
+    return (viewers,item.get('language')=='English',bool(item.get('hd')))
 def validate_url(url):
     try:u=urlparse(url)
     except Exception:raise ValueError('Invalid stream URL')
@@ -680,7 +684,7 @@ class RegularBrowserKeeper:
                 except (aiohttp.ClientError,asyncio.TimeoutError,ValueError,KeyError):pass
             if counts:viewers[match['id']]=max(counts)
             if candidates:
-                source,s=max(candidates,key=lambda v:(v[1].get('language')=='English',(v[1].get('viewers') if type(v[1].get('viewers')) in(int,float) else 0),bool(v[1].get('hd'))))
+                source,s=max(candidates,key=lambda v:stream_rank(v[1]))
                 playback[match['id']]='https://streamed.pk/watch/'+quote(match['id'],safe='')+'/'+quote(source,safe='')+'/'+str(s['streamNo'])
         now_ms=int(time.time()*1000);lead=spec.get('preload_minutes',10)*60000
         live_ids={m['id']for m in live if isinstance(m,dict)and isinstance(m.get('id'),str)}
@@ -913,8 +917,7 @@ class RegularBrowserKeeper:
                     if not isinstance(item,dict)or type(item.get('streamNo'))is not int or item['streamNo']<1:continue
                     url='https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
                     if url!=current and url not in tried:
-                        score=(item.get('language')=='English',bool(item.get('hd')),item.get('viewers')if type(item.get('viewers'))in(int,float)else 0)
-                        choices.append((score,url))
+                        choices.append((stream_rank(item),url))
             except (aiohttp.ClientError,asyncio.TimeoutError,ValueError,KeyError,TypeError):continue
         return max(choices,key=lambda c:c[0])[1]if choices else None
 

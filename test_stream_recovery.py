@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import AsyncMock,patch
-from regular_browser import RegularBrowserKeeper
+from regular_browser import RegularBrowserKeeper,stream_rank
 import test_regular_browser as fixtures
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +82,14 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         result=await self.k._recovery_sources(row,'https://streamed.pk/watch/0/golf/1',[])
         self.assertEqual(result,'https://streamed.pk/watch/0/golf/3')
         self.k._json.assert_awaited_once_with('stream/golf/a')
+
+    async def test_source_catalog_prefers_viewers_then_english_on_ties(self):
+        row={'id':'0','sources':[{'source':'golf','id':'a'}]}
+        self.k._json=AsyncMock(return_value=[{'streamNo':1,'language':'English'},{'streamNo':2,'language':'French','hd':True,'viewers':900},{'streamNo':3,'language':'English','viewers':40},{'streamNo':4,'language':'English','viewers':900}])
+        result=await self.k._recovery_sources(row,'https://streamed.pk/watch/0/golf/1',[])
+        self.assertEqual(result,'https://streamed.pk/watch/0/golf/4')
+        self.assertEqual(stream_rank({'language':'English'}),(0,True,False))
+        self.assertGreater(stream_rank({'language':'French','viewers':901}),stream_rank({'language':'English','viewers':900}))
 
     async def test_health_transition_between_polls_resets_failure_timer(self):
         await self.setup_stream();await self.tick(1000)
