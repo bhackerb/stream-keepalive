@@ -42,7 +42,9 @@ PLAYBACK_POLL_INTERVAL=.1
 def stream_rank(item):
     # Most-watched source first; English and then HD only break ties. Unknown counts rank as zero.
     viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else 0
-    return (viewers,item.get('language')=='English',bool(item.get('hd')))
+    language=str(item.get('language')or'').strip().lower()
+    english=language=='english'or language.startswith('english')and not language[7:8].isalpha()
+    return (viewers,english,bool(item.get('hd')))
 def validate_url(url):
     try:u=urlparse(url)
     except Exception:raise ValueError('Invalid stream URL')
@@ -313,13 +315,16 @@ class RegularBrowserKeeper:
             self._save()
         return ('Tracking stopped; could not close '+', '.join(failed))if failed else 'Stopped selected StreamKeeper-owned windows'
     async def force_reload(self,sid=None):
-        targets=[sid] if sid else list(self.active_streams)
+        targets=[sid] if sid else list(self.active_streams);skipped=[]
         for target in targets:
-            if time.time()-self._reload_times.get(target,0)<600:return '❌ Reload budget: at most once per stream per 10 minutes'
+            if time.time()-self._reload_times.get(target,0)<600:
+                if sid:return '❌ Reload budget: at most once per stream per 10 minutes'
+                skipped.append(target);continue
             await self.command_for(target,'reload');self._reload_times[target]=time.time()
             for key in list(self._frames):
                 if key[0]==target:del self._frames[key];self._progress.pop(key,None)
-        return 'Explicit reload requested'
+        if skipped and len(skipped)==len(targets):return '❌ Reload budget: at most once per stream per 10 minutes'
+        return 'Explicit reload requested'+('; skipped (reloaded within 10 minutes): '+', '.join(skipped)if skipped else '')
     async def force_unmute(self,sid=None):
         for target in ([sid] if sid else list(self.active_streams)):await self.command_for(target,'unmute')
         return 'Unmute requested'
@@ -688,8 +693,11 @@ class RegularBrowserKeeper:
                 playback[match['id']]='https://streamed.pk/watch/'+quote(match['id'],safe='')+'/'+quote(source,safe='')+'/'+str(s['streamNo'])
         now_ms=int(time.time()*1000);lead=spec.get('preload_minutes',10)*60000
         live_ids={m['id']for m in live if isinstance(m,dict)and isinstance(m.get('id'),str)}
-        try:await asyncio.wait_for(asyncio.gather(*(measure(m)for m in selected if m['id'] in live_ids or now_ms-1800000<=m['date']<=now_ms+lead)),20)
+        measured=[m for m in selected if m['id'] in live_ids or now_ms-1800000<=m['date']<=now_ms+lead]
+        try:await asyncio.wait_for(asyncio.gather(*(measure(m)for m in measured)),20)
         except asyncio.TimeoutError:pass # Partial viewer evidence; still schedule later starts.
+        missing=sum(m['id']not in playback for m in measured)
+        if missing:log.warning('Source measurement incomplete: %d of %d matches lack a ranked playback URL',missing,len(measured))
         ready_ids=live_ids|{m['id']for m in selected if m['id']in playback and now_ms-1800000<=m['date']<=now_ms+lead}
         plan=build_plan(list(merged.values()),ready_ids,viewers,spec,displays,int(time.time()*1000),until_ms)
         for row in plan['live']:
@@ -776,16 +784,16 @@ class RegularBrowserKeeper:
                 if park!=s.parked:
                     try:await self.command_for(sid,'park',enabled=park);s.parked=park
                     except (ValueError,TimeoutError)as e:self.errors.append(str(e));return
-        available=max(0,self.max_streams-len(self.active_streams))
+        available=max(0,self.max_streams-len(self.active_streams));lookup_deadline=asyncio.get_running_loop().time()+10
         if self._ownership_lost:self.errors.append('Ownership lost; existing windows left alone. Restart the session to open replacements.')
         for row in selected:
             if row['id'] in self.active_streams:continue
             if available<=0:self.errors.append('All available stream slots are occupied');break
             sources=row['sources']
             if not sources:self.errors.append(row['title']+': source not yet available');continue
-            source=sources[0]
             try:
-                url=self._recovery.get(row['id'],{}).get('url')or row.get('playback_url') or 'https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(source['source'],safe='')+'/1'
+                url=await self._opening_url(row,lookup_deadline)
+                if not self._openable(row['id']):continue # Closed or released during lookup.
                 await self._open(row['id'],url,row['title'],browser,self.session['id'],allow_replacement=allow_replacements);available-=1
             except (ValueError,KeyError,TimeoutError) as e:self.errors.append(row['title']+': '+str(e))
         # Stable order between joins: viewers cannot cause continuous reshuffling.
@@ -876,7 +884,7 @@ class RegularBrowserKeeper:
                 if park!=s.parked:
                     try:await self.command_for(sid,'park',enabled=park);s.parked=park
                     except (ValueError,TimeoutError)as e:self.errors.append('Could not park an unassigned game; placement deferred to avoid overlap: '+str(e));self._save();return
-        browser=self.session['spec']['browser']
+        browser=self.session['spec']['browser'];lookup_deadline=asyncio.get_running_loop().time()+10
         for sid in visible:
             if sid in self.active_streams:continue
             row=live[sid]
@@ -884,7 +892,8 @@ class RegularBrowserKeeper:
             sources=row.get('sources')or[]
             if not sources:self.errors.append(row['title']+': waiting for a source');continue
             try:
-                url=self._recovery.get(sid,{}).get('url')or row.get('playback_url')or 'https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(sources[0]['source'],safe='')+'/1'
+                url=await self._opening_url(row,lookup_deadline)
+                if not self._openable(sid):continue # Closed or released during lookup.
                 await self._open(sid,url,row['title'],browser,self.session['id'],allow_replacement=allow_replacements or sid in (replacement_ids or set()))
             except (ValueError,TimeoutError,KeyError)as e:self.errors.append(row['title']+': '+str(e))
         placements=manual_placements(self.manual_layout,self._displays(),visible&set(self.active_streams))
@@ -908,6 +917,18 @@ class RegularBrowserKeeper:
         buffering=[(key,v)for key,v in self._frames.items()if key[0]==sid and v[1].get('state')=='BUFFERING']
         return bool(buffering)and all(v[1].get('state')in ('NO_VIDEO','BUFFERING')for v in rows)and all(key in self._progress and 15<=now-self._progress[key]<=300 and v[1].get('paused')is not True and not v[1].get('ended')for key,v in buffering)
 
+    async def _opening_url(self,row,deadline):
+        # Saved recovery URL, then the discovery choice, then a bounded viewer-ranked
+        # lookup; only an unavailable lookup falls back to the first source's stream 1.
+        url=self._recovery.get(row['id'],{}).get('url')or row.get('playback_url')
+        if url:return url
+        remaining=deadline-asyncio.get_running_loop().time()
+        if self._client and remaining>0:
+            try:url=await asyncio.wait_for(self._recovery_sources(row,None,[]),min(8,remaining))
+            except Exception:log.warning('Ranked source lookup failed for %s; using first source',row['id'])
+        return url or 'https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(row['sources'][0]['source'],safe='')+'/1'
+    def _openable(self,sid):
+        return sid not in self.active_streams and sid not in self.suppressed|self._ownership_lost|self._releasing
     async def _recovery_sources(self,row,current,tried):
         choices=[]
         for source in (row.get('sources')or[])[:3]:
@@ -1066,6 +1087,9 @@ class RegularBrowserKeeper:
         while True:
             await asyncio.sleep(10)
             async with self._lock:
+                # Drop evidence only for departed streams; active stale frames still block recovery.
+                for key in [k for k in self._frames if k[0]not in self.active_streams]:del self._frames[key]
+                for key in [k for k in self._progress if k[0]not in self.active_streams]:del self._progress[key]
                 for sid,s in self.active_streams.items():
                     rows=[v for (i,_),v in self._frames.items() if i==sid]
                     if rows and time.time()-max(v[0] for v in rows)>15:s.health_monitor.stats['state']='STALE'

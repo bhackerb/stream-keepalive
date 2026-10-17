@@ -72,18 +72,13 @@ class StreamKeeperAPI:
         if request.path == "/health":
             return await handler(request)
 
-        # Companion control must fail closed, including legacy dev configuration.
-        if request.path in ("/settings", "/browser/bridge", "/session", "/session-layout", "/player-sources", "/switch", "/audio", "/resume", "/restore-layout") and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+        # Every control route fails closed without a key, including legacy dev configuration.
+        if not self.api_key or self.api_key == "YOUR_API_KEY":
             return web.json_response({"error": "API authentication required"}, status=503)
         if request.path == "/browser/bridge" and request.remote not in ("127.0.0.1", "::1"):
             return web.json_response({"error": "Native bridge is local only"}, status=403)
 
         # All other endpoints require auth
-        if not self.api_key or self.api_key == "YOUR_API_KEY":
-            # No API key configured — allow all (dev mode)
-            logger.warning("API key not configured — allowing unauthenticated access")
-            return await handler(request)
-
         if not _check_auth(request, self.api_key):
             return web.json_response(
                 {"error": "unauthorized", "message": "Invalid or missing Bearer token"},
