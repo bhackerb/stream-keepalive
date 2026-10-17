@@ -1,6 +1,43 @@
-/* Passive health evidence in every permitted frame. Never remove iframe sandbox. */
+/* Health and user-authoritative audio in proven owned frames. Never remove iframe sandbox. */
 const skAPI=globalThis.browser || chrome;
 let skOwned=false, skFill=false, skEscaped=false, skLastTime=null, skLastFrames=null, skLastProgress=Date.now(), skEverProgress=false, skStarted=false, skParked=false;
+// Persist intent in the extension, never infer it from arbitrary volumechange events.
+let skAudio=null, skAudioRevision=0, skAudioGestureUntil=0, skAudioPending=false;
+const skWatched=new WeakSet();
+function skPrimary(){return [...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];}
+function skApplyAudio(){
+  if(!skOwned || !skAudio || skAudioPending || Date.now()<skAudioGestureUntil)return;
+  const v=skPrimary();if(!v)return;
+  try{if(v.muted!==skAudio.muted)v.muted=skAudio.muted;if('volume'in skAudio&&v.volume!==skAudio.volume)v.volume=skAudio.volume;}catch{}
+}
+function skAudioGesture(e){
+  if(!skOwned || !e.isTrusted)return;
+  const path=e.composedPath?.()||[e.target];
+  const control=path.find(el=>el?.getAttribute && (/mute|volume|sound|audio/i.test([el.getAttribute('aria-label'),el.getAttribute('title'),el.getAttribute('data-a-target')].join(' ')) || (el.tagName==='VIDEO'&&el.controls)));
+  if(!control)return;
+  if(e.type==='keydown'&&!['m','M','ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Enter'].includes(e.key))return;
+  skAudioGestureUntil=Date.now()+1200;
+}
+for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,skAudioGesture,true);
+async function skVolumeChanged(v){
+  if(!skOwned || v!==skPrimary() || skAudioPending)return;
+  if(Date.now()<skAudioGestureUntil){
+    skAudioGestureUntil=0;skAudioPending=true;
+    try{
+      const reply=await skAPI.runtime.sendMessage({sk:true,op:'audio_intent',revision:skAudioRevision,audio:{muted:v.muted,volume:v.volume}});
+      if(reply?.owned&&reply.audio){skAudio=reply.audio;skAudioRevision=reply.audio_revision;}
+      else skOwned=false;
+    }catch{}finally{skAudioPending=false;skApplyAudio();}
+  }else skApplyAudio();
+}
+function skWatchAudio(){
+  for(const v of document.querySelectorAll('video'))if(!skWatched.has(v)){
+    skWatched.add(v);v.addEventListener?.('volumechange',()=>{void skVolumeChanged(v);});
+    v.addEventListener?.('loadedmetadata',skApplyAudio);v.addEventListener?.('play',skApplyAudio);
+  }
+  skApplyAudio();
+}
+if(typeof MutationObserver!=='undefined')new MutationObserver(skWatchAudio).observe(document,{childList:true,subtree:true});
 function skRestore(){document.getElementById('streamkeeper-tab-style')?.remove();document.querySelectorAll('[data-sk-tab]').forEach(e=>e.removeAttribute('data-sk-tab'));}
 function skExpand(target){
   if(!target || skEscaped)return;
@@ -16,6 +53,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){skEscaped=true;skRe
 skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
   if(!m?.sk)return false;
   if(m.op==='audio'){
+    skAudioGestureUntil=0;
     if(!skOwned || typeof m.muted!=='boolean' || ('volume'in m && (typeof m.volume!=='number' || !Number.isFinite(m.volume) || m.volume<0 || m.volume>1))){respond({confirmed:false});return false;}
     // Volume targets only the fresh primary frame selected by the controller.
     // Validate a decoded video before changing even mute state.
@@ -23,6 +61,8 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
     if(m.primary_only===true&&!primary){respond({confirmed:false});return false;}
     const media=m.primary_only===true?[primary]:[...document.querySelectorAll('video,audio')];
     try{
+      skAudioRevision=m.audio_revision??skAudioRevision;
+      skAudio={...skAudio,muted:m.muted,...('volume'in m?{volume:m.volume}:{})};
       for(const v of media){v.muted=m.muted;if('volume'in m)v.volume=m.volume;}
       const confirmed=media.every(v=>v.muted===m.muted && (!('volume'in m)||v.volume===m.volume));
       respond({confirmed,muted:m.muted,...('volume'in m?{volume:m.volume}:{}),media_count:media.length,video_count:m.primary_only===true?1:document.querySelectorAll('video').length});
@@ -34,7 +74,7 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
   if(m.op==='fill'){skFill=m.enabled;skEscaped=false;if(!skFill)skRestore();}
   if(m.op==='park'){skParked=m.enabled;for(const v of document.querySelectorAll('video')){if(m.enabled){v.dataset.skResume=String(!v.paused);v.pause();}else if(v.dataset.skResume==='true'){delete v.dataset.skResume;void v.play().catch(()=>{});}}}
   if(m.op==='play')for(const v of document.querySelectorAll('video'))void v.play().catch(()=>{});
-  if(m.op==='unmute')for(const v of document.querySelectorAll('video')){v.muted=false;v.volume=1;}
+  if(m.op==='unmute'){skAudioRevision=m.audio_revision??skAudioRevision;skAudio={muted:false,volume:1};skAudioGestureUntil=0;for(const v of document.querySelectorAll('video')){v.muted=false;v.volume=1;}}
   respond(true);return false;
 });
 async function skTick(){
@@ -46,7 +86,9 @@ async function skTick(){
     skLastTime=v?.currentTime??null;skLastFrames=frames;
     const reply=await skAPI.runtime.sendMessage({sk:true,op:'health',health});
     skOwned=!!reply?.owned;skFill=!!reply?.fill;
-    if(skOwned&&reply?.autoplay&&v&&!skStarted&&!reply.parked){skStarted=true;if(reply.start_muted)v.muted=true;void v.play().catch(()=>{});}
+    if(reply?.audio&&!skAudioPending&&reply.audio_revision>=skAudioRevision){skAudio=reply.audio;skAudioRevision=reply.audio_revision;}
+    skWatchAudio();
+    if(skOwned&&reply?.autoplay&&v&&!skStarted&&!reply.parked){skStarted=true;if(!skAudio&&reply.start_muted)v.muted=true;void v.play().catch(()=>{});}
     if(skOwned&&reply?.parked&&v&&!v.paused){if(!skParked)v.dataset.skResume='true';v.pause();skParked=true;}
     if(skOwned&&skFill&&!skEscaped&&v)skExpand(v.closest('.jwplayer,.video-js,.plyr,[data-player]')||v);
     if(!skOwned)skRestore();

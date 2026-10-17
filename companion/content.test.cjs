@@ -34,3 +34,35 @@ test('primary volume without decoded video fails before any media mutation',asyn
  const r=h.command({op:'audio',muted:false,volume:.25,primary_only:true});
  assert.equal(r.confirmed,false);assert.equal(h.video.muted,true);assert.equal(h.video.volume,1);
 });
+
+async function sticky(owned=true,audio={muted:false,volume:.3}){
+ const events={},messages=[];let tick,listener,revision=2;
+ const makeVideo=()=>{const callbacks={};return {muted:true,volume:1,controls:true,tagName:'VIDEO',getAttribute:()=>null,paused:false,currentTime:1,videoWidth:1280,videoHeight:720,readyState:4,play:async()=>{},getVideoPlaybackQuality:()=>({totalVideoFrames:10}),addEventListener:(k,f)=>{callbacks[k]=f;},fire:k=>callbacks[k]?.()};};
+ let video=makeVideo();
+ const document={addEventListener:(k,f)=>{events[k]=f;},querySelectorAll:s=>s==='video'||s==='video,audio'?[video]:[],getElementById:()=>null};
+ const api={runtime:{onMessage:{addListener:f=>{listener=f;}},sendMessage:async m=>{messages.push(m);if(m.op==='audio_intent'){audio=m.audio;revision++;}return {owned,fill:false,autoplay:true,start_muted:true,parked:false,audio,audio_revision:revision};}}};
+ vm.runInNewContext(fs.readFileSync(__dirname+'/content.js','utf8'),{browser:api,document,window:{},Date,setInterval:f=>{tick=f;}});
+ const settle=async()=>{await new Promise(setImmediate);};await settle();
+ return {get video(){return video;},messages,settle,tick,replace:()=>{video=makeVideo();},gesture:(trusted=true)=>events.pointerdown({isTrusted:trusted,target:video}),command:m=>listener({sk:true,...m},{},()=>{})};
+}
+test('saved manual audio overrides startup mute and script resets; replacement video inherits mute and volume',async()=>{
+ const h=await sticky();assert.equal(h.video.muted,false);assert.equal(h.video.volume,.3);
+ h.video.muted=true;h.video.volume=1;h.video.fire('volumechange');assert.equal(h.video.muted,false);assert.equal(h.video.volume,.3);
+ h.replace();await h.tick();assert.equal(h.video.muted,false);assert.equal(h.video.volume,.3);
+ assert.equal(h.messages.filter(m=>m.op==='audio_intent').length,0);
+});
+test('trusted player audio gesture updates intent; synthetic events and unowned frames cannot',async()=>{
+ const h=await sticky();h.gesture();h.video.muted=true;h.video.volume=.6;h.video.fire('volumechange');await h.settle();
+ assert.equal(h.messages.filter(m=>m.op==='audio_intent').length,1);assert.equal(h.video.muted,true);assert.equal(h.video.volume,.6);
+ h.gesture(false);h.video.muted=false;h.video.fire('volumechange');assert.equal(h.video.muted,true);
+ const personal=await sticky(false);personal.gesture();personal.video.fire('volumechange');await personal.settle();assert.equal(personal.messages.filter(m=>m.op==='audio_intent').length,0);assert.equal(personal.video.volume,1);
+});
+test('native audio command supersedes older heartbeat preferences',async()=>{
+ const h=await sticky();h.command({op:'audio',muted:true,volume:.7,audio_revision:3});await h.tick();
+ assert.equal(h.video.muted,true);assert.equal(h.video.volume,.7);
+});
+test('a manually muted player stays muted through script unmute and replacement',async()=>{
+ const h=await sticky(true,{muted:true,volume:.45});
+ h.video.muted=false;h.video.fire('volumechange');assert.equal(h.video.muted,true);
+ h.replace();await h.tick();assert.equal(h.video.muted,true);assert.equal(h.video.volume,.45);
+});

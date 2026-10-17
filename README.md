@@ -402,3 +402,33 @@ ranking must retain the selected game. Explicit Stop and browser closure remain 
 still requires a reachable server (for example through Tailscale); it is separate
 from local playback care. Validate without a desktop or network using
 `python3 -m unittest discover -q`.
+
+### Companion 0.2.2: preserve manual audio
+
+Version 0.2.2 includes 0.2.1's primary-video volume controls and remembers the
+last explicit mute/volume preference locally. Refreshes, replacement videos,
+and automatic source close/reopen in the same session restore that preference;
+a new session uses its configured startup mute policy. Preferences are bounded
+to the latest 200 game IDs and survive extension restarts. Health observations
+alone never change the saved preference. Existing games without saved intent
+initially use their startup policy; set their audio once after installing.
+
+Gwaihir audio commands, browser-tab mute controls, and trusted gestures on
+recognizable player audio controls update the preference. Player controls need
+an audio/mute/volume/sound label (aria-label, title, or data-a-target), or native
+video controls. Unlabelled custom controls may be restored to the saved choice;
+use Gwaihir or browser-tab mute for those players. Recognized player gestures
+allow a 1.2-second window for the next primary-video volumechange. Script changes
+outside that window are restored rather than remembered. Browsers can still
+block unmuted autoplay; this update never forces playback of a paused stream.
+
+Build with `python3 build_companion.py`, upload `build/streamkeeper-firefox.zip`
+for Firefox signing, then install the returned 0.2.2 XPI on both devices. The
+unsigned ZIP is an upload artifact, not a permanent Firefox installation.
+
+0.2.2 validation: 35 hermetic companion checks and 168 native Python checks pass;
+Mithrandir build passes. Independent review remains incomplete: Grok and Ollama
+hit their 120-second deadlines; the AGY-started retry produced no verdict before
+falling back into previously exhausted providers and was stopped. This package
+is prepared for signing, not installed or promoted to main. Physical Firefox
+refresh/buffering and custom player controls still need validation after signing.

@@ -7,6 +7,17 @@ function allowed(url) { try { const u = new URL(url); return u.protocol === 'htt
 let port, connecting=false;
 const ready = api.storage.local.get('owned').then(v => Object.assign(Object.create(null),v.owned || {}));
 let records, lost;
+let audioPreferences;
+const audioReady=api.storage.local.get('audioPreferences').then(v=>v.audioPreferences||{});
+async function preferences(){return audioPreferences ||= await audioReady;}
+function validAudio(a){return a && typeof a.muted==='boolean' && (!('volume'in a)||(typeof a.volume==='number'&&Number.isFinite(a.volume)&&a.volume>=0&&a.volume<=1));}
+async function rememberAudio(id,r,a){
+  r.audio={...r.audio,...a};r.audioRevision=(r.audioRevision||0)+1;
+  const prefs=await preferences();delete prefs[id];prefs[id]={session:r.session_id,audio:r.audio};
+  for(const key of Object.keys(prefs).slice(0,-200))delete prefs[key];
+  await api.storage.local.set({audioPreferences:prefs});await save();
+}
+
 const createdHere=new Set();
 let sessionOwners;
 const ownersReady=api.storage.session.get('ownerTokens').then(v=>v.ownerTokens||{});
@@ -65,7 +76,7 @@ async function audioCommand(r,c) {
   const targets=volume?frames.filter(f=>f.frameId===c.primary_frame_id&&allowed(f.url)):frames.filter(f=>allowed(f.url));
   if(!targets.length)throw Error(volume?'Primary video frame unavailable or unsupported; refresh player status':'No supported player frame');
   if(!await provesTab(await api.tabs.get(r.tabId),r))throw Error('Stream ownership changed before audio update');
-  const replies=await Promise.all(targets.map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'audio',muted:c.muted,...(volume?{volume:c.volume,primary_only:true}:{})},{frameId:f.frameId})));
+  const replies=await Promise.all(targets.map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'audio',audio_revision:(r.audioRevision||0)+1,muted:c.muted,...(volume?{volume:c.volume,primary_only:true}:{})},{frameId:f.frameId})));
   let count=0,videos=0;
   for(const result of replies){
     if(!result || result.confirmed!==true || !Number.isInteger(result.media_count) || result.media_count<0 || result.muted!==c.muted || ('volume'in c && result.volume!==c.volume))throw Error('Player audio confirmation unavailable');
@@ -91,6 +102,8 @@ async function command(c) {
     if(missing[c.stream_id] && !c.allow_replacement)throw Error('Ownership lost; explicit session restart required');
     delete missing[c.stream_id];
     const record={url:c.url,token:crypto.randomUUID(),createdAt:Date.now(),created:true,session_id:c.session_id||null,startMuted:c.start_muted!==false,label:String(c.label||'Stream').slice(0,200),fill:true};
+    const saved=(await preferences())[c.stream_id];
+    record.audio=saved?.session===record.session_id&&validAudio(saved.audio)?saved.audio:{muted:record.startMuted};record.audioRevision=0;
     all[c.stream_id]=record;await save();
     const w=await api.windows.create({url:markedURL(record),type:'popup',focused:false});
     const tab=w.tabs?.[0] || (await api.tabs.query({windowId:w.id}))[0];
@@ -98,6 +111,7 @@ async function command(c) {
     record.tabId=tab.id;record.windowId=w.id;createdHere.add(tab.id);
     (await ownerTokens())[tab.id]=record.token;await saveOwners();
     if(isFirefox)await api.sessions.setTabValue(tab.id,'streamkeeperOwner',record.token);
+    await api.tabs.update(tab.id,{muted:record.audio.muted});
     await save(); return all[c.stream_id];
   }
   if (!r) throw Error('Stream is not owned');
@@ -110,12 +124,12 @@ async function command(c) {
   if(c.op==='title') return tab.title || '';
   if(c.op==='marker') {if(typeof c.value!=='string' || c.value.length>300) throw Error('Invalid title'); return api.tabs.sendMessage(r.tabId,{sk:true,op:'marker',value:c.value},{frameId:0});}
   if(c.op==='fill') {r.fill=!!c.enabled;await save(); await frameCommand(r.tabId,{op:'fill',enabled:r.fill}).catch(()=>{});return true;}
-  if(c.op==='audio')return audioCommand(r,c);
+  if(c.op==='audio'){const result=await audioCommand(r,c);await rememberAudio(c.stream_id,r,{muted:c.muted,...('volume'in c?{volume:c.volume}:{})});return result;}
   if(c.op==='unmute'){
     // Preserve the legacy permissive request; it does not promise audio confirmation.
-    const result=await frameCommand(r.tabId,{op:'unmute'});
+    const result=await frameCommand(r.tabId,{op:'unmute',audio_revision:(r.audioRevision||0)+1});
     if(!await provesTab(await api.tabs.get(r.tabId),r))throw Error('Owned stream is unavailable');
-    await api.tabs.update(r.tabId,{muted:false});return result;
+    await api.tabs.update(r.tabId,{muted:false});await rememberAudio(c.stream_id,r,{muted:false,volume:1});return result;
   }
   if(c.op==='play') return frameCommand(r.tabId,{op:c.op});
   throw Error('Unsupported native command');
@@ -137,13 +151,14 @@ function connect() {
 }
 api.runtime.onMessage.addListener((m,sender,respond)=>{
   if(!m?.sk || !sender.tab || !allowed(sender.url || '')) return false;
-  (async()=>{
+  queue=queue.catch(()=>{}).then(async()=>{
     const all=await owned();const entry=Object.entries(all).find(([,r])=>r.tabId===sender.tab.id);
     if(!entry) return {owned:false};
     const [id,r]=entry;
     if(!await provesTab(sender.tab,r))return {owned:false};
     const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});
     if(!frames?.some(f=>f.frameId===sender.frameId && f.url===sender.url))return {owned:false};
+    if(m.op==='audio_intent' && validAudio(m.audio) && m.revision===(r.audioRevision||0)){await rememberAudio(id,r,m.audio);await api.tabs.update(r.tabId,{muted:m.audio.muted});}
     if(m.op==='escape'){r.fill=false;await save();await frameCommand(r.tabId,{op:'fill',enabled:false}).catch(()=>{});}
     if(m.op==='health' && r.fill && m.health?.width>0){
       const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});
@@ -154,8 +169,8 @@ api.runtime.onMessage.addListener((m,sender,respond)=>{
       }
     }
     if(m.op==='health') await send({event:'health',stream_id:id,frame_id:sender.frameId,health:m.health});
-    return {owned:true,fill:r.fill,parked:!!r.parked,autoplay:r.created,start_muted:r.startMuted};
-  })().then(respond).catch(()=>respond({owned:false}));return true;
+    return {owned:true,fill:r.fill,parked:!!r.parked,autoplay:r.created,start_muted:r.startMuted,audio:r.audio||{muted:r.startMuted!==false},audio_revision:r.audioRevision||0};
+  });queue.then(respond).catch(()=>respond({owned:false}));return true;
 });
 api.tabs.onRemoved.addListener((tabId,info)=>{
   queue=queue.catch(()=>{}).then(async()=>{
@@ -168,6 +183,13 @@ api.tabs.onRemoved.addListener((tabId,info)=>{
     delete (await ownerTokens())[tabId];await saveOwners();await save();
   });
 });
-api.tabs.onUpdated.addListener((tabId,change)=>{if(change.status==='complete')void owned().then(all=>{if(Object.values(all).some(r=>r.tabId===tabId))return scheduleInventory();});});
+api.tabs.onUpdated.addListener((tabId,change)=>{
+  // Only browser UI mute actions change intent; our own tabs.update is ignored.
+  if(change.mutedInfo?.reason==='user' || (change.mutedInfo?.muted===false&&!change.mutedInfo.reason))queue=queue.catch(()=>{}).then(async()=>{
+    const entry=Object.entries(await owned()).find(([,r])=>r.tabId===tabId);
+    if(entry && entry[1].audio?.muted!==change.mutedInfo.muted && await provesTab(await api.tabs.get(tabId),entry[1]))await rememberAudio(entry[0],entry[1],{muted:change.mutedInfo.muted});
+  });
+  if(change.status==='complete')void owned().then(all=>{if(Object.values(all).some(r=>r.tabId===tabId))return scheduleInventory();});
+});
 api.alarms.create('bridge-reconnect',{periodInMinutes:1});api.alarms.onAlarm.addListener(()=>{connect();void scheduleInventory();});
 connect();

@@ -6,12 +6,13 @@ async function harness(local={},session={},engine='firefox'){
  const store=data=>({get:async k=>({[k]:data[k]}),set:async v=>Object.assign(data,v)});
  const tabValues={};
  const api={sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',...(engine==='firefox'?{browser_specific_settings:{gecko:{id:'fixture'}}}:{})}),onMessage:event()},
-  tabs:{get:async id=>{if(!tabs.has(id))throw Error('missing');return tabs.get(id);},query:async q=>{if(!q?.url)throw Error('Personal tab scan forbidden');return [...tabs.values()].filter(t=>t.url.startsWith(q.url.slice(0,-1)));},remove:async id=>{removed.push(id);tabs.delete(id);},sendMessage:async()=>true,reload:async()=>{throw Error('Unexpected reload');},onRemoved:event(),onUpdated:event()},
+  tabs:{update:async(id,value)=>{tabs.get(id).mutedInfo={muted:value.muted,reason:'extension'};},get:async id=>{if(!tabs.has(id))throw Error('missing');return tabs.get(id);},query:async q=>{if(!q?.url)throw Error('Personal tab scan forbidden');return [...tabs.values()].filter(t=>t.url.startsWith(q.url.slice(0,-1)));},remove:async id=>{removed.push(id);tabs.delete(id);},sendMessage:async()=>true,reload:async()=>{throw Error('Unexpected reload');},onRemoved:event(),onUpdated:event()},
   windows:{update:async()=>{},create:async v=>{const id=next++;const tab={id,url:v.url,windowId:id};tabs.set(id,tab);return {id,tabs:[tab]};}},alarms:{create:()=>{},onAlarm:event()}};
  vm.runInNewContext(fs.readFileSync(__dirname+'/background.js','utf8'),{browser:api,console,setTimeout:()=>{},URL,Date,Promise,crypto:require('node:crypto').webcrypto});
  const settle=async()=>{for(let i=0;i<12;i++)await new Promise(r=>setImmediate(r));};await settle();
  async function command(op,args={}){const id='request-'+sent.length;port.onMessage.fire({id,op,...args});await settle();return sent.find(m=>m.id===id);}
- return {sent,tabs,removed,command,api,local,port,settle};
+ async function message(m,sender){let reply;api.runtime.onMessage.fire({sk:true,...m},sender,r=>{reply=r;});await settle();return reply;}
+ return {sent,tabs,removed,command,api,local,port,settle,message};
 }
 test('open is idempotent, unknown eval denied, only owned tab closes',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
@@ -155,4 +156,42 @@ test('primary frame without video never changes tab audio or confirms success',a
  h.api.webNavigation={getAllFrames:async()=>[{frameId:2,url:'https://embed.st/embed/game'}]};
  h.api.tabs.sendMessage=async()=>({confirmed:false});let tabsChanged=0;h.api.tabs.update=async()=>{tabsChanged++;};
  assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:2})).error);assert.equal(tabsChanged,0);
+});
+
+test('manual audio survives reload, recovery reopen and extension restart; a new session uses startup policy',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game',session_id:'session-a'});
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'}]};
+ h.api.tabs.sendMessage=async(_id,m)=>({confirmed:true,muted:m.muted,volume:m.volume,media_count:1,video_count:1});
+ assert.equal((await h.command('audio',{stream_id:'game',muted:false,volume:.27,primary_frame_id:0})).result.confirmed,true);
+ h.api.tabs.reload=async()=>{};await h.command('reload',{stream_id:'game'});
+ assert.equal(h.local.owned.game.audio.muted,false);assert.equal(h.local.owned.game.audio.volume,.27);
+ await h.command('close',{stream_id:'game'});await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game/other/1',session_id:'session-a'});
+ assert.equal(h.local.owned.game.audio.volume,.27);assert.equal(h.tabs.get(11).mutedInfo.muted,false);
+ const restarted=await harness(h.local);await restarted.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game',session_id:'session-a',allow_replacement:true});
+ assert.equal(restarted.local.owned.game.audio.muted,false);assert.equal(restarted.local.owned.game.audio.volume,.27);
+ await h.command('close',{stream_id:'game'});await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game',session_id:'session-b'});
+ assert.equal(h.local.owned.game.audio.muted,true);assert.equal(h.local.owned.game.audio.volume,undefined);
+});
+test('only proven current-frame manual intent changes durable preference; stale revisions lose',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ const url='https://embed.st/embed/game';h.api.webNavigation={getAllFrames:async()=>[{frameId:2,url}]};
+ const sender={tab:h.tabs.get(10),frameId:2,url};
+ let reply=await h.message({op:'audio_intent',revision:0,audio:{muted:false,volume:.4}},sender);
+ assert.equal(reply.audio.muted,false);assert.equal(reply.audio_revision,1);assert.equal(h.tabs.get(10).mutedInfo.muted,false);
+ reply=await h.message({op:'audio_intent',revision:0,audio:{muted:true,volume:1}},sender);
+ assert.equal(reply.audio.volume,.4);assert.equal(reply.audio_revision,1);
+ await h.message({op:'health',health:{muted:true,volume:1}},sender);assert.equal(h.local.owned.game.audio.volume,.4);
+ await h.message({op:'audio_intent',revision:1,audio:{muted:true}}, {...sender,frameId:3});assert.equal(h.local.owned.game.audio.muted,false);
+ h.tabs.get(10).url='https://personal.example/';assert.equal((await h.message({op:'audio_intent',revision:1,audio:{muted:true}},sender)).owned,false);
+});
+test('browser UI mute is saved while extension tab updates cannot replace manual intent',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false,reason:'user'}});await h.settle();assert.equal(h.local.owned.game.audio.muted,false);
+ h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:true,reason:'extension'}});await h.settle();assert.equal(h.local.owned.game.audio.muted,false);
+});
+test('browser unmute with omitted reason is remembered; matching programmatic state adds no revision',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
+ h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false}});await h.settle();assert.equal(h.local.owned.game.audio.muted,false);
+ const revision=h.local.owned.game.audioRevision;
+ h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false}});await h.settle();assert.equal(h.local.owned.game.audioRevision,revision);
 });
