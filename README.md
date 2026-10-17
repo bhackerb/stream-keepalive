@@ -430,5 +430,7 @@ unsigned ZIP is an upload artifact, not a permanent Firefox installation.
 Mithrandir build passes. Independent review remains incomplete: Grok and Ollama
 hit their 120-second deadlines; the AGY-started retry produced no verdict before
 falling back into previously exhausted providers and was stopped. This package
-is prepared for signing, not installed or promoted to main. Physical Firefox
-refresh/buffering and custom player controls still need validation after signing.
+was signed by Mozilla and Ben explicitly approved activation despite incomplete
+independent review on 2026-10-17. Both hosts now target the signed 0.2.2 XPI in
+Firefox policy; Firefox restart and physical playback verification remain pending.
+Physical buffering and custom player controls still need real-world validation.
