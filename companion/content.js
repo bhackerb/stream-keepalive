@@ -69,6 +69,15 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
     }catch{respond({confirmed:false});}
     return false;
   }
+  if(m.op==='seek'){
+    // Seek only the decoded primary video in this frame; live streams have no finite duration.
+    const v=[...document.querySelectorAll('video')].filter(v=>v.videoWidth>0&&Number.isFinite(v.duration)&&v.duration>0).sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];
+    if(!skOwned||!v||(typeof m.to!=='number'&&typeof m.delta!=='number')){respond({confirmed:false});return false;}
+    const target=typeof m.to==='number'?m.to:v.currentTime+m.delta;
+    try{v.currentTime=Math.max(0,Math.min(v.duration-1,target));respond({confirmed:true,current_time:v.currentTime,duration:v.duration,width:v.videoWidth,height:v.videoHeight});}
+    catch{respond({confirmed:false});}
+    return false;
+  }
   if(m.op==='fill_child' && skOwned && skFill && !skEscaped){const f=[...document.querySelectorAll('iframe')].find(f=>f.src===m.src || f.src.split('#')[0]===m.src.split('#')[0]);if(f)skExpand(f);}
   if(m.op==='marker' && window===window.top)document.title=m.value;
   if(m.op==='fill'){skFill=m.enabled;skEscaped=false;if(!skFill)skRestore();}
@@ -82,7 +91,7 @@ async function skTick(){
     const videos=[...document.querySelectorAll('video')];const v=videos.sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];
     const frames=v?.getVideoPlaybackQuality?.().totalVideoFrames ?? v?.webkitDecodedFrameCount ?? null;
     if(v && skLastTime!==null && v.currentTime>skLastTime && (frames===null || skLastFrames===null || frames>skLastFrames)){skLastProgress=Date.now();skEverProgress=true;}
-    const health=v?{state:v.error?'ERROR':v.paused?'PAUSED':skEverProgress&&v.readyState>=2&&Date.now()-skLastProgress<15000?'PLAYING':'LOADING',current_time:v.currentTime,decoded_frames:frames,ready_state:v.readyState,width:v.videoWidth,height:v.videoHeight,ended:v.ended&&skEverProgress&&(frames??0)>0,paused:v.paused,muted:v.muted,volume:v.volume,stall_seconds:(Date.now()-skLastProgress)/1000}: {state:'NO_VIDEO'};
+    const health=v?{state:v.error?'ERROR':v.paused?'PAUSED':skEverProgress&&v.readyState>=2&&Date.now()-skLastProgress<15000?'PLAYING':'LOADING',current_time:v.currentTime,decoded_frames:frames,ready_state:v.readyState,width:v.videoWidth,height:v.videoHeight,duration:Number.isFinite(v.duration)&&v.duration>0?v.duration:null,ended:v.ended&&skEverProgress&&(frames??0)>0,paused:v.paused,muted:v.muted,volume:v.volume,stall_seconds:(Date.now()-skLastProgress)/1000}: {state:'NO_VIDEO'};
     skLastTime=v?.currentTime??null;skLastFrames=frames;
     const reply=await skAPI.runtime.sendMessage({sk:true,op:'health',health});
     skOwned=!!reply?.owned;skFill=!!reply?.fill;

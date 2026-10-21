@@ -132,6 +132,16 @@ async function command(c) {
     await api.tabs.update(r.tabId,{muted:false});await rememberAudio(c.stream_id,r,{muted:false,volume:1});return result;
   }
   if(c.op==='play') return frameCommand(r.tabId,{op:c.op});
+  if(c.op==='seek'){
+    const to=c.to,delta=c.delta;
+    if(!((typeof to==='number'&&Number.isFinite(to)&&to>=0&&delta===undefined)||(typeof delta==='number'&&Number.isFinite(delta)&&Math.abs(delta)<=86400&&to===undefined)))throw Error('Invalid seek');
+    const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});
+    if(!frames?.length||frames.length>50)throw Error('Player frames unavailable');
+    const replies=await Promise.all(frames.filter(f=>allowed(f.url)).map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'seek',...(to!==undefined?{to}:{delta})},{frameId:f.frameId}).catch(()=>null)));
+    const best=replies.filter(x=>x?.confirmed===true).sort((a,b)=>b.width*b.height-a.width*a.height)[0];
+    if(!best)throw Error('No seekable video (live streams cannot seek)');
+    return {confirmed:true,current_time:best.current_time,duration:best.duration};
+  }
   throw Error('Unsupported native command');
 }
 let queue=Promise.resolve();
@@ -144,7 +154,7 @@ function connect() {
       queue=queue.catch(()=>{}).then(async()=>{try {await send({id:c.id,result:await command(c)});} catch(e){await send({id:c.id,error:String(e.message||e)});}});
     });
     port.onDisconnect.addListener(()=>{console.warn('StreamKeeper native bridge:',api.runtime.lastError?.message || 'disconnected');port=null;connecting=false;setTimeout(connect,5000);});
-    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1']});
+    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1','seek-v1']});
     void scheduleInventory();
   } catch { port=null;setTimeout(connect,5000); }
   connecting=false;

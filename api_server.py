@@ -59,6 +59,7 @@ class StreamKeeperAPI:
         self.app.router.add_post("/unmute", self.handle_unmute)
         self.app.router.add_post("/audio", self.handle_audio)
         self.app.router.add_post("/resume", self.handle_resume)
+        self.app.router.add_post("/seek", self.handle_seek)
         self.app.router.add_post("/restore-layout", self.handle_restore_layout)
         self.app.router.add_post("/switch", self.handle_switch)
         self.app.router.add_get("/player-sources", self.handle_player_sources)
@@ -205,6 +206,7 @@ class StreamKeeperAPI:
                 "volume": health["volume"],
                 "stall_duration": health["stall_duration"],
                 "recovery_count": health["recovery_count"],
+                "duration": health.get("duration"),
             },
         }
 
@@ -366,6 +368,19 @@ class StreamKeeperAPI:
         except Exception:
             logger.exception('Live layout restore failed')
             return web.json_response({'success':False,'message':'Live layout could not be restored; refresh status and retry'},status=409)
+
+    async def handle_seek(self,request):
+        try:
+            body=await request.json()
+            if not isinstance(body,dict)or not isinstance(body.get('stream_id'),str):raise ValueError('An exact stream_id is required')
+        except (ValueError,TypeError)as exc:
+            return web.json_response({'success':False,'message':str(exc)or'Invalid request'},status=400)
+        if not hasattr(self.keeper,'seek'):
+            return web.json_response({'success':False,'message':'Seek requires regular browser control'},status=409)
+        try:
+            return web.json_response(await self.keeper.seek(body['stream_id'],body.get('to'),body.get('delta')))
+        except (ValueError,TimeoutError)as exc:
+            return web.json_response({'success':False,'message':str(exc)},status=409)
 
     async def handle_resume(self,request):
         try:

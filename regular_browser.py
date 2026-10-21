@@ -264,6 +264,8 @@ class RegularBrowserKeeper:
             self._frames[key]=(now,h)
             rows=[v for (i,_),v in self._frames.items() if i==sid and now-v[0]<12]
             best=max(rows,key=lambda v:(v[1].get('state')=='PLAYING',v[1].get('width',0)*v[1].get('height',0)))[1]
+            duration=best.get('duration')
+            s.health_monitor.stats['duration']=round(duration,1)if type(duration)in(int,float)and math.isfinite(duration)and duration>0 else None
             s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),stall_duration=str(round(best.get('stall_seconds',0),1)))
             # Playback aggregation can favor a small PLAYING ad. Audio controls
             # must describe the same fresh primary video that volume targets.
@@ -449,6 +451,15 @@ class RegularBrowserKeeper:
             if playback.get('playback_warning'):message+='; '+playback['playback_warning']
             return {'success':True,'stream_id':sid,'muted':muted,'volume':result.get('volume'),'confirmed':True,'message':message,**playback}
 
+    async def seek(self,sid,to=None,delta=None):
+        if not self.active_streams.get(sid):raise ValueError('Stream not found')
+        if (to is None)==(delta is None):raise ValueError('Provide exactly one of to or delta')
+        for value in (to,delta):
+            if value is not None and (type(value)not in(int,float)or not math.isfinite(value)):raise ValueError('Seek value must be a number')
+        if to is not None and to<0:raise ValueError('Seek position must be positive')
+        result=await self.command_for(sid,'seek',**({'to':float(to)}if to is not None else{'delta':float(delta)}))
+        if not isinstance(result,dict)or result.get('confirmed')is not True:raise ValueError('Player did not confirm the seek')
+        return {'success':True,'current_time':result.get('current_time'),'duration':result.get('duration'),'message':'Moved to '+time.strftime('%H:%M:%S',time.gmtime(result.get('current_time')or 0))}
     async def player_sources(self,sid):
         if not isinstance(sid,str)or sid not in self.active_streams:raise ValueError('Choose an active owned game')
         matches=await asyncio.wait_for(self._json('matches/all'),10)
