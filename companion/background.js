@@ -2,7 +2,7 @@
 const api = globalThis.browser || chrome;
 const isFirefox = !!api.runtime.getManifest().browser_specific_settings?.gecko;
 const HOST = 'com.bhackerb.streamkeeper';
-const HOSTS = ['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top'];
+const HOSTS = ['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site'];
 function allowed(url) { try { const u = new URL(url); return u.protocol === 'https:' && !u.username && !u.password && (!u.port || u.port==='443') && HOSTS.some(h => u.hostname === h || u.hostname.endsWith('.'+h)); } catch { return false; } }
 let port, connecting=false;
 const ready = api.storage.local.get('owned').then(v => Object.assign(Object.create(null),v.owned || {}));
