@@ -15,6 +15,7 @@ seconds after open, audited against its exact tab/window/token receipt. A pendin
 layout never authorizes another open, reload, adoption, or an ownership bypass.
 """
 import asyncio
+import re
 import json
 import logging
 import os
@@ -45,6 +46,12 @@ def stream_rank(item):
     language=str(item.get('language')or'').strip().lower()
     english=language=='english'or language.startswith('english')and not language[7:8].isalpha()
     return (viewers,english,bool(item.get('hd')))
+WRESTLING_TITLE=re.compile(r'\b(wwe|aew|nxt|tna|impact|roh|njpw|stardom|noah|gcw|wrestl\w*|smackdown|raw|dynamite|collision|rampage|lucha|aaa|cmll)\b',re.I)
+def wrestling_category(match):
+    """Streamed files wrestling under 'fight'; expose it as its own sport."""
+    if isinstance(match,dict)and match.get('category')=='fight'and isinstance(match.get('title'),str)and WRESTLING_TITLE.search(match['title']):
+        match['category']='wrestling'
+    return match
 def validate_url(url):
     try:u=urlparse(url)
     except Exception:raise ValueError('Invalid stream URL')
@@ -681,6 +688,8 @@ class RegularBrowserKeeper:
         async with self._client.get('https://streamed.pk/api/'+path) as res:
             res.raise_for_status();value=await res.json()
             if not isinstance(value,list):raise ValueError('Invalid Streamed catalog response')
+            if path.startswith('matches/'):
+                for m in value:wrestling_category(m)
             return value
     async def discover(self,spec,until_ms=None):
         await self.refresh_displays()

@@ -32,3 +32,14 @@ class PlannerTests(unittest.TestCase):
         for spec in ({'hours':True},{'sports':'hockey'},{'favorites':'Blues'},{'browser':'unknown'}):
             with self.assertRaises(ValueError):validate_spec(spec)
 if __name__=='__main__': unittest.main()
+
+
+class WrestlingCategoryTests(unittest.TestCase):
+    def test_fight_wrestling_titles_become_wrestling(self):
+        from regular_browser import wrestling_category
+        self.assertEqual(wrestling_category({'category':'fight','title':'AEW Wednesday Night Dynamite'})['category'],'wrestling')
+        self.assertEqual(wrestling_category({'category':'fight','title':'TNA Impact'})['category'],'wrestling')
+        self.assertEqual(wrestling_category({'category':'fight','title':'UFC 320: Ankalaev vs Pereira'})['category'],'fight')
+        self.assertEqual(wrestling_category({'category':'basketball','title':'Raw deal'})['category'],'basketball')
+        from session_planner import validate_spec
+        self.assertEqual(validate_spec({'sports':['wrestling']})['sports'],['wrestling'])

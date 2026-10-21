@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from display_layout import CAPACITIES, plan_layout
 
-SPORTS = {'hockey', 'baseball', 'basketball', 'football', 'american-football', 'rugby', 'tennis', 'cricket', 'motor-sports', 'fight', 'other'}
+SPORTS = {'hockey', 'baseball', 'basketball', 'football', 'american-football', 'rugby', 'tennis', 'cricket', 'motor-sports', 'fight', 'wrestling', 'other'}
 
 
 def validate_spec(spec):
