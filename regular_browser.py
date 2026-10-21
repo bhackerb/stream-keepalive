@@ -482,7 +482,8 @@ class RegularBrowserKeeper:
                 url='https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
                 if url in seen:continue
                 seen.add(url);choices.append(dict(url=url,source=source['source'],number=item['streamNo'],language=str(item.get('language')or'Unknown')[:50],hd=item.get('hd')is True,viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else None,current=url==self.active_streams.get(sid,SimpleNamespace(url=None)).url))
-        return dict(stream_id=sid,choices=choices)
+        # Wrestling games may also switch to a watch-wrestling embed resolved by Mithrandir.
+        return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling')
 
     async def switch_source(self,sid=None,url=None):
         try:options=await asyncio.wait_for(self.player_sources(sid),20)
@@ -492,7 +493,8 @@ class RegularBrowserKeeper:
             try:
                 stream=self.active_streams.get(sid)
                 if not stream or stream.parked or sid in self._releasing or sid in self._ownership_lost:raise ValueError('Choose a visible, owned game with no pending transfer')
-                if not isinstance(url,str)or url not in {c['url']for c in options['choices']}:raise ValueError('Choose an available source from this game')
+                if not isinstance(url,str)or (url not in {c['url']for c in options['choices']} and not (url.startswith('https://dailywrestling.cc/embed/')and options.get('wrestling'))):raise ValueError('Choose an available source from this game')
+                if url.startswith('https://dailywrestling.cc/embed/'):validate_url(url)
                 if url==stream.url:return 'Already using this source'
                 audit=await self.command(stream.browser,'inventory')
                 if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed; source unchanged')
