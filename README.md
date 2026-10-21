@@ -434,3 +434,17 @@ was signed by Mozilla and Ben explicitly approved activation despite incomplete
 independent review on 2026-10-17. Both hosts now target the signed 0.2.2 XPI in
 Firefox policy; Firefox restart and physical playback verification remain pending.
 Physical buffering and custom player controls still need real-world validation.
+
+## Wrestling VODs and live shows (0.2.3, 2026-10-21)
+
+Companion 0.2.3 adds watch-wrestling's public embed host `dailywrestling.cc` and its
+observed player hosts `nightcityv.site` and `limemint.site`. Mithrandir's Streaming page
+lists promotions and shows, ranks sources (full show, quality, provider), confirms
+decoded video and full-show length headlessly, and opens the embed through `/watch`.
+The embed page is already a fullscreen player. Player hosts rotate; a new player domain
+still plays but lacks companion health/audio until added here. Dailymotion/OK.ru
+sources play without companion frame control.
+
+Rollout: `python3 build_companion.py`, upload `build/streamkeeper-firefox.zip` for
+unlisted signing, then `./install_signed_companion.sh <signed.xpi>` and restart
+Firefox on both hosts.
