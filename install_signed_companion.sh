@@ -25,5 +25,8 @@ sudo cp /etc/firefox/policies/policies.json "/etc/firefox/policies/policies.json
 sudo python3 -c "$POLICY" "$HOME/.local/share/StreamKeeper/$NAME"
 ssh "$LAPTOP" mkdir -p .local/share/StreamKeeper
 scp -q "$XPI" "$LAPTOP:.local/share/StreamKeeper/$NAME"
-ssh -t "$LAPTOP" "sudo cp /etc/firefox/policies/policies.json /etc/firefox/policies/policies.json.before-streamkeeper-$VERSION-\$(date +%s) && sudo python3 -c $(printf %q "$POLICY") \$HOME/.local/share/StreamKeeper/$NAME"
+ssh "$LAPTOP" bash -s -- "$VERSION" "$NAME" <<REMOTE
+sudo cp /etc/firefox/policies/policies.json /etc/firefox/policies/policies.json.before-streamkeeper-\$1-\$(date +%s)
+sudo python3 -c $(printf %q "$POLICY") \$HOME/.local/share/StreamKeeper/\$2
+REMOTE
 echo "Installed $NAME on both hosts. Restart Firefox on each to load it (StreamKeeper reattaches owned tabs)."
