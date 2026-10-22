@@ -3,6 +3,8 @@ const api = globalThis.browser || chrome;
 const isFirefox = !!api.runtime.getManifest().browser_specific_settings?.gecko;
 const HOST = 'com.bhackerb.streamkeeper';
 const HOSTS = ['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site'];
+// Player iframes rotate domains, so trust any https frame inside a proven owned tab.
+function frameOk(url) { try { const u=new URL(url); return u.protocol==='https:' && !u.username && !u.password; } catch { return false; } }
 function allowed(url) { try { const u = new URL(url); return u.protocol === 'https:' && !u.username && !u.password && (!u.port || u.port==='443') && HOSTS.some(h => u.hostname === h || u.hostname.endsWith('.'+h)); } catch { return false; } }
 let port, connecting=false;
 const ready = api.storage.local.get('owned').then(v => Object.assign(Object.create(null),v.owned || {}));
@@ -73,7 +75,7 @@ async function audioCommand(r,c) {
   // frame response and cannot prove that the player accepted the settings.
   const volume='volume'in c;
   if(volume && (!Number.isInteger(c.primary_frame_id)||c.primary_frame_id<0))throw Error('Primary video frame required; update the StreamKeeper controller for volume control');
-  const targets=volume?frames.filter(f=>f.frameId===c.primary_frame_id&&allowed(f.url)):frames.filter(f=>allowed(f.url));
+  const targets=volume?frames.filter(f=>f.frameId===c.primary_frame_id&&frameOk(f.url)):frames.filter(f=>frameOk(f.url));
   if(!targets.length)throw Error(volume?'Primary video frame unavailable or unsupported; refresh player status':'No supported player frame');
   if(!await provesTab(await api.tabs.get(r.tabId),r))throw Error('Stream ownership changed before audio update');
   const replies=await Promise.all(targets.map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'audio',audio_revision:(r.audioRevision||0)+1,muted:c.muted,...(volume?{volume:c.volume,primary_only:true}:{})},{frameId:f.frameId})));
@@ -137,7 +139,7 @@ async function command(c) {
     if(!((typeof to==='number'&&Number.isFinite(to)&&to>=0&&delta===undefined)||(typeof delta==='number'&&Number.isFinite(delta)&&Math.abs(delta)<=86400&&to===undefined)))throw Error('Invalid seek');
     const frames=await api.webNavigation.getAllFrames({tabId:r.tabId});
     if(!frames?.length||frames.length>50)throw Error('Player frames unavailable');
-    const replies=await Promise.all(frames.filter(f=>allowed(f.url)).map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'seek',...(to!==undefined?{to}:{delta})},{frameId:f.frameId}).catch(()=>null)));
+    const replies=await Promise.all(frames.filter(f=>frameOk(f.url)).map(f=>api.tabs.sendMessage(r.tabId,{sk:true,op:'seek',...(to!==undefined?{to}:{delta})},{frameId:f.frameId}).catch(()=>null)));
     const best=replies.filter(x=>x?.confirmed===true).sort((a,b)=>b.width*b.height-a.width*a.height)[0];
     if(!best)throw Error('No seekable video (live streams cannot seek)');
     return {confirmed:true,current_time:best.current_time,duration:best.duration};
@@ -160,7 +162,7 @@ function connect() {
   connecting=false;
 }
 api.runtime.onMessage.addListener((m,sender,respond)=>{
-  if(!m?.sk || !sender.tab || !allowed(sender.url || '')) return false;
+  if(!m?.sk || !sender.tab || !frameOk(sender.url || '') || !allowed(sender.tab.url || '')) return false;
   queue=queue.catch(()=>{}).then(async()=>{
     const all=await owned();const entry=Object.entries(all).find(([,r])=>r.tabId===sender.tab.id);
     if(!entry) return {owned:false};
@@ -200,6 +202,15 @@ api.tabs.onUpdated.addListener((tabId,change)=>{
     if(entry && entry[1].audio?.muted!==change.mutedInfo.muted && await provesTab(await api.tabs.get(tabId),entry[1]))await rememberAudio(entry[0],entry[1],{muted:change.mutedInfo.muted});
   });
   if(change.status==='complete')void owned().then(all=>{if(Object.values(all).some(r=>r.tabId===tabId))return scheduleInventory();});
+});
+api.webNavigation.onCompleted.addListener(d=>{
+  // Statically matched hosts already have content.js; inject into rotating player frames of owned tabs only.
+  if(d.frameId===0 || allowed(d.url) || !frameOk(d.url))return;
+  void owned().then(async all=>{
+    const r=Object.values(all).find(x=>x.tabId===d.tabId);if(!r)return;
+    const tab=await api.tabs.get(d.tabId).catch(()=>null);if(!tab || !await provesTab(tab,r))return;
+    await api.scripting.executeScript({target:{tabId:d.tabId,frameIds:[d.frameId]},files:['content.js']}).catch(e=>console.warn('StreamKeeper inject',d.url,e?.message||e));
+  });
 });
 api.alarms.create('bridge-reconnect',{periodInMinutes:1});api.alarms.onAlarm.addListener(()=>{connect();void scheduleInventory();});
 connect();
