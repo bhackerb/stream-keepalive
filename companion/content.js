@@ -4,6 +4,7 @@ let skOwned=false, skFill=false, skEscaped=false, skLastTime=null, skLastFrames=
 // Persist intent in the extension, never infer it from arbitrary volumechange events.
 let skAudio=null, skAudioRevision=0, skAudioGestureUntil=0, skAudioPending=false;
 const skWatched=new WeakSet();
+let skTickPending=false, skWatchPending=false;
 function skPrimary(){return [...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];}
 function skApplyAudio(){
   if(!skOwned || !skAudio || skAudioPending || Date.now()<skAudioGestureUntil)return;
@@ -37,7 +38,12 @@ function skWatchAudio(){
   }
   skApplyAudio();
 }
-if(typeof MutationObserver!=='undefined')new MutationObserver(skWatchAudio).observe(document,{childList:true,subtree:true});
+// Busy player pages mutate constantly. Coalesce scans instead of scanning the
+// entire document for every mutation delivery, including unowned frames.
+if(typeof MutationObserver!=='undefined')new MutationObserver(()=>{
+  if(!skOwned||skWatchPending)return;
+  skWatchPending=true;setTimeout(()=>{skWatchPending=false;skWatchAudio();},200);
+}).observe(document,{childList:true,subtree:true});
 function skRestore(){document.getElementById('streamkeeper-tab-style')?.remove();document.querySelectorAll('[data-sk-tab]').forEach(e=>e.removeAttribute('data-sk-tab'));}
 function skExpand(target){
   if(!target || skEscaped)return;
@@ -87,11 +93,21 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
   respond(true);return false;
 });
 async function skTick(){
+  if(skTickPending)return;
+  skTickPending=true;
   try {
     const videos=[...document.querySelectorAll('video')];const v=videos.sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];
-    const frames=v?.getVideoPlaybackQuality?.().totalVideoFrames ?? v?.webkitDecodedFrameCount ?? null;
+    const quality=v?.getVideoPlaybackQuality?.();
+    const frames=quality?.totalVideoFrames ?? v?.webkitDecodedFrameCount ?? null;
+    let bufferAhead=null,liveDistance=null;
+    if(v){
+      for(let i=0;i<v.buffered.length;i++)if(v.buffered.start(i)<=v.currentTime&&v.currentTime<=v.buffered.end(i)){bufferAhead=Math.max(0,v.buffered.end(i)-v.currentTime);break;}
+      // This is distance to the player's seekable edge, not broadcast latency.
+      if(!Number.isFinite(v.duration)&&v.seekable.length)liveDistance=Math.max(0,v.seekable.end(v.seekable.length-1)-v.currentTime);
+    }
     if(v && skLastTime!==null && v.currentTime>skLastTime && (frames===null || skLastFrames===null || frames>skLastFrames)){skLastProgress=Date.now();skEverProgress=true;}
     const health=v?{state:v.error?'ERROR':v.paused?'PAUSED':skEverProgress&&v.readyState>=2&&Date.now()-skLastProgress<15000?'PLAYING':'LOADING',current_time:v.currentTime,decoded_frames:frames,ready_state:v.readyState,width:v.videoWidth,height:v.videoHeight,duration:Number.isFinite(v.duration)&&v.duration>0?v.duration:null,ended:v.ended&&skEverProgress&&(frames??0)>0,paused:v.paused,muted:v.muted,volume:v.volume,stall_seconds:(Date.now()-skLastProgress)/1000}: {state:'NO_VIDEO'};
+    if(v)Object.assign(health,{dropped_frames:quality?.droppedVideoFrames??v.webkitDroppedFrameCount??null,buffer_ahead_seconds:bufferAhead,live_edge_distance_seconds:liveDistance,playback_rate:v.playbackRate});
     skLastTime=v?.currentTime??null;skLastFrames=frames;
     const reply=await skAPI.runtime.sendMessage({sk:true,op:'health',health});
     skOwned=!!reply?.owned;skFill=!!reply?.fill;
@@ -101,6 +117,6 @@ async function skTick(){
     if(skOwned&&reply?.parked&&v&&!v.paused){if(!skParked)v.dataset.skResume='true';v.pause();skParked=true;}
     if(skOwned&&skFill&&!skEscaped&&v)skExpand(v.closest('.jwplayer,.video-js,.plyr,[data-player]')||v);
     if(!skOwned)skRestore();
-  }catch{}
+  }catch{}finally{skTickPending=false;}
 }
 setInterval(skTick,3000);void skTick();

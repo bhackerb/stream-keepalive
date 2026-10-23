@@ -31,9 +31,10 @@ from display_layout import plan_layout
 from display_probe import probe_displays
 from manual_layout import validate_manual_layout,manual_placements
 from session_planner import build_plan, validate_spec, reserve_sports
+from resource_monitor import ResourceMonitor
 
 log=logging.getLogger('stream-keeper.regular')
-ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site')
+ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv')
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
 PLACEMENT_READY_TIMEOUT=40
@@ -56,7 +57,7 @@ def validate_url(url):
     try:u=urlparse(url)
     except Exception:raise ValueError('Invalid stream URL')
     if u.scheme!='https' or not u.hostname or u.username or u.password or not any(u.hostname==h or u.hostname.endswith('.'+h) for h in ALLOWED_HOSTS):
-        raise ValueError('Regular mode supports HTTPS Streamed/player hosts only')
+        raise ValueError('Regular mode supports allowlisted HTTPS stream/player hosts only')
     return url
 
 def recovery_record(value):
@@ -98,7 +99,10 @@ class CompanionPage:
 class RegularBrowserKeeper:
     def __init__(self,config):
         self.config=config;self.browser_engine=config.get('browser',{}).get('engine','firefox')
-        self.max_streams=config.get('session',{}).get('max_open_streams',max(20,config.get('streams',{}).get('max_streams',10)))
+        self.max_streams=config.get('session',{}).get('max_open_streams',config.get('streams',{}).get('max_streams',10))
+        if type(self.max_streams)is not int or not 1<=self.max_streams<=40:raise ValueError('Stream capacity must be an integer from 1 to 40')
+        self.resources=ResourceMonitor();self._resource_checked=0;self._resource_logged=0
+        self._resource_lock=asyncio.Lock();self._opening_lock=asyncio.Lock()
         self.default_site='streamed';self.active_streams={};self.connections={};self.pending={}
         self.layout_status={'success':False,'message':'No companion connected'}
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
@@ -149,7 +153,9 @@ class RegularBrowserKeeper:
         for key in list(self._frames):
             if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
         health={'state':'DISCONNECTED','resolution':'unknown','current_time':'0','buffered_to':'unknown','audio':'unknown','muted':True,'volume':0,'stall_duration':'0','recovery_count':0}
-        self.active_streams[sid]=SimpleNamespace(id=sid,team=r.get('label',sid),site='streamed',url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
+        host=urlparse(r['url']).hostname or ''
+        site='onhockey.tv'if host=='onhockey.tv'or host.endswith('.onhockey.tv')else 'streamed'
+        self.active_streams[sid]=SimpleNamespace(id=sid,team=r.get('label',sid),site=site,url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
     async def refresh_displays(self):
         self.display_probe=await probe_displays(self.config.get('layout',{}).get('displays',{}),self.config.get('layout',{}).get('backend'))
         self._display_checked=time.time()
@@ -178,6 +184,7 @@ class RegularBrowserKeeper:
             return {'success':True,'message':'Local viewing and keepalive settings saved',**self.extra_status()}
     async def start_browser(self):
         self._client=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+        await self.refresh_resources()
         await self.refresh_displays()
         self._task=asyncio.create_task(self._loop())
     async def shutdown(self):
@@ -280,6 +287,11 @@ class RegularBrowserKeeper:
             if primary:
                 audio=primary[1][1]
                 s.health_monitor.stats.update(muted=bool(audio.get('muted',True)),volume=audio.get('volume',0))
+                # Optional 0.2.6 telemetry comes from the largest fresh video,
+                # never from a small PLAYING advertisement in another frame.
+                for field in ('decoded_frames','dropped_frames','buffer_ahead_seconds','live_edge_distance_seconds','playback_rate'):
+                    value=audio.get(field)
+                    s.health_monitor.stats[field]=round(value,3)if type(value)in(int,float)and math.isfinite(value)and value>=0 else None
     async def command(self,browser,op,**args):
         ws=self.connections.get(browser)
         if not ws or ws.closed or not self._browser_ready.get(browser):raise ValueError(f'Install/connect the StreamKeeper companion in regular {browser} first')
@@ -292,13 +304,35 @@ class RegularBrowserKeeper:
         if not s:raise ValueError('Stream not found')
         return await self.command(s.browser,op,stream_id=sid,**args)
     def _find_stream(self,sid):return self.active_streams.get(sid)
+    async def refresh_resources(self):
+        async with self._resource_lock:
+            now=time.monotonic()
+            if self._resource_checked and now-self._resource_checked<5:return self.resources.snapshot
+            snapshot=await asyncio.to_thread(self.resources.sample)
+            self._resource_checked=now
+            if now-self._resource_logged>=60:
+                log.info('Resource sample: %s',json.dumps(snapshot,allow_nan=False))
+                self._resource_logged=now
+            return snapshot
+    async def _check_open_resources(self):
+        if len(self.active_streams)>=self.max_streams:raise ValueError('Stream capacity reached; existing streams preserved')
+        await self._check_memory()
+    async def _check_memory(self):
+        snapshot=await self.refresh_resources()
+        if self.config.get('session',{}).get('memory_guard',True)and snapshot['state']!='ok':
+            raise ValueError('New streams deferred: '+snapshot['message']+'; existing streams preserved')
     async def _open(self,sid,url,label,browser,session_id=None,allow_replacement=False):
-        if sid in self.active_streams:return
-        validate_url(url)
-        record=await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement)
-        self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id));self._save()
-        if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
-            self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
+        async with self._opening_lock:
+            if sid in self.active_streams:return
+            validate_url(url)
+            host=urlparse(url).hostname or ''
+            if (host=='onhockey.tv'or host.endswith('.onhockey.tv'))and 'onhockey-v1'not in self._companion_info.get(browser,{}).get('capabilities',[]):
+                raise ValueError('OnHockey needs signed companion 0.2.6 or later; existing streams preserved')
+            await self._check_open_resources()
+            record=await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement)
+            self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id));self._save()
+            if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
+                self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
     async def watch_url(self,url,label=None):
         try:
             if len(self.active_streams)>=self.max_streams:raise ValueError('Stream capacity reached')
@@ -496,6 +530,7 @@ class RegularBrowserKeeper:
                 if not isinstance(url,str)or (url not in {c['url']for c in options['choices']} and not (url.startswith('https://dailywrestling.cc/embed/')and options.get('wrestling'))):raise ValueError('Choose an available source from this game')
                 if url.startswith('https://dailywrestling.cc/embed/'):validate_url(url)
                 if url==stream.url:return 'Already using this source'
+                await self._check_memory()
                 audit=await self.command(stream.browser,'inventory')
                 if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed; source unchanged')
                 if self.active_streams.get(sid)is not stream:raise ValueError('Game changed while loading sources')
@@ -685,7 +720,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
+        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
     async def _json(self,path):
         async with self._client.get('https://streamed.pk/api/'+path) as res:
             res.raise_for_status();value=await res.json()
@@ -763,6 +798,8 @@ class RegularBrowserKeeper:
             else:self._end_seen.pop(sid,None)
     async def _reconcile(self,plan,allow_replacements=False):
         if not self.session:return
+        try:await self._check_memory()
+        except ValueError as exc:self.errors=[str(exc)];return
         await self.refresh_displays()
         self._displays() # Block new opens/parking when live display evidence is unknown.
         if self.local_keepalive.get('enabled'):return # Explicit local selection owns ongoing care until disabled.
@@ -870,6 +907,7 @@ class RegularBrowserKeeper:
             protected=self.local_keepalive.get('stream_id')if self.local_keepalive.get('enabled')else None
             if protected and protected not in releases and protected not in {a['game_id']for a in layout['assignments']}:raise ValueError('Selected local keepalive stream must retain its assignment or receive an explicit release')
             if type(body.get('reset_suppression',False))is not bool or(body.get('reset_suppression')and not group):raise ValueError('Invalid suppression reset')
+            await self._check_memory() # Before releases, parking, or committing a new layout.
             if body.get('reset_suppression')and group not in self._group_epochs:self.suppressed.difference_update(r['id']for r in plan['live']+plan['pending'])
             # Commit the new desired layout before a potentially delayed close, so
             # the old local loop cannot reopen departing games after an API timeout.
@@ -894,6 +932,8 @@ class RegularBrowserKeeper:
             return {'success':True,'message':'Manual layout scheduled; future games keep their assigned slots','plan':plan,'errors':self.errors,'placement_pending':bool(self.layout_status.get('pending')),'layout':layout}
 
     async def _reconcile_manual(self,plan,allow_replacements=False,replacement_ids=None):
+        try:await self._check_memory()
+        except ValueError as exc:self.errors=[str(exc)];return
         await self.refresh_displays()
         self._displays()
         validate_manual_layout(self.manual_layout,self._displays()) # Validate before any browser mutations.
@@ -967,6 +1007,8 @@ class RegularBrowserKeeper:
     async def _recover_no_video(self,plan):
         # Called under the same lock as layout/stop. One action per minute tick,
         # one refresh and at most two alternate players per match, across restarts.
+        try:await self._check_memory()
+        except ValueError as exc:self.errors=[str(exc)];return
         live={r['id']:r for r in plan['live']}
         if self.local_keepalive.get('enabled'):return
         for sid,record in list(self._recovery.items()):
@@ -1060,6 +1102,8 @@ class RegularBrowserKeeper:
         """
         if not self.local_keepalive.get('enabled'):return
         sid=self.local_keepalive.get('stream_id');stream=self.active_streams.get(sid);care=self._local_care;now=time.time()
+        try:await self._check_memory()
+        except ValueError as exc:care.update(state='memory-pressure',message=str(exc));return
         if not stream or sid in self.suppressed|self._ownership_lost|self._releasing:
             care.update(state='inactive',message='Selected stream closed or ownership unavailable; no reopen permitted');return
         if not self._browser_ready.get(stream.browser):
@@ -1108,6 +1152,7 @@ class RegularBrowserKeeper:
     async def _loop(self):
         while True:
             await asyncio.sleep(10)
+            await self.refresh_resources()
             async with self._lock:
                 # Drop evidence only for departed streams; active stale frames still block recovery.
                 for key in [k for k in self._frames if k[0]not in self.active_streams]:del self._frames[key]

@@ -1,5 +1,8 @@
 # StreamKeeper 🏒📺
 
+For the October 22 laptop memory investigation, memory guards, diagnostics,
+companion 0.2.6 metrics, and alternative-source playback, see [PERFORMANCE.md](PERFORMANCE.md).
+
 **A Mithrandir agent for keeping sports streams alive.**
 
 StreamKeeper is a Playwright-based Python automation tool that navigates to your game stream, blocks ads, monitors stream health (video stalls, audio dropout, crashes), and auto-recovers — all controllable via Discord.

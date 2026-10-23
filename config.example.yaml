@@ -144,6 +144,7 @@ logging:
 
 # Regular-browser session controls (no special browser profiles).
 session:
-  max_open_streams: 20  # includes parked windows; TV/dock visible limits stay 4/10
+  max_open_streams: 10  # includes parked windows; defaults to streams.max_streams
+  memory_guard: true  # defer new windows when RAM/PSI/browser memory exceeds safe headroom
   start_muted: true
   state_file: regular-session.json

@@ -2,7 +2,7 @@
 const api = globalThis.browser || chrome;
 const isFirefox = !!api.runtime.getManifest().browser_specific_settings?.gecko;
 const HOST = 'com.bhackerb.streamkeeper';
-const HOSTS = ['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site'];
+const HOSTS = ['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv'];
 // Player iframes rotate domains, so trust any https frame inside a proven owned tab.
 function frameOk(url) { try { const u=new URL(url); return u.protocol==='https:' && !u.username && !u.password; } catch { return false; } }
 function allowed(url) { try { const u = new URL(url); return u.protocol === 'https:' && !u.username && !u.password && (!u.port || u.port==='443') && HOSTS.some(h => u.hostname === h || u.hostname.endsWith('.'+h)); } catch { return false; } }
@@ -156,7 +156,7 @@ function connect() {
       queue=queue.catch(()=>{}).then(async()=>{try {await send({id:c.id,result:await command(c)});} catch(e){await send({id:c.id,error:String(e.message||e)});}});
     });
     port.onDisconnect.addListener(()=>{console.warn('StreamKeeper native bridge:',api.runtime.lastError?.message || 'disconnected');port=null;connecting=false;setTimeout(connect,5000);});
-    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1','seek-v1']});
+    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1','seek-v1','playback-metrics-v1','onhockey-v1']});
     void scheduleInventory();
   } catch { port=null;setTimeout(connect,5000); }
   connecting=false;

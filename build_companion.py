@@ -2,7 +2,7 @@
 import base64, hashlib, json, shutil, subprocess, tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
-HOSTS=['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site']
+HOSTS=['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv']
 def extension_id(key):
     digest=hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
     return ''.join(chr(ord('a')+int(c,16)) for c in digest)
@@ -15,7 +15,7 @@ def build():
             public=subprocess.check_output(['openssl','rsa','-in',str(private),'-pubout','-outform','DER'],stderr=subprocess.DEVNULL)
             keyfile.write_text(base64.b64encode(public).decode()+'\n')
     key=keyfile.read_text().strip()
-    base={'manifest_version':3,'name':'StreamKeeper Companion','version':'0.2.5','description':'Control only StreamKeeper-owned sports and wrestling windows in your regular browser.',
+    base={'manifest_version':3,'name':'StreamKeeper Companion','version':'0.2.6','description':'Control only StreamKeeper-owned sports and wrestling windows in your regular browser.',
           'permissions':['nativeMessaging','storage','tabs','alarms','webNavigation','scripting'],
           'host_permissions':['https://*/*'],
           'content_scripts':[{'matches':[f'https://*.{h}/*' for h in HOSTS],'js':['content.js'],'all_frames':True,'run_at':'document_idle'}]}
