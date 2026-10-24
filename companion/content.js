@@ -5,6 +5,18 @@ let skOwned=false, skFill=false, skEscaped=false, skLastTime=null, skLastFrames=
 let skAudio=null, skAudioRevision=0, skAudioGestureUntil=0, skAudioPending=false;
 const skWatched=new WeakSet();
 let skTickPending=false, skWatchPending=false;
+// Each owned frame hides its idle pointer, including iframe player surfaces.
+let skPointerMoved=Date.now();
+function skShowPointer(){document.getElementById('streamkeeper-cursor-style')?.remove();}
+function skPointerActivity(){skPointerMoved=Date.now();skShowPointer();}
+for(const type of ['pointermove','pointerdown','keydown'])document.addEventListener(type,skPointerActivity,true);
+function skUpdatePointer(reply,v){
+  if(!skOwned||!skFill||skEscaped||reply?.parked||v?.paused||v?.ended||Date.now()-skPointerMoved<3000){skShowPointer();return;}
+  if(document.getElementById('streamkeeper-cursor-style'))return;
+  const parent=document.head||document.documentElement;if(!parent)return;
+  const style=document.createElement('style');style.id='streamkeeper-cursor-style';
+  style.textContent='html,body,body *{cursor:none!important}';parent.append(style);
+}
 function skPrimary(){return [...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];}
 function skApplyAudio(){
   if(!skOwned || !skAudio || skAudioPending || Date.now()<skAudioGestureUntil)return;
@@ -55,7 +67,7 @@ function skExpand(target){
   for(let e=target.parentElement;e;e=e.parentElement)e.dataset.skTab='ancestor';target.dataset.skTab='player';
 
 }
-document.addEventListener('keydown',e=>{if(e.key==='Escape'){skEscaped=true;skRestore();if(skOwned)void skAPI.runtime.sendMessage({sk:true,op:'escape'}).catch(()=>{});}},true);
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){skEscaped=true;skShowPointer();skRestore();if(skOwned)void skAPI.runtime.sendMessage({sk:true,op:'escape'}).catch(()=>{});}},true);
 skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
   if(!m?.sk)return false;
   if(m.op==='audio'){
@@ -111,12 +123,13 @@ async function skTick(){
     skLastTime=v?.currentTime??null;skLastFrames=frames;
     const reply=await skAPI.runtime.sendMessage({sk:true,op:'health',health});
     skOwned=!!reply?.owned;skFill=!!reply?.fill;
+    skUpdatePointer(reply,v);
     if(reply?.audio&&!skAudioPending&&reply.audio_revision>=skAudioRevision){skAudio=reply.audio;skAudioRevision=reply.audio_revision;}
     skWatchAudio();
     if(skOwned&&reply?.autoplay&&v&&!skStarted&&!reply.parked){skStarted=true;if(!skAudio&&reply.start_muted)v.muted=true;void v.play().catch(()=>{});}
     if(skOwned&&reply?.parked&&v&&!v.paused){if(!skParked)v.dataset.skResume='true';v.pause();skParked=true;}
     if(skOwned&&skFill&&!skEscaped&&v)skExpand(v.closest('.jwplayer,.video-js,.plyr,[data-player]')||v);
     if(!skOwned)skRestore();
-  }catch{}finally{skTickPending=false;}
+  }catch{skShowPointer();}finally{skTickPending=false;}
 }
 setInterval(skTick,3000);void skTick();

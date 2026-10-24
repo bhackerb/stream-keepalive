@@ -1,5 +1,13 @@
 # StreamKeeper 🏒📺
 
+Companion 0.2.7 adds idle cursor hiding in owned, filled stream frames on both
+devices. After three seconds without input, the pointer hides; moving it or
+pressing Escape restores it. Parked, paused, ended, unowned and disconnected
+frames restore the pointer. Personal tabs are unaffected. Build with
+`python3 build_companion.py`; `build/streamkeeper-firefox.zip` requires Mozilla
+unlisted signing before permanent installation on either device. This source
+change does not update an already installed signed companion.
+
 For the October 22 laptop memory investigation, memory guards, diagnostics,
 companion 0.2.6 metrics, and alternative-source playback, see [PERFORMANCE.md](PERFORMANCE.md).
 

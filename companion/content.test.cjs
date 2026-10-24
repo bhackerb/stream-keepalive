@@ -1,7 +1,26 @@
 const test=require('node:test');const assert=require('node:assert/strict');const vm=require('node:vm');const fs=require('node:fs');
+test('idle cursor hides only in owned filled frames and returns on movement, Escape, parking or disconnect',async()=>{
+ let tick,now=0,reply={owned:true,fill:true},style=null;const events={};
+ const document={head:{append:s=>{style=s;}},createElement:()=>({remove(){style=null;}}),
+  getElementById:id=>id==='streamkeeper-cursor-style'?style:null,querySelectorAll:()=>[],
+  addEventListener:(name,fn)=>{(events[name]??=[]).push(fn);}};
+ const api={runtime:{onMessage:{addListener:()=>{}},sendMessage:async()=>reply}};
+ vm.runInNewContext(fs.readFileSync(__dirname+'/content.js','utf8'),{browser:api,document,window:{},Date:{now:()=>now},setInterval:f=>{tick=f;}});
+ await new Promise(setImmediate);assert.equal(style,null);
+ now=3000;await tick();assert.match(style.textContent,/cursor:none/);
+ events.pointermove.forEach(f=>f({}));assert.equal(style,null);
+ now=6000;await tick();assert.ok(style);
+ reply.parked=true;await tick();assert.equal(style,null);
+ reply.parked=false;await tick();assert.ok(style);
+ reply.owned=false;await tick();assert.equal(style,null);
+ reply.owned=true;reply.fill=false;await tick();assert.equal(style,null);
+ reply.fill=true;await tick();assert.ok(style);
+ events.keydown.forEach(f=>f({key:'Escape'}));assert.equal(style,null);
+ now=9000;await tick();assert.equal(style,null);
+});
 async function content(owned,extra=[]){
  let listener;
- const video={muted:true,volume:1,paused:false,currentTime:1,videoWidth:1280,videoHeight:720,readyState:4,getVideoPlaybackQuality:()=>({totalVideoFrames:10})};
+ const video={muted:true,volume:1,paused:false,currentTime:1,videoWidth:1280,videoHeight:720,readyState:4,buffered:{length:0},seekable:{length:0},getVideoPlaybackQuality:()=>({totalVideoFrames:10})};
  const api={runtime:{onMessage:{addListener:f=>{listener=f;}},sendMessage:async()=>({owned,fill:false})}};
  const document={addEventListener:()=>{},querySelectorAll:s=>s==='video'||s==='video,audio'?[video,...extra]:[],getElementById:()=>null};
  vm.runInNewContext(fs.readFileSync(__dirname+'/content.js','utf8'),{browser:api,document,window:{},setInterval:()=>{},Date});
@@ -37,7 +56,7 @@ test('primary volume without decoded video fails before any media mutation',asyn
 
 async function sticky(owned=true,audio={muted:false,volume:.3}){
  const events={},messages=[];let tick,listener,revision=2;
- const makeVideo=()=>{const callbacks={};return {muted:true,volume:1,controls:true,tagName:'VIDEO',getAttribute:()=>null,paused:false,currentTime:1,videoWidth:1280,videoHeight:720,readyState:4,play:async()=>{},getVideoPlaybackQuality:()=>({totalVideoFrames:10}),addEventListener:(k,f)=>{callbacks[k]=f;},fire:k=>callbacks[k]?.()};};
+ const makeVideo=()=>{const callbacks={};return {muted:true,volume:1,controls:true,tagName:'VIDEO',getAttribute:()=>null,paused:false,currentTime:1,videoWidth:1280,videoHeight:720,readyState:4,buffered:{length:0},seekable:{length:0},play:async()=>{},getVideoPlaybackQuality:()=>({totalVideoFrames:10}),addEventListener:(k,f)=>{callbacks[k]=f;},fire:k=>callbacks[k]?.()};};
  let video=makeVideo();
  const document={addEventListener:(k,f)=>{events[k]=f;},querySelectorAll:s=>s==='video'||s==='video,audio'?[video]:[],getElementById:()=>null};
  const api={runtime:{onMessage:{addListener:f=>{listener=f;}},sendMessage:async m=>{messages.push(m);if(m.op==='audio_intent'){audio=m.audio;revision++;}return {owned,fill:false,autoplay:true,start_muted:true,parked:false,audio,audio_revision:revision};}}};
