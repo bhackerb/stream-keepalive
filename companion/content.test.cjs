@@ -1,4 +1,16 @@
 const test=require('node:test');const assert=require('node:assert/strict');const vm=require('node:vm');const fs=require('node:fs');
+test('external MLB source selection waits for video and only clicks once in an owned exact-host top frame',async()=>{
+ for(const [owned,hostname,expected]of [[true,'roxiestreams.su',1],[false,'roxiestreams.su',0],[true,'roxiestreams.su.evil.example',0]]){
+  let tick,video=null,clicks=0;const window={};window.top=window;
+  const button={textContent:'Stream 2',click:()=>{clicks++;setImmediate(()=>{video={...video,muted:false,volume:1};});}};
+  const document={addEventListener:()=>{},getElementById:()=>null,querySelectorAll:s=>s==='button'?[button]:s==='video'&&video?[video]:[]};
+  const api={runtime:{onMessage:{addListener:()=>{}},sendMessage:async()=>({owned,fill:false,audio:{muted:true,volume:.4},audio_revision:0})}};
+  vm.runInNewContext(fs.readFileSync(__dirname+'/content.js','utf8'),{browser:api,document,window,URL,location:{hostname,href:'https://'+hostname+'/mlb-streams-1?sk-source=2'},Date,setImmediate,setInterval:f=>{tick=f;}});
+  await new Promise(setImmediate);assert.equal(clicks,0);
+  video={paused:false,currentTime:1,videoWidth:1280,videoHeight:720,readyState:4,buffered:{length:0},seekable:{length:0}};
+  await tick();await new Promise(setImmediate);await tick();assert.equal(clicks,expected);if(owned&&expected){assert.equal(video.muted,true);assert.equal(video.volume,.4);}
+ }
+});
 test('idle cursor hides only in owned filled frames and returns on movement, Escape, parking or disconnect',async()=>{
  let tick,now=0,reply={owned:true,fill:true},style=null;const events={};
  const document={head:{append:s=>{style=s;}},createElement:()=>({remove(){style=null;}}),

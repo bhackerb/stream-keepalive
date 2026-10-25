@@ -32,9 +32,10 @@ from display_probe import probe_displays
 from manual_layout import validate_manual_layout,manual_placements
 from session_planner import build_plan, validate_spec, reserve_sports
 from resource_monitor import ResourceMonitor
+from external_sports_sources import baseball_choices, ROXIE_HOST, ROXIE_CAPABILITY, ROXIE_URLS
 
 log=logging.getLogger('stream-keeper.regular')
-ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv')
+ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv',ROXIE_HOST)
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
 PLACEMENT_READY_TIMEOUT=40
@@ -58,6 +59,8 @@ def validate_url(url):
     except Exception:raise ValueError('Invalid stream URL')
     if u.scheme!='https' or not u.hostname or u.username or u.password or not any(u.hostname==h or u.hostname.endswith('.'+h) for h in ALLOWED_HOSTS):
         raise ValueError('Regular mode supports allowlisted HTTPS stream/player hosts only')
+    if (u.hostname==ROXIE_HOST or u.hostname.endswith('.'+ROXIE_HOST)) and url not in ROXIE_URLS:
+        raise ValueError('Choose a listed MLB channel source')
     return url
 
 def recovery_record(value):
@@ -154,7 +157,7 @@ class RegularBrowserKeeper:
             if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
         health={'state':'DISCONNECTED','resolution':'unknown','current_time':'0','buffered_to':'unknown','audio':'unknown','muted':True,'volume':0,'stall_duration':'0','recovery_count':0}
         host=urlparse(r['url']).hostname or ''
-        site='onhockey.tv'if host=='onhockey.tv'or host.endswith('.onhockey.tv')else 'streamed'
+        site='onhockey.tv'if host=='onhockey.tv'or host.endswith('.onhockey.tv')else 'roxiestreams'if host==ROXIE_HOST or host.endswith('.'+ROXIE_HOST)else 'streamed'
         self.active_streams[sid]=SimpleNamespace(id=sid,team=r.get('label',sid),site=site,url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
     async def refresh_displays(self):
         self.display_probe=await probe_displays(self.config.get('layout',{}).get('displays',{}),self.config.get('layout',{}).get('backend'))
@@ -326,6 +329,10 @@ class RegularBrowserKeeper:
             if sid in self.active_streams:return
             validate_url(url)
             host=urlparse(url).hostname or ''
+            if host==ROXIE_HOST and self._recovery.get(sid,{}).get('url')!=url:
+                raise ValueError('Choose RoxieStreams through Change source on an active baseball game')
+            if (host==ROXIE_HOST or host.endswith('.'+ROXIE_HOST)) and ROXIE_CAPABILITY not in self._companion_info.get(browser,{}).get('capabilities',[]):
+                raise ValueError('RoxieStreams needs signed companion 0.2.8 or later; existing streams preserved')
             if (host=='onhockey.tv'or host.endswith('.onhockey.tv'))and 'onhockey-v1'not in self._companion_info.get(browser,{}).get('capabilities',[]):
                 raise ValueError('OnHockey needs signed companion 0.2.6 or later; existing streams preserved')
             await self._check_open_resources()
@@ -335,6 +342,7 @@ class RegularBrowserKeeper:
                 self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
     async def watch_url(self,url,label=None):
         try:
+            if (urlparse(url).hostname==ROXIE_HOST or (urlparse(url).hostname or '').endswith('.'+ROXIE_HOST)):raise ValueError('Choose RoxieStreams through Change source on an active baseball game')
             if len(self.active_streams)>=self.max_streams:raise ValueError('Stream capacity reached')
             await self._open('manual-'+uuid.uuid4().hex[:12],url,label or 'Stream',self.browser_engine)
             return 'Stream window opened in your regular browser; playback may need a click'
@@ -516,8 +524,12 @@ class RegularBrowserKeeper:
                 url='https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
                 if url in seen:continue
                 seen.add(url);choices.append(dict(url=url,source=source['source'],number=item['streamNo'],language=str(item.get('language')or'Unknown')[:50],hd=item.get('hd')is True,viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else None,current=url==self.active_streams.get(sid,SimpleNamespace(url=None)).url))
-        # Wrestling games may also switch to a watch-wrestling embed resolved by Mithrandir.
-        return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling')
+        stream=self.active_streams.get(sid)
+        if stream and row.get('category')=='baseball':
+            choices.extend(baseball_choices(row.get('category'),stream.url,self._companion_info.get(stream.browser,{}).get('capabilities',[])))
+        # External MLB channels are manual choices, not guaranteed exact-match feeds.
+        note='RoxieStreams offers live MLB channels; confirm the matchup after switching. Requires signed companion 0.2.8.' if row.get('category')=='baseball' else None
+        return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling',note=note)
 
     async def switch_source(self,sid=None,url=None):
         try:options=await asyncio.wait_for(self.player_sources(sid),20)
@@ -528,6 +540,8 @@ class RegularBrowserKeeper:
                 stream=self.active_streams.get(sid)
                 if not stream or stream.parked or sid in self._releasing or sid in self._ownership_lost:raise ValueError('Choose a visible, owned game with no pending transfer')
                 if not isinstance(url,str)or (url not in {c['url']for c in options['choices']} and not (url.startswith('https://dailywrestling.cc/embed/')and options.get('wrestling'))):raise ValueError('Choose an available source from this game')
+                if any(c['url']==url and c.get('available') is False for c in options['choices']):raise ValueError('Install signed companion 0.2.8 before choosing RoxieStreams; existing stream preserved')
+                if urlparse(url).hostname==ROXIE_HOST and ROXIE_CAPABILITY not in self._companion_info.get(stream.browser,{}).get('capabilities',[]):raise ValueError('Install signed companion 0.2.8 before choosing RoxieStreams; existing stream preserved')
                 if url.startswith('https://dailywrestling.cc/embed/'):validate_url(url)
                 if url==stream.url:return 'Already using this source'
                 await self._check_memory()

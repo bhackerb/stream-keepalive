@@ -72,6 +72,39 @@ class SourcePickerTests(unittest.IsolatedAsyncioTestCase):
         r=await self.k.player_sources('game')
         self.assertEqual(len(r['choices']),2);self.assertTrue(r['choices'][0]['current']);self.assertFalse(r['choices'][1]['current'])
         self.assertEqual([c.args[0]for c in self.k._json.call_args_list],['matches/all','stream/golf/provider-game'])
+    async def test_external_mlb_choices_are_manual_channels_and_require_capability(self):
+        self.k.player_sources=RegularBrowserKeeper.player_sources.__get__(self.k)
+        self.k._json=AsyncMock(return_value=[{'id':'game','category':'baseball','sources':[]}])
+        options=await self.k.player_sources('game')
+        self.assertEqual(len(options['choices']),2)
+        self.assertTrue(all(c['available'] is False for c in options['choices']))
+        self.assertIn('confirm the matchup',options['note'])
+        result=await self.k.switch_source('game',options['choices'][1]['url'])
+        self.assertIn('0.2.8',result);self.k.command.assert_not_awaited()
+        self.k._companion_info={'firefox':{'capabilities':['external-baseball-v1']}}
+        options=await self.k.player_sources('game');self.assertTrue(all(c['available'] for c in options['choices']))
+        target=options['choices'][1]['url']
+        result=await self.k.switch_source('game',target)
+        self.assertNotIn('❌',result);self.assertEqual(self.k.active_streams['game'].url,target)
+        self.assertEqual([c.args[1] for c in self.k.command.call_args_list],['inventory','close','inventory','open'])
+        self.k._place.assert_awaited_once()
+
+    async def test_external_choices_never_leak_to_other_sports_or_accept_unlisted_urls(self):
+        self.k.player_sources=RegularBrowserKeeper.player_sources.__get__(self.k)
+        self.k._json=AsyncMock(return_value=[{'id':'game','category':'hockey','sources':[]}])
+        self.assertEqual((await self.k.player_sources('game'))['choices'],[])
+        self.k._json=AsyncMock(return_value=[{'id':'game','category':'baseball','sources':[]}])
+        self.k._companion_info={'firefox':{'capabilities':['external-baseball-v1']}}
+        result=await self.k.switch_source('game','https://roxiestreams.su/mlb-streams-1?sk-source=3')
+        self.assertIn('❌',result);self.k.command.assert_not_awaited()
+
+    async def test_roxie_generic_open_and_unlisted_paths_are_rejected(self):
+        self.k._companion_info={'firefox':{'capabilities':['external-baseball-v1']}}
+        self.assertIn('Change source',await self.k.watch_url('https://roxiestreams.su/mlb-streams-1?sk-source=1'))
+        for url in ('https://roxiestreams.su/mlb-streams-1?sk-source=1','https://roxiestreams.su/other','https://sub.roxiestreams.su/mlb-streams-1?sk-source=1'):
+            with self.assertRaises(ValueError):await self.k._open('new',url,'Hockey','firefox')
+        self.k.command.assert_not_awaited()
+
     async def test_api_game_sources_and_switch_are_authenticated_and_scoped(self):
         api=StreamKeeperAPI(self.k,self.k.config)
         client=TestClient(TestServer(api.app));await client.start_server()

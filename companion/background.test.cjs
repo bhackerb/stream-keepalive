@@ -5,7 +5,7 @@ async function harness(local={},session={},engine='firefox'){
  const port={postMessage:m=>sent.push(m),onMessage:event(),onDisconnect:event()};
  const store=data=>({get:async k=>({[k]:data[k]}),set:async v=>Object.assign(data,v)});
  const tabValues={};
- const api={sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',...(engine==='firefox'?{browser_specific_settings:{gecko:{id:'fixture'}}}:{})}),onMessage:event()},
+ const api={webNavigation:{onCompleted:event(),getAllFrames:async()=>[]},scripting:{executeScript:async()=>[]},sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',...(engine==='firefox'?{browser_specific_settings:{gecko:{id:'fixture'}}}:{})}),onMessage:event()},
   tabs:{update:async(id,value)=>{tabs.get(id).mutedInfo={muted:value.muted,reason:'extension'};},get:async id=>{if(!tabs.has(id))throw Error('missing');return tabs.get(id);},query:async q=>{if(!q?.url)throw Error('Personal tab scan forbidden');return [...tabs.values()].filter(t=>t.url.startsWith(q.url.slice(0,-1)));},remove:async id=>{removed.push(id);tabs.delete(id);},sendMessage:async()=>true,reload:async()=>{throw Error('Unexpected reload');},onRemoved:event(),onUpdated:event()},
   windows:{update:async()=>{},create:async v=>{const id=next++;const tab={id,url:v.url,windowId:id};tabs.set(id,tab);return {id,tabs:[tab]};}},alarms:{create:()=>{},onAlarm:event()}};
  vm.runInNewContext(fs.readFileSync(__dirname+'/background.js','utf8'),{browser:api,console,setTimeout:()=>{},URL,Date,Promise,crypto:require('node:crypto').webcrypto});
@@ -14,6 +14,12 @@ async function harness(local={},session={},engine='firefox'){
  async function message(m,sender){let reply;api.runtime.onMessage.fire({sk:true,...m},sender,r=>{reply=r;});await settle();return reply;}
  return {sent,tabs,removed,command,api,local,port,settle,message};
 }
+test('external baseball advertises capability and permits only the exact allowlisted host',async()=>{
+ const h=await harness();assert.ok(h.sent.find(m=>m.event==='hello').capabilities.includes('external-baseball-v1'));
+ assert.ok((await h.command('open',{stream_id:'game',url:'https://roxiestreams.su/mlb-streams-1?sk-source=2'})).result);
+ assert.ok((await h.command('open',{stream_id:'other',url:'https://roxiestreams.su.evil.example/mlb-streams-1'})).error);
+ assert.equal(h.tabs.get(1).url,'https://personal.example/');
+});
 test('open is idempotent, unknown eval denied, only owned tab closes',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
  assert.equal(h.tabs.size,2);assert.match((await h.command('eval',{stream_id:'game',code:'document.cookie'})).error,/Unsupported/);
@@ -103,7 +109,7 @@ test('health from an allowlisted child of a navigated unowned tab is refused',as
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
  h.tabs.get(10).url='https://personal.example/';
  let reply;h.api.runtime.onMessage.fire({sk:true,op:'health',health:{state:'PLAYING'}},{tab:h.tabs.get(10),url:'https://embed.st/embed/game',frameId:2},r=>{reply=r;});await h.settle();
- assert.equal(reply.owned,false);assert.equal(h.sent.filter(m=>m.event==='health').length,0);
+ assert.equal(reply,undefined);assert.equal(h.sent.filter(m=>m.event==='health').length,0); // Unowned top-level origin is dropped before dispatch.
 });
 
 test('legacy volume payload without primary target fails before mutating media',async()=>{
@@ -145,7 +151,7 @@ test('primary volume ignores unrelated unsupported embeds but targets only suppo
 });
 test('missing unsupported invalid primary frame and ownership loss fail before audio mutation',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
- h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:3,url:'https://unsupported.example/video'}]};
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:3,url:'http://unsupported.example/video'}]};
  let mutations=0;h.api.tabs.sendMessage=async()=>{mutations++;return true;};h.api.tabs.update=async()=>{mutations++;};
  for(const frame of [undefined,-1,true,99,3])assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:frame})).error);
  h.tabs.get(10).url='https://personal.example/';assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:0})).error);
@@ -182,7 +188,7 @@ test('only proven current-frame manual intent changes durable preference; stale 
  assert.equal(reply.audio.volume,.4);assert.equal(reply.audio_revision,1);
  await h.message({op:'health',health:{muted:true,volume:1}},sender);assert.equal(h.local.owned.game.audio.volume,.4);
  await h.message({op:'audio_intent',revision:1,audio:{muted:true}}, {...sender,frameId:3});assert.equal(h.local.owned.game.audio.muted,false);
- h.tabs.get(10).url='https://personal.example/';assert.equal((await h.message({op:'audio_intent',revision:1,audio:{muted:true}},sender)).owned,false);
+ h.tabs.get(10).url='https://personal.example/';assert.equal(await h.message({op:'audio_intent',revision:1,audio:{muted:true}},sender),undefined);assert.equal(h.local.owned.game.audio.muted,false);
 });
 test('browser UI mute is saved while extension tab updates cannot replace manual intent',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
@@ -194,4 +200,10 @@ test('browser unmute with omitted reason is remembered; matching programmatic st
  h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false}});await h.settle();assert.equal(h.local.owned.game.audio.muted,false);
  const revision=h.local.owned.game.audioRevision;
  h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false}});await h.settle();assert.equal(h.local.owned.game.audioRevision,revision);
+});
+
+test('external MLB opens reject other paths and subdomains without creating tabs',async()=>{
+ const h=await harness();
+ for(const url of ['https://roxiestreams.su/other','https://sub.roxiestreams.su/mlb-streams-1?sk-source=1','https://roxiestreams.su/mlb-streams-1?sk-source=3'])assert.ok((await h.command('open',{stream_id:'new',url})).error);
+ assert.equal(h.local.owned?.new,undefined);
 });

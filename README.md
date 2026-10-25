@@ -1,5 +1,15 @@
 # StreamKeeper 🏒📺
 
+Companion 0.2.8 adds explicit RoxieStreams MLB main/alternate channel choices.
+They appear only for baseball in Change source, retain the existing game ID and
+display slot, and require `external-baseball-v1` before the current player can be
+closed. Older companions show disabled upgrade-required options. These are MLB
+channels: confirm the matchup after switching; no exact-game match or sustained
+playback guarantee is implied. Automatic recovery does not use these channels.
+Build with `python3 build_companion.py`, Mozilla-sign the generated ZIP, then
+install the signed XPI on both devices. Native controller and portal updates are
+also required. The source-selection script acts only on owned RoxieStreams tabs.
+
 Companion 0.2.7 adds idle cursor hiding in owned, filled stream frames on both
 devices. After three seconds without input, the pointer hides; moving it or
 pressing Escape restores it. Parked, paused, ended, unowned and disconnected

@@ -5,6 +5,14 @@ let skOwned=false, skFill=false, skEscaped=false, skLastTime=null, skLastFrames=
 let skAudio=null, skAudioRevision=0, skAudioGestureUntil=0, skAudioPending=false;
 const skWatched=new WeakSet();
 let skTickPending=false, skWatchPending=false;
+let skExternalSourceApplied=false;
+function skChooseExternalSource(v){
+  if(skExternalSourceApplied||!skOwned||!v||typeof location==='undefined'||location.hostname!=='roxiestreams.su'||window!==window.top)return;
+  const selected=new URL(location.href).searchParams.get('sk-source');
+  if(!['1','2'].includes(selected))return;
+  const button=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Stream '+selected);
+  if(button){if(skAudio)skApplyAudio(v);skExternalSourceApplied=true;button.click();}
+}
 // Each owned frame hides its idle pointer, including iframe player surfaces.
 let skPointerMoved=Date.now();
 function skShowPointer(){document.getElementById('streamkeeper-cursor-style')?.remove();}
@@ -126,6 +134,7 @@ async function skTick(){
     skUpdatePointer(reply,v);
     if(reply?.audio&&!skAudioPending&&reply.audio_revision>=skAudioRevision){skAudio=reply.audio;skAudioRevision=reply.audio_revision;}
     skWatchAudio();
+    skChooseExternalSource(v);
     if(skOwned&&reply?.autoplay&&v&&!skStarted&&!reply.parked){skStarted=true;if(!skAudio&&reply.start_muted)v.muted=true;void v.play().catch(()=>{});}
     if(skOwned&&reply?.parked&&v&&!v.paused){if(!skParked)v.dataset.skResume='true';v.pause();skParked=true;}
     if(skOwned&&skFill&&!skEscaped&&v)skExpand(v.closest('.jwplayer,.video-js,.plyr,[data-player]')||v);
