@@ -6,6 +6,20 @@ const HOSTS = ['streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top'
 // Player iframes rotate domains, so trust any https frame inside a proven owned tab.
 function frameOk(url) { try { const u=new URL(url); return u.protocol==='https:' && !u.username && !u.password; } catch { return false; } }
 function allowed(url) { try { const u = new URL(url); return u.protocol === 'https:' && !u.username && !u.password && (!u.port || u.port==='443') && HOSTS.some(h => u.hostname === h || u.hostname.endsWith('.'+h)); } catch { return false; } }
+function userSourceUrl(value) {
+  try {
+    if(typeof value!=='string'||!value.length||value.length>4096||/[\s\\\x00-\x1f\x7f]/.test(value))return false;
+    if((value.match(/^https:\/\/([^/?#]*)/i)?.[1]||'').includes('@'))return false;
+    const u=new URL(value),labels=u.hostname.split('.');
+    return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&labels.length>=2&&u.hostname.length<=253&&
+      labels.every(l=>/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l))&&/^[a-z][a-z0-9-]*$/.test(labels.at(-1))&&
+      !['local','localhost','internal','lan'].includes(labels.at(-1))&&!u.hostname.endsWith('.home.arpa');
+  }catch{return false;}
+}
+function sourceOriginMatches(tab,r){
+  const url=tab.url||tab.pendingUrl||'';
+  return userSourceUrl(r.url)&&userSourceUrl(url)&&new URL(url).origin===new URL(r.url).origin;
+}
 let port, connecting=false;
 const ready = api.storage.local.get('owned').then(v => Object.assign(Object.create(null),v.owned || {}));
 let records, lost;
@@ -26,6 +40,11 @@ const ownersReady=api.storage.session.get('ownerTokens').then(v=>v.ownerTokens||
 async function ownerTokens(){return sessionOwners ||= await ownersReady;}
 async function saveOwners(){await api.storage.session.set({ownerTokens:await ownerTokens()});}
 async function provesTab(tab,r){
+ if(r.userSource){
+   if(!sourceOriginMatches(tab,r))return false;
+   if(tab.id===r.tabId&&tab.windowId===r.windowId&&(await ownerTokens())[tab.id]===r.token)return true;
+   return isFirefox&&(await api.sessions.getTabValue(tab.id,'streamkeeperOwner').catch(()=>null))===r.token;
+ }
  if(hasMarker(tab,r))return true;
  if(!allowed(tab.url||tab.pendingUrl||''))return false;
  if((await ownerTokens())[tab.id]===r.token && tab.windowId===r.windowId)return true;
@@ -37,14 +56,15 @@ async function lostRecords(){return lost ||= await lostReady;}
 async function owned() { return records ||= await ready; }
 async function save() { await api.storage.local.set({owned:await owned(),lost:await lostRecords()}); }
 async function send(value) { try { port?.postMessage(value); } catch {} }
-function markedURL(r) { const u=new URL(r.url);u.hash=(u.hash ? u.hash.slice(1)+'&' : '')+'sk-owned='+r.token;return u.href; }
+function markedURL(r) { if(r.userSource)return r.url;const u=new URL(r.url);u.hash=(u.hash ? u.hash.slice(1)+'&' : '')+'sk-owned='+r.token;return u.href; }
 function hasMarker(tab,r) { return allowed(tab.url || tab.pendingUrl || '') && (tab.url || tab.pendingUrl || '').includes('sk-owned='+r.token); }
 async function recover(r) {
   const tab=typeof r.tabId==='number' ? await api.tabs.get(r.tabId).catch(()=>null) : null;
   if(tab && await provesTab(tab,r))return tab;
   if(tab && createdHere.has(r.tabId) && (tab.url==='about:blank' || !tab.url) && Date.now()-r.createdAt<90000)return tab;
-  // Search only this saved stream URL, and claim only its unpredictable ownership marker.
-  const candidates=await api.tabs.query({url:r.url.split('#')[0]+'*'});
+  // Generic recovery searches one origin and still requires private browser proof;
+  // legacy recovery retains its saved-URL/marker behavior.
+  const candidates=await api.tabs.query({url:r.userSource?new URL(r.url).origin+'/*':r.url.split('#')[0]+'*'});
   const matches=[];for(const candidate of candidates)if(await provesTab(candidate,r))matches.push(candidate);
   return matches.length===1 ? matches[0] : null;
 }
@@ -98,12 +118,17 @@ async function command(c) {
   const all = await owned(); const r=all[c.stream_id];
   if (c.op==='inventory') return inventory();
   if (c.op==='open') {
-    if (typeof c.stream_id!=='string' || !/^[a-zA-Z0-9_-]{1,180}$/.test(c.stream_id) || !allowed(c.url)) throw Error('Unsupported stream');
-    if(r){const tab=await recover(r);if(tab){r.tabId=tab.id;r.windowId=tab.windowId;await save();return r;}}
+    if (typeof c.stream_id!=='string' || !/^[a-zA-Z0-9_-]{1,180}$/.test(c.stream_id) ||
+      ('user_source'in c&&typeof c.user_source!=='boolean') || !(c.user_source===true?userSourceUrl(c.url):allowed(c.url))) throw Error('Unsupported stream');
+    if(r){const tab=await recover(r);if(tab){
+      if(r.url!==c.url||!!r.userSource!==(c.user_source===true))throw Error('Game already has a different owned source; close it first');
+      r.tabId=tab.id;r.windowId=tab.windowId;await save();return r;
+    }}
     const missing=await lostRecords();
     if(missing[c.stream_id] && !c.allow_replacement)throw Error('Ownership lost; explicit session restart required');
     delete missing[c.stream_id];
     const record={url:c.url,token:crypto.randomUUID(),createdAt:Date.now(),created:true,session_id:c.session_id||null,startMuted:c.start_muted!==false,label:String(c.label||'Stream').slice(0,200),fill:true};
+    if(c.user_source===true)record.userSource=true;
     const saved=(await preferences())[c.stream_id];
     record.audio=saved?.session===record.session_id&&validAudio(saved.audio)?saved.audio:{muted:record.startMuted};record.audioRevision=0;
     all[c.stream_id]=record;await save();
@@ -114,7 +139,12 @@ async function command(c) {
     (await ownerTokens())[tab.id]=record.token;await saveOwners();
     if(isFirefox)await api.sessions.setTabValue(tab.id,'streamkeeperOwner',record.token);
     await api.tabs.update(tab.id,{muted:record.audio.muted});
-    await save(); return all[c.stream_id];
+    await save();
+    if(record.userSource){
+      const frames=await api.webNavigation.getAllFrames({tabId:tab.id}).catch(()=>[]);
+      for(const frame of frames||[])await injectOwnedFrame(record,frame.frameId,frame.url,frame.documentId);
+    }
+    return all[c.stream_id];
   }
   if (!r) throw Error('Stream is not owned');
   const tab=await recover(r);if(!tab || !(await provesTab(tab,r)))throw Error('Owned stream is unavailable');r.tabId=tab.id;r.windowId=tab.windowId;
@@ -156,13 +186,13 @@ function connect() {
       queue=queue.catch(()=>{}).then(async()=>{try {await send({id:c.id,result:await command(c)});} catch(e){await send({id:c.id,error:String(e.message||e)});}});
     });
     port.onDisconnect.addListener(()=>{console.warn('StreamKeeper native bridge:',api.runtime.lastError?.message || 'disconnected');port=null;connecting=false;setTimeout(connect,5000);});
-    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1','seek-v1','playback-metrics-v1','onhockey-v1']});
+    port.postMessage({event:'hello',browser:isFirefox?'firefox':'chromium',version:api.runtime.getManifest().version,capabilities:['audio-v1','primary-volume-v1','seek-v1','playback-metrics-v1','onhockey-v1','user-source-v1']});
     void scheduleInventory();
   } catch { port=null;setTimeout(connect,5000); }
   connecting=false;
 }
 api.runtime.onMessage.addListener((m,sender,respond)=>{
-  if(!m?.sk || !sender.tab || !frameOk(sender.url || '') || !allowed(sender.tab.url || '')) return false;
+  if(!m?.sk || !sender.tab || !frameOk(sender.url || '') || !(allowed(sender.tab.url||'')||userSourceUrl(sender.tab.url||''))) return false;
   queue=queue.catch(()=>{}).then(async()=>{
     const all=await owned();const entry=Object.entries(all).find(([,r])=>r.tabId===sender.tab.id);
     if(!entry) return {owned:false};
@@ -203,13 +233,18 @@ api.tabs.onUpdated.addListener((tabId,change)=>{
   });
   if(change.status==='complete')void owned().then(all=>{if(Object.values(all).some(r=>r.tabId===tabId))return scheduleInventory();});
 });
+async function injectOwnedFrame(r,frameId,url,documentId){
+  if(!frameOk(url)||(r.userSource?!userSourceUrl(url):frameId===0||allowed(url)))return;
+  if(r.userSource&&(typeof documentId!=='string'||!documentId))return;
+  const tab=await api.tabs.get(r.tabId).catch(()=>null);if(!tab||!await provesTab(tab,r))return;
+  const target=typeof documentId==='string'?{tabId:r.tabId,documentIds:[documentId]}:{tabId:r.tabId,frameIds:[frameId]};
+  await api.scripting.executeScript({target,files:['content.js']}).catch(()=>{});
+}
 api.webNavigation.onCompleted.addListener(d=>{
-  // Statically matched hosts already have content.js; inject into rotating player frames of owned tabs only.
-  if(d.frameId===0 || allowed(d.url) || !frameOk(d.url))return;
+  if(!frameOk(d.url))return;
   void owned().then(async all=>{
     const r=Object.values(all).find(x=>x.tabId===d.tabId);if(!r)return;
-    const tab=await api.tabs.get(d.tabId).catch(()=>null);if(!tab || !await provesTab(tab,r))return;
-    await api.scripting.executeScript({target:{tabId:d.tabId,frameIds:[d.frameId]},files:['content.js']}).catch(e=>console.warn('StreamKeeper inject',d.url,e?.message||e));
+    await injectOwnedFrame(r,d.frameId,d.url,d.documentId);
   });
 });
 api.alarms.create('bridge-reconnect',{periodInMinutes:1});api.alarms.onAlarm.addListener(()=>{connect();void scheduleInventory();});

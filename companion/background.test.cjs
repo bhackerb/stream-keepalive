@@ -5,7 +5,7 @@ async function harness(local={},session={},engine='firefox'){
  const port={postMessage:m=>sent.push(m),onMessage:event(),onDisconnect:event()};
  const store=data=>({get:async k=>({[k]:data[k]}),set:async v=>Object.assign(data,v)});
  const tabValues={};
- const api={sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',...(engine==='firefox'?{browser_specific_settings:{gecko:{id:'fixture'}}}:{})}),onMessage:event()},
+ const api={webNavigation:{onCompleted:event(),getAllFrames:async()=>[]},scripting:{executeScript:async()=>[]},sessions:{getTabValue:async id=>tabValues[id],setTabValue:async(id,_key,value)=>{tabValues[id]=value;}},storage:{local:store(local),session:store(session)},runtime:{connectNative:()=>port,getManifest:()=>({version:'fixture',...(engine==='firefox'?{browser_specific_settings:{gecko:{id:'fixture'}}}:{})}),onMessage:event()},
   tabs:{update:async(id,value)=>{tabs.get(id).mutedInfo={muted:value.muted,reason:'extension'};},get:async id=>{if(!tabs.has(id))throw Error('missing');return tabs.get(id);},query:async q=>{if(!q?.url)throw Error('Personal tab scan forbidden');return [...tabs.values()].filter(t=>t.url.startsWith(q.url.slice(0,-1)));},remove:async id=>{removed.push(id);tabs.delete(id);},sendMessage:async()=>true,reload:async()=>{throw Error('Unexpected reload');},onRemoved:event(),onUpdated:event()},
   windows:{update:async()=>{},create:async v=>{const id=next++;const tab={id,url:v.url,windowId:id};tabs.set(id,tab);return {id,tabs:[tab]};}},alarms:{create:()=>{},onAlarm:event()}};
  vm.runInNewContext(fs.readFileSync(__dirname+'/background.js','utf8'),{browser:api,console,setTimeout:()=>{},URL,Date,Promise,crypto:require('node:crypto').webcrypto});
@@ -22,6 +22,55 @@ test('open is idempotent, unknown eval denied, only owned tab closes',async()=>{
 test('unsupported URLs and unowned tabs never controlled',async()=>{
  const h=await harness();for(const url of ['javascript:alert(1)','https://streamed.pk.evil.example/game','http://streamed.pk/watch/game'])assert.ok((await h.command('open',{stream_id:'game',url})).error);
  assert.ok((await h.command('close',{stream_id:'personal'})).error);assert.equal(h.tabs.size,1);assert.equal(h.removed.length,0);
+});
+
+test('supplied URL creates one origin-scoped owned player and injects top/nested frames after mute',async()=>{
+ const h=await harness();const injections=[];
+ const url='https://olympicweb.me/game/2/#/watch';
+ h.api.webNavigation.getAllFrames=async({tabId})=>[{frameId:0,documentId:'root-doc',parentFrameId:-1,url:h.tabs.get(tabId).url},{frameId:2,documentId:'child-doc',parentFrameId:0,url:'https://dervlin.me/embed/game'},{frameId:3,parentFrameId:0,url:'http://unsupported.example/video'}];
+ h.api.scripting.executeScript=async args=>{assert.equal(h.tabs.get(args.target.tabId).mutedInfo.muted,true);injections.push(args);return [];};
+ assert.ok((await h.command('open',{stream_id:'game',url})).error);
+ const opened=await h.command('open',{stream_id:'game',url,user_source:true});assert.ok(opened.result);
+ assert.equal(h.tabs.get(10).url,url);assert.equal(h.local.owned.game.userSource,true);
+ assert.deepEqual(injections.map(x=>x.target.documentIds[0]),['root-doc','child-doc']);
+ assert.ok(h.sent.find(x=>x.event==='hello').capabilities.includes('user-source-v1'));
+ const reply=await h.message({op:'health',health:{state:'PLAYING'}},{tab:h.tabs.get(10),frameId:2,url:'https://dervlin.me/embed/game'});
+ assert.equal(reply.owned,true);
+ await h.command('open',{stream_id:'game',url,user_source:true});assert.equal(h.tabs.size,2);
+ assert.match((await h.command('open',{stream_id:'game',url:'https://different.example.com/game',user_source:true})).error,/different owned source/);assert.equal(h.tabs.size,2);
+ await h.command('close',{stream_id:'game'});assert.deepEqual(h.removed,[10]);assert.equal(h.tabs.get(1).title,'Personal');
+});
+test('generic authorization never becomes a host-wide grant or adopts a copied marker',async()=>{
+ const h=await harness();const url='https://falconstreams.st/game/123';
+ await h.command('open',{stream_id:'game',url,user_source:true});const r=h.local.owned.game;
+ h.tabs.get(1).url=url+'#sk-owned='+r.token;
+ assert.equal((await h.message({op:'health',health:{}},{tab:h.tabs.get(1),frameId:0,url:h.tabs.get(1).url})).owned,false);
+ h.tabs.delete(10);const inventory=await h.command('inventory');assert.equal(inventory.result.game,undefined);
+ assert.ok((await h.command('close',{stream_id:'game'})).error);assert.equal(h.removed.length,0);assert.equal(h.tabs.get(1).title,'Personal');
+ assert.ok((await h.command('open',{stream_id:'other',url:'https://falconstreams.st/another'})).error);
+});
+test('generic streams reject cross-origin redirects and recover Firefox tab tokens without exposing a marker',async()=>{
+ const h=await harness();const url='https://video.example.com/#/game';
+ await h.command('open',{stream_id:'game',url,user_source:true});const r=h.local.owned.game,old=h.tabs.get(10);
+ h.tabs.delete(10);h.tabs.set(30,{...old,id:30,windowId:30});await h.api.sessions.setTabValue(30,'streamkeeperOwner',r.token);
+ const inv=await h.command('inventory');assert.equal(inv.result.game.tabId,30);
+ h.tabs.get(30).url='https://offsite.example.com/redirect';
+ assert.ok((await h.command('reload',{stream_id:'game'})).error);assert.equal(h.removed.length,0);
+});
+test('navigation injects only frames in a proven owned URL window; personal tabs and redirects fail closed',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://falconstreams.st/game',user_source:true});const calls=[];
+ h.api.scripting.executeScript=async args=>{calls.push(args);};
+ h.api.webNavigation.onCompleted.fire({tabId:10,frameId:0,documentId:'root-doc',url:'https://falconstreams.st/game'});await h.settle();
+ assert.equal(calls.length,1);
+ h.api.webNavigation.onCompleted.fire({tabId:1,frameId:0,url:'https://personal.example/'});
+ h.tabs.get(10).url='https://offsite.example.com/';
+ h.api.webNavigation.onCompleted.fire({tabId:10,frameId:2,url:'https://dervlin.me/embed/game'});await h.settle();assert.equal(calls.length,1);
+});
+test('supplied URL permission rejects unsafe addresses and malformed flags before creating tabs',async()=>{
+ const h=await harness();
+ for(const url of ['http://example.com/','https://a:b@example.com/','https://@example.com/','https://a:@example.com/','https://127.0.0.1/','https://0x7f.0.0.1/','https://[::1]/','https://example.local/','https://example.com:8890/','https://example.com\\@other.com/','https://exam\nple.com/'])assert.ok((await h.command('open',{stream_id:'game',url,user_source:true})).error);
+ assert.ok((await h.command('open',{stream_id:'game',url:'https://example.com/',user_source:'true'})).error);
+ assert.equal(h.tabs.size,1);assert.equal(h.removed.length,0);
 });
 test('browser restart invalidates old numeric ownership before IDs can be reused',async()=>{
  const h=await harness({owned:{stale:{tabId:1,url:'https://streamed.pk/watch/stale',created:true}}},{});
@@ -145,7 +194,7 @@ test('primary volume ignores unrelated unsupported embeds but targets only suppo
 });
 test('missing unsupported invalid primary frame and ownership loss fail before audio mutation',async()=>{
  const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});
- h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:3,url:'https://unsupported.example/video'}]};
+ h.api.webNavigation={getAllFrames:async()=>[{frameId:0,url:'https://streamed.pk/watch/game'},{frameId:3,url:'http://unsupported.example/video'}]};
  let mutations=0;h.api.tabs.sendMessage=async()=>{mutations++;return true;};h.api.tabs.update=async()=>{mutations++;};
  for(const frame of [undefined,-1,true,99,3])assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:frame})).error);
  h.tabs.get(10).url='https://personal.example/';assert.ok((await h.command('audio',{stream_id:'game',muted:false,volume:.25,primary_frame_id:0})).error);
@@ -194,4 +243,42 @@ test('browser unmute with omitted reason is remembered; matching programmatic st
  h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false}});await h.settle();assert.equal(h.local.owned.game.audio.muted,false);
  const revision=h.local.owned.game.audioRevision;
  h.api.tabs.onUpdated.fire(10,{mutedInfo:{muted:false}});await h.settle();assert.equal(h.local.owned.game.audioRevision,revision);
+});
+
+test('generic injection targets an exact document and never falls back to a navigated frame',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://falconstreams.st/game',user_source:true});
+ let attempted,executed=0;
+ h.api.tabs.get=async id=>{const snapshot={...h.tabs.get(id)};h.tabs.get(id).url='https://offsite.example.com/';return snapshot;};
+ h.api.scripting.executeScript=async args=>{attempted=args.target;if(args.target.documentIds?.[0]==='old-document')throw Error('Document no longer exists');executed++;};
+ h.api.webNavigation.onCompleted.fire({tabId:10,frameId:0,documentId:'old-document',url:'https://falconstreams.st/game'});await h.settle();
+ assert.deepEqual(Array.from(attempted.documentIds),['old-document']);assert.equal(attempted.frameIds,undefined);assert.equal(executed,0);
+});
+test('generic navigation without document proof is not injected',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://falconstreams.st/game',user_source:true});let calls=0;
+ h.api.scripting.executeScript=async()=>calls++;
+ h.api.webNavigation.onCompleted.fire({tabId:10,frameId:0,url:'https://falconstreams.st/game'});await h.settle();assert.equal(calls,0);
+});
+test('known-host nested player injection supports exact documents and the existing frame fallback',async()=>{
+ const h=await harness();await h.command('open',{stream_id:'game',url:'https://streamed.pk/watch/game'});const calls=[];
+ h.api.scripting.executeScript=async args=>{calls.push(args.target);};
+ h.api.webNavigation.onCompleted.fire({tabId:10,frameId:2,documentId:'legacy-player',url:'https://player.example.com/video'});await h.settle();
+ h.api.webNavigation.onCompleted.fire({tabId:10,frameId:3,url:'https://player.example.com/other'});await h.settle();
+ assert.deepEqual(Array.from(calls[0].documentIds),['legacy-player']);assert.equal(calls[0].frameIds,undefined);
+ assert.deepEqual(Array.from(calls[1].frameIds),[3]);
+});
+test('generic restoration query is canonical and independent of URL path syntax',async()=>{
+ const h=await harness();const url='https://video.example.com?watch=1#/player';
+ await h.command('open',{stream_id:'game',url,user_source:true});const r=h.local.owned.game,old=h.tabs.get(10);
+ h.tabs.delete(10);h.tabs.set(30,{...old,id:30,windowId:30,url:new URL(url).href});await h.api.sessions.setTabValue(30,'streamkeeperOwner',r.token);
+ let pattern;const query=h.api.tabs.query;h.api.tabs.query=async q=>{pattern=q.url;return query(q);};
+ const result=await h.command('inventory');assert.equal(result.result.game.tabId,30);assert.equal(pattern,'https://video.example.com/*');
+});
+test('Chromium uses document targeting and private session proof without Firefox APIs',async()=>{
+ const h=await harness({}, {},'chromium');const url='https://falconstreams.st/game',calls=[];
+ h.api.sessions.getTabValue=async()=>{throw Error('Firefox-only API called');};h.api.sessions.setTabValue=h.api.sessions.getTabValue;
+ h.api.webNavigation.getAllFrames=async()=>[{frameId:0,documentId:'chrome-top',url},{frameId:2,documentId:'chrome-player',url:'https://player.example.com/embed'}];
+ h.api.scripting.executeScript=async args=>{calls.push(args.target);return [];};
+ const opened=await h.command('open',{stream_id:'game',url,user_source:true});assert.ok(opened.result);assert.equal(opened.error,undefined);
+ assert.deepEqual(calls.map(c=>Array.from(c.documentIds)),[['chrome-top'],['chrome-player']]);
+ assert.ok((await h.command('inventory')).result.game);await h.command('close',{stream_id:'game'});assert.deepEqual(h.removed,[10]);assert.equal(h.tabs.get(1).title,'Personal');
 });

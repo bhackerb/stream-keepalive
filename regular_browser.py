@@ -32,6 +32,7 @@ from display_probe import probe_displays
 from manual_layout import validate_manual_layout,manual_placements
 from session_planner import build_plan, validate_spec, reserve_sports
 from resource_monitor import ResourceMonitor
+from user_source import validate_user_source_url, USER_SOURCE_CAPABILITY, USER_SOURCE_VERSION
 
 log=logging.getLogger('stream-keeper.regular')
 ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv')
@@ -63,10 +64,13 @@ def validate_url(url):
 def recovery_record(value):
     if not isinstance(value,dict)or type(value.get('attempts'))is not int or not 0<=value['attempts']<=3:return None
     if not isinstance(value.get('tried'),list)or len(value['tried'])>10:return None
+    if 'user_source'in value and type(value['user_source'])is not bool:return None
     record={'attempts':value['attempts'],'tried':value['tried']}
+    if value.get('user_source')is True:record['user_source']=True
+    validator=validate_user_source_url if record.get('user_source')else validate_url
     try:
-        for url in record['tried']:validate_url(url)
-        if 'url'in value:record['url']=validate_url(value['url'])
+        for url in record['tried']:validator(url)
+        if 'url'in value:record['url']=validator(value['url'])
     except (ValueError,TypeError):return None
     for key in ('created_at','last_action'):
         if key in value:
@@ -78,6 +82,7 @@ def recovery_record(value):
     if 'message'in value:
         if not isinstance(value['message'],str)or len(value['message'])>500:return None
         record['message']=value['message']
+    if record.get('user_source')and 'url'not in record:return None
     record.setdefault('created_at',time.time())
     return record
 
@@ -143,7 +148,7 @@ class RegularBrowserKeeper:
         self._placement_startup={sid:r for sid,r in self._placement_startup.items()if self.active_streams.get(sid)is r[0]}
         self._recovery={sid:r for sid,r in self._recovery.items()if sid in self.active_streams or time.time()-r.get('last_action',r.get('created_at',time.time()))<86400}
         for sid,stream in self.active_streams.items():stream.health_monitor.stats['recovery_count']=self._recovery.get(sid,{}).get('attempts',0)
-        value={'local_care':{k:v for k,v in self._local_care.items()if k in ('attempts','last_action','next_retry')},'viewing_mode':self.viewing_mode,'local_keepalive':self.local_keepalive,'recovery':self._recovery,'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked}for sid,s in self.active_streams.items()}}
+        value={'local_care':{k:v for k,v in self._local_care.items()if k in ('attempts','last_action','next_retry')},'viewing_mode':self.viewing_mode,'local_keepalive':self.local_keepalive,'recovery':self._recovery,'releasing':sorted(self._releasing),'group_epochs':self._group_epochs,'manual_layout':self.manual_layout,'saved_layout':self.saved_layout,'session':self.session,'suppressed':sorted(self.suppressed),'ownership_lost':sorted(self._ownership_lost),'slot_rows':self._slot_rows,'layout_ids':list(self._layout_ids),'visible_ids':list(self._visible_ids),'streams':{sid:{'url':s.url,'label':s.team,'browser':s.browser,'started_at':s.started_at,'session_id':s.session_id,'parked':s.parked,'user_source':getattr(s,'user_source',False)}for sid,s in self.active_streams.items()}}
         self.state_path.parent.mkdir(parents=True,exist_ok=True);temp=self.state_path.with_suffix('.tmp')
         fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'w')as f:
@@ -153,9 +158,12 @@ class RegularBrowserKeeper:
         for key in list(self._frames):
             if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
         health={'state':'DISCONNECTED','resolution':'unknown','current_time':'0','buffered_to':'unknown','audio':'unknown','muted':True,'volume':0,'stall_duration':'0','recovery_count':0}
+        user_source=r.get('user_source')is True
+        if user_source:validate_user_source_url(r['url'])
         host=urlparse(r['url']).hostname or ''
         site='onhockey.tv'if host=='onhockey.tv'or host.endswith('.onhockey.tv')else 'streamed'
-        self.active_streams[sid]=SimpleNamespace(id=sid,team=r.get('label',sid),site=site,url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
+        if user_source:site=host
+        self.active_streams[sid]=SimpleNamespace(id=sid,user_source=user_source,team=r.get('label',sid),site=site,url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
     async def refresh_displays(self):
         self.display_probe=await probe_displays(self.config.get('layout',{}).get('displays',{}),self.config.get('layout',{}).get('backend'))
         self._display_checked=time.time()
@@ -232,10 +240,19 @@ class RegularBrowserKeeper:
             if not isinstance(records,dict):return
             for sid,r in records.items():
                 if not isinstance(sid,str) or not isinstance(r,dict):continue
-                try:validate_url(r['url'])
+                custom=r.get('userSource')is True
+                if custom and USER_SOURCE_CAPABILITY not in self._companion_info.get(browser,{}).get('capabilities',[]):continue
+                try:(validate_user_source_url if custom else validate_url)(r['url'])
                 except (ValueError,KeyError):continue
                 self._ownership_lost.discard(sid)
-                if sid not in self.active_streams:self._add(sid,dict(r,browser=browser))
+                if sid not in self.active_streams:self._add(sid,dict(r,browser=browser,user_source=custom))
+                if custom and self.active_streams[sid].browser==browser:
+                    stream=self.active_streams[sid]
+                    stream.url=r['url'];stream.user_source=True;stream.site=urlparse(r['url']).hostname
+                    saved=self._recovery.get(sid,{})
+                    if not saved.get('pending_release')and(not saved.get('user_source')or saved.get('url')==r['url']):
+                        saved=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
+                        saved.update(url=r['url'],user_source=True)
             for sid,s in list(self.active_streams.items()):
                 if s.browser==browser and sid not in records:
                     self.active_streams.pop(sid,None)
@@ -324,13 +341,20 @@ class RegularBrowserKeeper:
     async def _open(self,sid,url,label,browser,session_id=None,allow_replacement=False):
         async with self._opening_lock:
             if sid in self.active_streams:return
-            validate_url(url)
+            selected=self._recovery.get(sid,{})
+            user_source=selected.get('user_source')is True and selected.get('url')==url
+            if user_source:
+                validate_user_source_url(url)
+                if USER_SOURCE_CAPABILITY not in self._companion_info.get(browser,{}).get('capabilities',[]):raise ValueError('Install signed companion '+USER_SOURCE_VERSION+' to use a supplied URL; existing streams preserved')
+            else:validate_url(url)
             host=urlparse(url).hostname or ''
             if (host=='onhockey.tv'or host.endswith('.onhockey.tv'))and 'onhockey-v1'not in self._companion_info.get(browser,{}).get('capabilities',[]):
                 raise ValueError('OnHockey needs signed companion 0.2.6 or later; existing streams preserved')
             await self._check_open_resources()
-            record=await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement)
-            self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id));self._save()
+            record=await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement,**({'user_source':True}if user_source else {}))
+            if user_source and(not isinstance(record,dict)or record.get('url')!=url or record.get('userSource')is not True):
+                raise ValueError('Browser did not confirm the selected URL; source remains saved for retry')
+            self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id,user_source=user_source));self._save()
             if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
                 self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
     async def watch_url(self,url,label=None):
@@ -501,8 +525,12 @@ class RegularBrowserKeeper:
         result=await self.command_for(sid,'seek',**({'to':float(to)}if to is not None else{'delta':float(delta)}))
         if not isinstance(result,dict)or result.get('confirmed')is not True:raise ValueError('Player did not confirm the seek')
         return {'success':True,'current_time':result.get('current_time'),'duration':result.get('duration'),'message':'Moved to '+time.strftime('%H:%M:%S',time.gmtime(result.get('current_time')or 0))}
-    async def player_sources(self,sid):
+    async def player_sources(self,sid,include_catalog=True):
         if not isinstance(sid,str)or sid not in self.active_streams:raise ValueError('Choose an active owned game')
+        stream=self.active_streams[sid]
+        supported=USER_SOURCE_CAPABILITY in self._companion_info.get(stream.browser,{}).get('capabilities',[])
+        custom={'available':supported,'requires_companion':None if supported else USER_SOURCE_VERSION,'current_url':stream.url if getattr(stream,'user_source',False)else None}
+        if not include_catalog:return dict(stream_id=sid,choices=[],user_source=custom)
         matches=await asyncio.wait_for(self._json('matches/all'),10)
         row=next((r for r in matches if isinstance(r,dict)and r.get('id')==sid),None)
         if not row:raise ValueError('This game is no longer in the source catalog')
@@ -517,17 +545,22 @@ class RegularBrowserKeeper:
                 if url in seen:continue
                 seen.add(url);choices.append(dict(url=url,source=source['source'],number=item['streamNo'],language=str(item.get('language')or'Unknown')[:50],hd=item.get('hd')is True,viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else None,current=url==self.active_streams.get(sid,SimpleNamespace(url=None)).url))
         # Wrestling games may also switch to a watch-wrestling embed resolved by Mithrandir.
-        return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling')
+        return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling',user_source=custom)
 
-    async def switch_source(self,sid=None,url=None):
-        try:options=await asyncio.wait_for(self.player_sources(sid),20)
+    async def switch_source(self,sid=None,url=None,user_source=False):
+        if type(user_source)is not bool:return '❌ Invalid supplied URL selection'
+        try:
+            if user_source:validate_user_source_url(url);options=None
+            else:
+                options=await asyncio.wait_for(self.player_sources(sid),20)
         except (ValueError,TimeoutError,aiohttp.ClientError)as e:return '❌ '+(str(e)or'Source lookup timed out; try again')
         async with self._lock:
             released=False
             try:
                 stream=self.active_streams.get(sid)
                 if not stream or stream.parked or sid in self._releasing or sid in self._ownership_lost:raise ValueError('Choose a visible, owned game with no pending transfer')
-                if not isinstance(url,str)or (url not in {c['url']for c in options['choices']} and not (url.startswith('https://dailywrestling.cc/embed/')and options.get('wrestling'))):raise ValueError('Choose an available source from this game')
+                if user_source and USER_SOURCE_CAPABILITY not in self._companion_info.get(stream.browser,{}).get('capabilities',[]):raise ValueError('Install signed companion '+USER_SOURCE_VERSION+' to use a supplied URL; existing stream preserved')
+                if not user_source and (not isinstance(url,str)or (url not in {c['url']for c in options['choices']} and not (url.startswith('https://dailywrestling.cc/embed/')and options.get('wrestling')))):raise ValueError('Choose an available source from this game')
                 if url.startswith('https://dailywrestling.cc/embed/'):validate_url(url)
                 if url==stream.url:return 'Already using this source'
                 await self._check_memory()
@@ -536,7 +569,7 @@ class RegularBrowserKeeper:
                 if self.active_streams.get(sid)is not stream:raise ValueError('Game changed while loading sources')
                 placements=[p for p in self.layout_status.get('placements',[])if p['stream_id']in self.active_streams]
                 record=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
-                record.update(pending_release=True,url=url,last_action=time.time(),message='Manual source switch requested');record.pop('since',None)
+                record.update(pending_release=True,url=url,user_source=user_source,last_action=time.time(),message='Manual source switch requested');record.pop('since',None)
                 self._releasing.add(sid);self._save()
                 if await self.command_for(sid,'close')is not True:raise ValueError('Source close unconfirmed; no replacement opened')
                 audit=await self.command(stream.browser,'inventory')
@@ -992,6 +1025,7 @@ class RegularBrowserKeeper:
     def _openable(self,sid):
         return sid not in self.active_streams and sid not in self.suppressed|self._ownership_lost|self._releasing
     async def _recovery_sources(self,row,current,tried):
+        if self._recovery.get(row['id'],{}).get('user_source')is True:return None
         choices=[]
         for source in (row.get('sources')or[])[:3]:
             try:

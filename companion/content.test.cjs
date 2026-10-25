@@ -1,4 +1,10 @@
 const test=require('node:test');const assert=require('node:assert/strict');const vm=require('node:vm');const fs=require('node:fs');
+test('repeated dynamic injection installs a single receiver and health timer',async()=>{
+ let receivers=0,timers=0;
+ const context=vm.createContext({browser:{runtime:{onMessage:{addListener:()=>receivers++},sendMessage:async()=>({owned:false})}},document:{addEventListener:()=>{},querySelectorAll:()=>[],getElementById:()=>null},window:{},Date,setInterval:()=>timers++});
+ const source=fs.readFileSync(__dirname+'/content.js','utf8');vm.runInContext(source,context);vm.runInContext(source,context);
+ await new Promise(setImmediate);assert.equal(receivers,1);assert.equal(timers,1);
+});
 test('idle cursor hides only in owned filled frames and returns on movement, Escape, parking or disconnect',async()=>{
  let tick,now=0,reply={owned:true,fill:true},style=null;const events={};
  const document={head:{append:s=>{style=s;}},createElement:()=>({remove(){style=null;}}),

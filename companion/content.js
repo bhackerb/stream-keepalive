@@ -1,4 +1,7 @@
 /* Health and user-authoritative audio in proven owned frames. Never remove iframe sandbox. */
+(()=>{
+if(globalThis.__streamKeeperContentLoaded)return;
+globalThis.__streamKeeperContentLoaded=true;
 const skAPI=globalThis.browser || chrome;
 let skOwned=false, skFill=false, skEscaped=false, skLastTime=null, skLastFrames=null, skLastProgress=Date.now(), skEverProgress=false, skStarted=false, skParked=false;
 // Persist intent in the extension, never infer it from arbitrary volumechange events.
@@ -133,3 +136,4 @@ async function skTick(){
   }catch{skShowPointer();}finally{skTickPending=false;}
 }
 setInterval(skTick,3000);void skTick();
+})();

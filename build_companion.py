@@ -15,17 +15,17 @@ def build():
             public=subprocess.check_output(['openssl','rsa','-in',str(private),'-pubout','-outform','DER'],stderr=subprocess.DEVNULL)
             keyfile.write_text(base64.b64encode(public).decode()+'\n')
     key=keyfile.read_text().strip()
-    base={'manifest_version':3,'name':'StreamKeeper Companion','version':'0.2.7','description':'Control only StreamKeeper-owned sports and wrestling windows in your regular browser.',
+    base={'manifest_version':3,'name':'StreamKeeper Companion','version':'0.2.9','description':'Control only StreamKeeper-owned sports and wrestling windows in your regular browser.',
           'permissions':['nativeMessaging','storage','tabs','alarms','webNavigation','scripting'],
           'host_permissions':['https://*/*'],
           'content_scripts':[{'matches':[f'https://*.{h}/*' for h in HOSTS],'js':['content.js'],'all_frames':True,'run_at':'document_idle'}]}
     for browser in ('chrome','firefox'):
         target=ROOT/'build'/'companion'/browser;target.mkdir(parents=True,exist_ok=True)
         manifest=dict(base)
-        if browser=='chrome':manifest.update(key=key,background={'service_worker':'background.js'})
+        if browser=='chrome':manifest.update(key=key,minimum_chrome_version='106',background={'service_worker':'background.js'})
         else:
             manifest['permissions']=base['permissions']+['sessions']
-            manifest.update(background={'scripts':['background.js']},browser_specific_settings={'gecko':{'id':'streamkeeper@bhackerb.local','strict_min_version':'140.0','data_collection_permissions':{'required':['none']}}})
+            manifest.update(background={'scripts':['background.js']},browser_specific_settings={'gecko':{'id':'streamkeeper@bhackerb.local','strict_min_version':'153.0','data_collection_permissions':{'required':['none']}}})
         (target/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
         for file in ('background.js','content.js'):shutil.copy2(ROOT/'companion'/file,target/file)
     shutil.make_archive(str(ROOT/'build'/'streamkeeper-firefox'),'zip',ROOT/'build'/'companion'/'firefox')

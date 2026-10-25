@@ -438,8 +438,10 @@ class StreamKeeperAPI:
 
         if not isinstance(body,dict)or not isinstance(body.get('stream_id',''),str):return web.json_response({'error':'Invalid game'},status=400)
         stream_id = body.get("stream_id", "").strip() or None
+        if 'user_source'in body and type(body['user_source'])is not bool:return web.json_response({'error':'Invalid supplied URL selection'},status=400)
+        if body.get('user_source')is True and not hasattr(self.keeper,'player_sources'):return web.json_response({'error':'Supplied URLs require regular browser mode'},status=400)
         if hasattr(self.keeper,'player_sources'):
-            result = await self.keeper.switch_source(stream_id,body.get('url'))
+            result = await self.keeper.switch_source(stream_id,body.get('url'),**({'user_source':True}if body.get('user_source')is True else {}))
         elif body.get('url') is not None:return web.json_response({'error':'Source picker requires regular browser mode'},status=400)
         else:result = await self.keeper.switch_source(stream_id)
         return web.json_response({
@@ -449,7 +451,7 @@ class StreamKeeperAPI:
 
     async def handle_player_sources(self,request):
         if not hasattr(self.keeper,'player_sources'):return web.json_response({'error':'Source picker requires regular browser mode'},status=400)
-        try:return web.json_response(await self.keeper.player_sources(request.query.get('stream_id')))
+        try:return web.json_response(await self.keeper.player_sources(request.query.get('stream_id'),**({'include_catalog':False}if request.query.get('catalog')=='0'else {})))
         except (ValueError,TimeoutError)as e:return web.json_response({'error':str(e)or'Source lookup timed out; try again'},status=400)
 
     async def handle_screenshot(self, request: web.Request) -> web.Response:

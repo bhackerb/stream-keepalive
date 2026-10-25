@@ -459,3 +459,33 @@ sources play without companion frame control.
 Rollout: `python3 build_companion.py`, upload `build/streamkeeper-firefox.zip` for
 unlisted signing, then `./install_signed_companion.sh <signed.xpi>` and restart
 Firefox on both hosts.
+
+### Supplied game URLs — companion 0.2.9
+
+In Change source, **Use this URL for this game** accepts a public HTTPS page URL
+for the selected active game. The request explicitly sets `user_source:true`;
+normal source selection and standalone Open stream keep the existing host rules.
+The controller checks `user-source-v1` before ownership audit or close. Install
+Mozilla-signed companion **0.2.9** first; the older unsigned 0.2.8 Roxie draft is
+superseded by this generic path.
+
+The finite source-switch flow confirms ownership, close and inventory absence,
+then reopens the same game ID/session and reapplies its display slot. The selected
+URL and authorization flag persist in private controller state and browser-owned
+records. Existing explicit audio preference is retained. Failed opening keeps
+the selected URL for session retry; unconfirmed close never opens a replacement.
+The custom URL is not rotated back to Streamed by automatic mirror recovery.
+
+The companion does not change supplied URL fragments, so hash-based players work.
+Control requires its private tab/session token and the original HTTPS origin;
+a copied page marker cannot authorize another tab. Cross-origin redirects lose
+control: paste the final page URL explicitly instead. Script injection targets
+only proven owned tabs and their eligible HTTPS frames, and is idempotent.
+No iframe sandbox is removed. Websites may still need a play/sign-in click or a
+future adapter; choosing a URL does not prove correct content or reliable playback.
+Capability-only `/player-sources?...&catalog=0` avoids catalog network dependencies.
+
+Generic injection targets browser `documentIds` and fails closed when a document
+has navigated away; it never falls back to a reused frame ID. Companion 0.2.9
+requires Firefox 153+ or Chromium 106+. Public hostname syntax is validated;
+there is no server-side URL fetch or DNS/network-address verification.
