@@ -356,7 +356,13 @@ class StreamKeeperAPI:
             body = {}
 
         stream_id = body.get("stream_id", "").strip() or None
-        result = await self.keeper.force_reload(stream_id)
+        try:
+            result = await self.keeper.force_reload(stream_id)
+        except ValueError as exc:
+            # Companion disconnected or stream unknown: a client error, not a server fault.
+            return web.json_response({"success": False, "message": str(exc)}, status=409)
+        except TimeoutError:
+            return web.json_response({"success": False, "message": "Browser did not answer the reload in time"}, status=504)
         return web.json_response({
             "success": not result.startswith("\u274c"),
             "message": result,
