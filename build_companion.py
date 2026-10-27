@@ -15,7 +15,7 @@ def build():
             public=subprocess.check_output(['openssl','rsa','-in',str(private),'-pubout','-outform','DER'],stderr=subprocess.DEVNULL)
             keyfile.write_text(base64.b64encode(public).decode()+'\n')
     key=keyfile.read_text().strip()
-    base={'manifest_version':3,'name':'StreamKeeper Companion','version':'0.2.11','description':'Control only StreamKeeper-owned sports and wrestling windows in your regular browser.',
+    base={'manifest_version':3,'name':'StreamKeeper Companion','version':'0.2.12','description':'Control only StreamKeeper-owned sports and wrestling windows in your regular browser.',
           'permissions':['nativeMessaging','storage','tabs','alarms','webNavigation','scripting'],
           'host_permissions':['https://*/*'],
           'content_scripts':[{'matches':[f'https://*.{h}/*' for h in HOSTS],'js':['content.js'],'all_frames':True,'run_at':'document_idle'}]}
