@@ -43,6 +43,11 @@ ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top'
 AUTOPLAY_STEPS=('play','play_control','pointer','os_click')
 AUTOPLAY_GRACE=8
 AUTOPLAY_STEP_TIMEOUT=10
+# A live stream that stops reporting for this long counts as failed, but only if it was not playing.
+SILENCE_FAILURE_SECONDS=30
+SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
+# A frame that reported playing within this window may still be playing unseen; recovery waits for it to age out.
+STALE_PLAYING_GUARD=120
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
 PLACEMENT_READY_TIMEOUT=40
@@ -119,7 +124,7 @@ class RegularBrowserKeeper:
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set()
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={}
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
         self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
@@ -301,7 +306,7 @@ class RegularBrowserKeeper:
             if record:
                 if h.get('state')not in ('NO_VIDEO','BUFFERING') or now-record.get('last_health',now)>=12:record.pop('since',None)
                 record['last_health']=now
-            self._frames[key]=(now,h)
+            self._frames[key]=(now,h);self._last_seen[sid]=now
             rows=[v for (i,_),v in self._frames.items() if i==sid and now-v[0]<12]
             best=max(rows,key=lambda v:(v[1].get('state')=='PLAYING',v[1].get('width',0)*v[1].get('height',0)))[1]
             duration=best.get('duration')
@@ -1077,11 +1082,19 @@ class RegularBrowserKeeper:
         if not self.session or not stream or stream.session_id!=self.session['id'] or stream.parked:return False
         if sid in self.suppressed or sid in self._ownership_lost or sid in self._releasing or sid not in self._visible_ids:return False
         if not self._browser_ready.get(stream.browser):return False
-        rows=[v for (i,_),v in self._frames.items()if i==sid]
-        if not rows or any(now-v[0]>=12 for v in rows):return False
+        if any(key[0]==sid and now-v[0]<STALE_PLAYING_GUARD and v[1].get('state')in ('PLAYING','PAUSED')for key,v in self._frames.items()):return False
+        # Only fresh rows decide; a frame that went quiet without playing must not block recovery of the others.
+        rows=[v for (i,_),v in self._frames.items()if i==sid and now-v[0]<12]
+        if any(v[1].get('page_error')is True for v in rows):return True
+        if not rows:
+            last=self._last_seen.get(sid,stream.started_at)
+            return now-last>=SILENCE_FAILURE_SECONDS and stream.health_monitor.stats.get('state')in SILENT_FAILURE_STATES
         if all(v[1].get('state')=='NO_VIDEO'for v in rows):return True
-        buffering=[(key,v)for key,v in self._frames.items()if key[0]==sid and v[1].get('state')=='BUFFERING']
+        buffering=[(key,v)for key,v in self._frames.items()if key[0]==sid and now-v[0]<12 and v[1].get('state')=='BUFFERING']
         return bool(buffering)and all(v[1].get('state')in ('NO_VIDEO','BUFFERING')for v in rows)and all(key in self._progress and 15<=now-self._progress[key]<=300 and v[1].get('paused')is not True and not v[1].get('ended')for key,v in buffering)
+
+    def _dead_source(self,sid,now):
+        return any(key[0]==sid and now-v[0]<12 and v[1].get('page_error')is True for key,v in self._frames.items())
 
     async def _opening_url(self,row,deadline):
         # Saved recovery URL, then the discovery choice, then the next ranked catalog source.
@@ -1147,7 +1160,8 @@ class RegularBrowserKeeper:
                 audit=await self.command(stream.browser,'inventory')
                 if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed')
                 if not self._recoverable_failure(sid,time.time()):continue
-                if record['attempts']==0:
+                # A dead-source page will not recover on reload; go straight to an alternate.
+                if record['attempts']==0 and not self._dead_source(sid,time.time()):
                     if time.time()-self._reload_times.get(sid,0)<600:continue
                     record.update(attempts=1,last_action=time.time(),since=time.time(),message='One automatic refresh requested')
                     self._save();await self.force_reload(sid)

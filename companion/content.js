@@ -144,6 +144,8 @@ async function skTick(){
     if(v && skLastTime!==null && v.currentTime>skLastTime && (frames===null || skLastFrames===null || frames>skLastFrames)){skLastProgress=Date.now();skEverProgress=true;}
     const health=v?{state:v.error?'ERROR':v.paused?'PAUSED':skEverProgress&&v.readyState>=2&&Date.now()-skLastProgress<15000?'PLAYING':'LOADING',current_time:v.currentTime,decoded_frames:frames,ready_state:v.readyState,width:v.videoWidth,height:v.videoHeight,duration:Number.isFinite(v.duration)&&v.duration>0?v.duration:null,ended:v.ended&&skEverProgress&&(frames??0)>0,paused:v.paused,muted:v.muted,volume:v.volume,stall_seconds:(Date.now()-skLastProgress)/1000}: {state:'NO_VIDEO'};
     if(v)Object.assign(health,{dropped_frames:quality?.droppedVideoFrames??v.webkitDroppedFrameCount??null,buffer_ahead_seconds:bufferAhead,live_edge_distance_seconds:liveDistance,playback_rate:v.playbackRate});
+    // A dead-source page (403/404/410/5xx from the host) has no player. Report it so recovery skips the reload and tries another source.
+    if(!v&&document.body&&/\b(403|404|410|502|503)\b/.test(`${document.title} ${document.body.innerText.slice(0,300)}`))health.page_error=true;
     skLastTime=v?.currentTime??null;skLastFrames=frames;
     const reply=await skAPI.runtime.sendMessage({sk:true,op:'health',health});
     skOwned=!!reply?.owned;skFill=!!reply?.fill;
