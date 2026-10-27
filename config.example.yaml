@@ -148,3 +148,7 @@ session:
   memory_guard: true  # defer new windows when RAM/PSI/browser memory exceeds safe headroom
   start_muted: true
   state_file: regular-session.json
+
+# Live-game catalog providers (see catalog_providers.py); all are polled and merged.
+catalog:
+  disabled: []  # e.g. [cdnlivetv]

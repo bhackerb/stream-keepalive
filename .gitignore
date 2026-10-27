@@ -30,4 +30,6 @@ venv/
 
 regular-session.json
 regular-session.tmp
+provider-health.json
+provider-health.tmp
 config.yaml.before-regular

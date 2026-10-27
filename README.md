@@ -199,6 +199,27 @@ control of arbitrary websites. Normal ad blocking remains the browser's responsi
 active uBlock and observed blocked requests are separate from playback evidence.
 Installing the companion does not install an ad blocker.
 
+### Multi-provider catalog
+
+Streamed closed in October 2026. Session discovery now polls every provider in
+`catalog_providers.py` together (PPV.ST, StreamFree, TimStreams, Rockylive,
+CDN Live TV; mirrors tried in order) and merges the same game across sites, so
+no site is primary. One provider failing, walled, or changing its schema only
+drops its sources; `/session` returns 502 only when every provider is down.
+
+Playback choices rank by provider consistency, then viewers, English, and HD.
+Consistency is measured, not assumed: each poll records reachability, latency,
+and the share of all live games the provider carried. Evidence persists in
+`provider-health.json` beside the session state, keeps accumulating every five
+minutes between sessions, and appears under `catalog.providers` in `/status`.
+Run `python3 catalog_providers.py 10 60` for a ten-round manual comparison.
+Disable a provider with `catalog: {disabled: [name]}` in `config.yaml`.
+
+Provider players rotate hosts the signed allowlist cannot name, so catalog
+URLs open through the companion's user-source path (0.2.9+). Unlike a URL Ben
+supplies, they stay eligible for automatic recovery, which walks the ranked
+sources across every provider.
+
 POST `/session` with authenticated JSON:
 
 ```json
@@ -474,7 +495,7 @@ then reopens the same game ID/session and reapplies its display slot. The select
 URL and authorization flag persist in private controller state and browser-owned
 records. Existing explicit audio preference is retained. Failed opening keeps
 the selected URL for session retry; unconfirmed close never opens a replacement.
-The custom URL is not rotated back to Streamed by automatic mirror recovery.
+A supplied custom URL is never replaced by automatic catalog recovery.
 
 The companion does not change supplied URL fragments, so hash-based players work.
 Control requires its private tab/session token and the original HTTPS origin;

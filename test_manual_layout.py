@@ -108,17 +108,13 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
     async def test_pregame_source_opens_early_only_with_real_stream_metadata(self):
         from unittest.mock import patch
         from test_session_planner import game
-        g=game(20);g['date']=1000000+5*60000;g['sources']=[{'source':'golf','id':'test'}]
-        async def catalog(path):
-            if path=='matches/all':return[g]
-            if path=='matches/live':return[]
-            return[{'streamNo':1,'language':'English','viewers':1}]
-        self.k._json=AsyncMock(side_effect=catalog)
+        g=game(20);g.update(date=1000000+5*60000,live=False,viewers=1,sources=[{'url':'https://example.com/embed/20','provider':'ppv','label':'PPV','language':'English','hd':False,'viewers':1}])
+        self.k._catalog=AsyncMock(return_value={'matches':[g]})
         with patch('regular_browser.time.time',return_value=1000):
             plan=await self.k.discover({'sports':['hockey'],'preload_minutes':10})
         self.assertEqual(len(plan['live']),1);self.assertTrue(plan['live'][0]['prestart']);self.assertFalse(plan['live'][0]['live'])
-        async def empty(path):return[g]if path=='matches/all'else[]
-        self.k._json=AsyncMock(side_effect=empty)
+        self.assertEqual(plan['live'][0]['playback_url'],'https://example.com/embed/20')
+        self.k._catalog=AsyncMock(return_value={'matches':[dict(g,sources=[])]})
         with patch('regular_browser.time.time',return_value=1000):
             plan=await self.k.discover({'sports':['hockey'],'preload_minutes':10})
         self.assertFalse(plan['live']);self.assertEqual(len(plan['pending']),1)

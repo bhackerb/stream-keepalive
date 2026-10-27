@@ -68,10 +68,17 @@ class SourcePickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('close',[c.args[1]for c in self.k.command.call_args_list])
     async def test_lookup_only_game_catalog_sources_and_valid_numbers(self):
         self.k.player_sources=RegularBrowserKeeper.player_sources.__get__(self.k)
-        self.k._json=AsyncMock(side_effect=[[{'id':'game','sources':[{'source':'golf','id':'provider-game'}]}],[{'streamNo':1,'language':'English','hd':True,'viewers':400},{'streamNo':2,'language':'German','viewers':100},{'streamNo':True},{'streamNo':-1}]])
+        current=self.k.active_streams['game'].url
+        sources=[dict(url=current,provider='ppv',label='ESPN',language='English',hd=True,viewers=400),
+                 dict(url='https://example.com/a',provider='ppv',label='ESPN Deportes',language='es',hd=False,viewers=None),
+                 dict(url='https://example.org/b',provider='timstreams',label='Sky',language=None,hd=False,viewers=None)]
+        self.k._catalog=AsyncMock(return_value={'matches':[{'id':'other','sources':[dict(sources[1],url='https://example.com/other')]},{'id':'game','category':'hockey','sources':sources}]})
         r=await self.k.player_sources('game')
-        self.assertEqual(len(r['choices']),2);self.assertTrue(r['choices'][0]['current']);self.assertFalse(r['choices'][1]['current'])
-        self.assertEqual([c.args[0]for c in self.k._json.call_args_list],['matches/all','stream/golf/provider-game'])
+        self.assertEqual([c['url']for c in r['choices']],[s['url']for s in sources])
+        self.assertEqual([(c['source'],c['number'])for c in r['choices']],[('PPV.ST',1),('PPV.ST',2),('TimStreams',1)])
+        self.assertTrue(r['choices'][0]['current']);self.assertFalse(r['choices'][1]['current'])
+        self.assertEqual(r['choices'][1]['language'],'ESPN Deportes · es')
+        self.k._catalog.assert_awaited_once_with(max_age=60)
     async def test_api_game_sources_and_switch_are_authenticated_and_scoped(self):
         api=StreamKeeperAPI(self.k,self.k.config)
         client=TestClient(TestServer(api.app));await client.start_server()
@@ -105,8 +112,8 @@ class SourcePickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh.active_streams['game'].url,url);self.assertTrue(fresh.active_streams['game'].user_source)
         self.assertTrue(fresh._recovery['game']['user_source'])
         self.assertEqual(await fresh._opening_url({'id':'game'},0),url)
-        fresh._json=AsyncMock(side_effect=AssertionError('No catalog for supplied URL'))
-        self.assertIsNone(await fresh._recovery_sources({'id':'game'},url,[]));fresh._json.assert_not_awaited()
+        fresh._catalog=AsyncMock(side_effect=AssertionError('No catalog for supplied URL'))
+        self.assertIsNone(await fresh._recovery_sources({'id':'game','sources':[{'url':'https://example.com/other'}]},url,[]));fresh._catalog.assert_not_awaited()
 
     async def test_supplied_url_rejections_and_unconfirmed_release_never_open(self):
         self.k._companion_info={'firefox':{'capabilities':['user-source-v1']}}
@@ -120,10 +127,10 @@ class SourcePickerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_capability_metadata_is_independent_of_missing_catalog(self):
         self.k.player_sources=RegularBrowserKeeper.player_sources.__get__(self.k)
-        self.k._json=AsyncMock(side_effect=TimeoutError())
+        self.k._catalog=AsyncMock(side_effect=TimeoutError())
         self.k._companion_info={'firefox':{'capabilities':['user-source-v1']}}
         metadata=await self.k.player_sources('game',include_catalog=False)
-        self.assertTrue(metadata['user_source']['available']);self.k._json.assert_not_awaited()
+        self.assertTrue(metadata['user_source']['available']);self.k._catalog.assert_not_awaited()
         with self.assertRaises(TimeoutError):await self.k.player_sources('game')
         self.assertIn('timed out',await self.k.switch_source('game','https://streamed.pk/watch/game/golf/2'))
         self.k.command.assert_not_awaited()
@@ -158,7 +165,7 @@ class SourcePickerTests(unittest.IsolatedAsyncioTestCase):
         self.k.command.assert_not_awaited()  # Never duplicate a still-owned window.
 
     async def test_normal_catalog_timeout_http_contract_is_preserved(self):
-        self.k.player_sources=RegularBrowserKeeper.player_sources.__get__(self.k);self.k._json=AsyncMock(side_effect=TimeoutError())
+        self.k.player_sources=RegularBrowserKeeper.player_sources.__get__(self.k);self.k._catalog=AsyncMock(side_effect=TimeoutError())
         api=StreamKeeperAPI(self.k,self.k.config);client=TestClient(TestServer(api.app));await client.start_server()
         try:
             r=await client.get('/player-sources?stream_id=game',headers={'Authorization':'Bearer test'})

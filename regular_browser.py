@@ -33,11 +33,10 @@ from manual_layout import validate_manual_layout,manual_placements
 from session_planner import build_plan, validate_spec, reserve_sports
 from resource_monitor import ResourceMonitor
 from user_source import validate_user_source_url, USER_SOURCE_CAPABILITY, USER_SOURCE_VERSION
+from catalog_providers import Catalog, CatalogUnavailable, stream_rank
 
 log=logging.getLogger('stream-keeper.regular')
 
-class CatalogUnavailable(ValueError):
-    """Upstream stream catalog could not be read; existing streams are left untouched."""
 ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv')
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
@@ -45,12 +44,6 @@ PLACEMENT_READY_TIMEOUT=40
 PLACEMENT_RETRY_INTERVAL=1
 PLACEMENT_COMMAND_TIMEOUT=3
 PLAYBACK_POLL_INTERVAL=.1
-def stream_rank(item):
-    # Most-watched source first; English and then HD only break ties. Unknown counts rank as zero.
-    viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else 0
-    language=str(item.get('language')or'').strip().lower()
-    english=language=='english'or language.startswith('english')and not language[7:8].isalpha()
-    return (viewers,english,bool(item.get('hd')))
 WRESTLING_TITLE=re.compile(r'\b(wwe|aew|nxt|tna|impact|roh|njpw|stardom|noah|gcw|wrestl\w*|smackdown|raw|dynamite|collision|rampage|lucha|aaa|cmll)\b',re.I)
 def wrestling_category(match):
     """Streamed files wrestling under 'fight'; expose it as its own sport."""
@@ -64,12 +57,17 @@ def validate_url(url):
         raise ValueError('Regular mode supports allowlisted HTTPS stream/player hosts only')
     return url
 
+def allowlisted(url):
+    try:validate_url(url);return True
+    except ValueError:return False
+
 def recovery_record(value):
     if not isinstance(value,dict)or type(value.get('attempts'))is not int or not 0<=value['attempts']<=3:return None
     if not isinstance(value.get('tried'),list)or len(value['tried'])>10:return None
     if 'user_source'in value and type(value['user_source'])is not bool:return None
     record={'attempts':value['attempts'],'tried':value['tried']}
     if value.get('user_source')is True:record['user_source']=True
+    if value.get('user_source')is True and value.get('catalog')is True:record['catalog']=True
     validator=validate_user_source_url if record.get('user_source')else validate_url
     try:
         for url in record['tried']:validator(url)
@@ -115,6 +113,7 @@ class RegularBrowserKeeper:
         self.layout_status={'success':False,'message':'No companion connected'}
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
+        self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
         self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={}
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
@@ -255,7 +254,9 @@ class RegularBrowserKeeper:
                     saved=self._recovery.get(sid,{})
                     if not saved.get('pending_release')and(not saved.get('user_source')or saved.get('url')==r['url']):
                         saved=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
+                        manual=saved.get('user_source')is True and not saved.get('catalog')
                         saved.update(url=r['url'],user_source=True)
+                        if not manual and self.catalog.known_url(r['url']):saved['catalog']=True
             for sid,s in list(self.active_streams.items()):
                 if s.browser==browser and sid not in records:
                     self.active_streams.pop(sid,None)
@@ -346,9 +347,13 @@ class RegularBrowserKeeper:
             if sid in self.active_streams:return
             selected=self._recovery.get(sid,{})
             user_source=selected.get('user_source')is True and selected.get('url')==url
+            # Catalog providers rotate player hosts the signed allowlist cannot name, so their URLs
+            # travel as companion user sources while staying eligible for automatic recovery.
+            catalog=(user_source and selected.get('catalog')is True)or(not user_source and self.catalog.known_url(url)and not allowlisted(url))
+            user_source=user_source or catalog
             if user_source:
                 validate_user_source_url(url)
-                if USER_SOURCE_CAPABILITY not in self._companion_info.get(browser,{}).get('capabilities',[]):raise ValueError('Install signed companion '+USER_SOURCE_VERSION+' to use a supplied URL; existing streams preserved')
+                if USER_SOURCE_CAPABILITY not in self._companion_info.get(browser,{}).get('capabilities',[]):raise ValueError('Install signed companion '+USER_SOURCE_VERSION+' to use '+('catalog sources'if catalog else 'a supplied URL')+'; existing streams preserved')
             else:validate_url(url)
             host=urlparse(url).hostname or ''
             if (host=='onhockey.tv'or host.endswith('.onhockey.tv'))and 'onhockey-v1'not in self._companion_info.get(browser,{}).get('capabilities',[]):
@@ -357,6 +362,9 @@ class RegularBrowserKeeper:
             record=await self.command(browser,'open',stream_id=sid,url=url,label=label,session_id=session_id,start_muted=self.config.get('session',{}).get('start_muted',True),allow_replacement=allow_replacement,**({'user_source':True}if user_source else {}))
             if user_source and(not isinstance(record,dict)or record.get('url')!=url or record.get('userSource')is not True):
                 raise ValueError('Browser did not confirm the selected URL; source remains saved for retry')
+            if catalog:
+                saved=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
+                saved.update(url=url,user_source=True,catalog=True)
             self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id,user_source=user_source));self._save()
             if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
                 self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
@@ -534,19 +542,14 @@ class RegularBrowserKeeper:
         supported=USER_SOURCE_CAPABILITY in self._companion_info.get(stream.browser,{}).get('capabilities',[])
         custom={'available':supported,'requires_companion':None if supported else USER_SOURCE_VERSION,'current_url':stream.url if getattr(stream,'user_source',False)else None}
         if not include_catalog:return dict(stream_id=sid,choices=[],user_source=custom)
-        matches=await asyncio.wait_for(self._json('matches/all'),10)
-        row=next((r for r in matches if isinstance(r,dict)and r.get('id')==sid),None)
+        matches=(await asyncio.wait_for(self._catalog(max_age=60),15))['matches']
+        row=next((r for r in matches if r.get('id')==sid),None)
         if not row:raise ValueError('This game is no longer in the source catalog')
-        choices=[];seen=set()
-        for source in (row.get('sources')or[])[:3]:
-            if not isinstance(source,dict)or not isinstance(source.get('source'),str)or not isinstance(source.get('id'),str):continue
-            try:streams=await asyncio.wait_for(self._json('stream/'+quote(source['source'],safe='')+'/'+quote(source['id'],safe='')),8)
-            except (aiohttp.ClientError,asyncio.TimeoutError,ValueError):continue
-            for item in streams[:30]:
-                if not isinstance(item,dict)or type(item.get('streamNo'))is not int or item['streamNo']<1:continue
-                url='https://streamed.pk/watch/'+quote(sid,safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
-                if url in seen:continue
-                seen.add(url);choices.append(dict(url=url,source=source['source'],number=item['streamNo'],language=str(item.get('language')or'Unknown')[:50],hd=item.get('hd')is True,viewers=item.get('viewers')if type(item.get('viewers'))in(int,float)and math.isfinite(item['viewers'])else None,current=url==self.active_streams.get(sid,SimpleNamespace(url=None)).url))
+        labels={p.name:p.label for p in self.catalog.providers};counts={};choices=[]
+        for item in row['sources'][:30]:
+            counts[item['provider']]=counts.get(item['provider'],0)+1
+            language=item['label']+(' · '+item['language']if item.get('language')else '')
+            choices.append(dict(url=item['url'],source=labels.get(item['provider'],item['provider']),provider=item['provider'],number=counts[item['provider']],language=language[:80],hd=item.get('hd')is True,viewers=item.get('viewers'),current=item['url']==stream.url))
         # Wrestling games may also switch to a watch-wrestling embed resolved by Mithrandir.
         return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling',user_source=custom)
 
@@ -572,7 +575,7 @@ class RegularBrowserKeeper:
                 if self.active_streams.get(sid)is not stream:raise ValueError('Game changed while loading sources')
                 placements=[p for p in self.layout_status.get('placements',[])if p['stream_id']in self.active_streams]
                 record=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
-                record.update(pending_release=True,url=url,user_source=user_source,last_action=time.time(),message='Manual source switch requested');record.pop('since',None)
+                record.update(pending_release=True,url=url,user_source=user_source,last_action=time.time(),message='Manual source switch requested');record.pop('since',None);record.pop('catalog',None)
                 self._releasing.add(sid);self._save()
                 if await self.command_for(sid,'close')is not True:raise ValueError('Source close unconfirmed; no replacement opened')
                 audit=await self.command(stream.browser,'inventory')
@@ -756,48 +759,22 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
-    async def _json(self,path):
-        try:
-            async with self._client.get('https://streamed.pk/api/'+path) as res:
-                res.raise_for_status()
-                # The catalog sits behind a bot-challenge that answers 200 text/html to non-browser clients.
-                if 'json' not in (res.content_type or ''):raise CatalogUnavailable('Streamed catalog returned '+(res.content_type or 'no content type')+' for '+path)
-                value=await res.json()
-        except (aiohttp.ClientError,asyncio.TimeoutError)as e:raise CatalogUnavailable('Streamed catalog request failed for '+path+': '+type(e).__name__)from e
-        if not isinstance(value,list):raise CatalogUnavailable('Invalid Streamed catalog response for '+path)
-        if path.startswith('matches/'):
-            for m in value:wrestling_category(m)
-        return value
+        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.health.summary(self.catalog.providers),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
+    async def _catalog(self,max_age=0):
+        # Every provider is polled together; one failing site only drops its sources.
+        if self.catalog.last and time.time()-self.catalog.last_at<=max_age:return self.catalog.last
+        return await self.catalog.fetch(self._client)
     async def discover(self,spec,until_ms=None):
         await self.refresh_displays()
         displays=self._displays();spec={**spec,'display':self._display_target(spec.get('display','dock'))}
-        all_matches,live=await asyncio.gather(self._json('matches/all'),self._json('matches/live'))
-        merged={m['id']:m for m in all_matches+live if isinstance(m,dict) and isinstance(m.get('id'),str)}
-        selected=[m for m in merged.values()if m.get('category') in spec['sports'] and type(m.get('date'))in(int,float)and m['date']>0]
-        viewers={};playback={};semaphore=asyncio.Semaphore(4)
-        async def measure(match):
-            counts=[];candidates=[]
-            for source in (match.get('sources')or[])[:3]:
-                if not isinstance(source,dict):continue
-                try:
-                    async with semaphore:streams=await self._json('stream/'+quote(source['source'],safe='')+'/'+quote(source['id'],safe=''))
-                    candidates.extend((source['source'],s)for s in streams if isinstance(s,dict) and type(s.get('streamNo')) is int and s['streamNo']>0)
-                    counts.extend(s['viewers'] for s in streams if isinstance(s,dict) and type(s.get('viewers')) in (int,float) and s['viewers']>=0)
-                except (aiohttp.ClientError,asyncio.TimeoutError,ValueError,KeyError):pass
-            if counts:viewers[match['id']]=max(counts)
-            if candidates:
-                source,s=max(candidates,key=lambda v:stream_rank(v[1]))
-                playback[match['id']]='https://streamed.pk/watch/'+quote(match['id'],safe='')+'/'+quote(source,safe='')+'/'+str(s['streamNo'])
+        matches=(await self._catalog())['matches']
         now_ms=int(time.time()*1000);lead=spec.get('preload_minutes',10)*60000
-        live_ids={m['id']for m in live if isinstance(m,dict)and isinstance(m.get('id'),str)}
-        measured=[m for m in selected if m['id'] in live_ids or now_ms-1800000<=m['date']<=now_ms+lead]
-        try:await asyncio.wait_for(asyncio.gather(*(measure(m)for m in measured)),20)
-        except asyncio.TimeoutError:pass # Partial viewer evidence; still schedule later starts.
-        missing=sum(m['id']not in playback for m in measured)
-        if missing:log.warning('Source measurement incomplete: %d of %d matches lack a ranked playback URL',missing,len(measured))
+        live_ids={m['id']for m in matches if m['live']}
+        selected=[m for m in matches if m['category']in spec['sports']]
+        viewers={m['id']:m['viewers']for m in selected if m['viewers']is not None}
+        playback={m['id']:m['sources'][0]['url']for m in selected if m['sources']}
         ready_ids=live_ids|{m['id']for m in selected if m['id']in playback and now_ms-1800000<=m['date']<=now_ms+lead}
-        plan=build_plan(list(merged.values()),ready_ids,viewers,spec,displays,int(time.time()*1000),until_ms)
+        plan=build_plan(matches,ready_ids,viewers,spec,displays,now_ms,until_ms)
         for row in plan['live']:
             row['playback_url']=playback.get(row['id']);row['source_ready']=bool(playback.get(row['id']));row['prestart']=row['id']not in live_ids and row['start_ms']>now_ms;row['live']=row['id']in live_ids
         return plan
@@ -1021,30 +998,25 @@ class RegularBrowserKeeper:
         return bool(buffering)and all(v[1].get('state')in ('NO_VIDEO','BUFFERING')for v in rows)and all(key in self._progress and 15<=now-self._progress[key]<=300 and v[1].get('paused')is not True and not v[1].get('ended')for key,v in buffering)
 
     async def _opening_url(self,row,deadline):
-        # Saved recovery URL, then the discovery choice, then a bounded viewer-ranked
-        # lookup; only an unavailable lookup falls back to the first source's stream 1.
+        # Saved recovery URL, then the discovery choice, then the next ranked catalog source.
         url=self._recovery.get(row['id'],{}).get('url')or row.get('playback_url')
         if url:return url
-        remaining=deadline-asyncio.get_running_loop().time()
-        if self._client and remaining>0:
-            try:url=await asyncio.wait_for(self._recovery_sources(row,None,[]),min(8,remaining))
-            except Exception:log.warning('Ranked source lookup failed for %s; using first source',row['id'])
-        return url or 'https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(row['sources'][0]['source'],safe='')+'/1'
+        try:url=await self._recovery_sources(row,None,[])
+        except Exception:log.warning('Ranked source lookup failed for %s; using first source',row['id']);url=None
+        first=next((s['url']for s in row.get('sources')or[]if isinstance(s,dict)and s.get('url')),None)
+        if not(url or first):raise ValueError('no catalog source available')
+        return url or first
     def _openable(self,sid):
         return sid not in self.active_streams and sid not in self.suppressed|self._ownership_lost|self._releasing
     async def _recovery_sources(self,row,current,tried):
-        if self._recovery.get(row['id'],{}).get('user_source')is True:return None
-        choices=[]
-        for source in (row.get('sources')or[])[:3]:
-            try:
-                streams=await self._json('stream/'+quote(source['source'],safe='')+'/'+quote(source['id'],safe=''))
-                for item in streams:
-                    if not isinstance(item,dict)or type(item.get('streamNo'))is not int or item['streamNo']<1:continue
-                    url='https://streamed.pk/watch/'+quote(row['id'],safe='')+'/'+quote(source['source'],safe='')+'/'+str(item['streamNo'])
-                    if url!=current and url not in tried:
-                        choices.append((stream_rank(item),url))
-            except (aiohttp.ClientError,asyncio.TimeoutError,ValueError,KeyError,TypeError):continue
-        return max(choices,key=lambda c:c[0])[1]if choices else None
+        # A URL Ben supplied is never replaced automatically; catalog URLs fall through every provider.
+        saved=self._recovery.get(row['id'],{})
+        if saved.get('user_source')is True and not saved.get('catalog'):return None
+        sources=row.get('sources')or[]
+        if self.catalog.last:
+            fresh=next((m for m in self.catalog.last['matches']if m['id']==row['id']),None)
+            if fresh:sources=fresh['sources']
+        return next((s['url']for s in sources if isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried),None)
 
     async def _recover_no_video(self,plan):
         # Called under the same lock as layout/stop. One action per minute tick,
@@ -1195,6 +1167,11 @@ class RegularBrowserKeeper:
         while True:
             await asyncio.sleep(10)
             await self.refresh_resources()
+            if not self.session and self._client and time.time()-getattr(self,'_last_health_poll',0)>=300:
+                # Keep gathering provider consistency evidence between sessions, outside the control lock.
+                self._last_health_poll=time.time()
+                try:await self._catalog()
+                except Exception as e:log.warning('Provider health poll failed: %s',e)
             async with self._lock:
                 # Drop evidence only for departed streams; active stale frames still block recovery.
                 for key in [k for k in self._frames if k[0]not in self.active_streams]:del self._frames[key]

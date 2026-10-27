@@ -76,18 +76,25 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.k._recovery_sources.side_effect=closed;await self.tick(1200)
         self.assertIn('0',self.k.suppressed);self.assertEqual(self.k.command.await_count,1)
 
-    async def test_source_catalog_filters_tried_invalid_and_prefers_english(self):
-        row={'id':'0','sources':[{'source':'golf','id':'a'}]}
-        self.k._json=AsyncMock(return_value=[{'streamNo':1,'language':'English'},{'streamNo':2,'language':'French','hd':True},{'streamNo':3,'language':'English'},{'streamNo':True}])
-        result=await self.k._recovery_sources(row,'https://streamed.pk/watch/0/golf/1',[])
-        self.assertEqual(result,'https://streamed.pk/watch/0/golf/3')
-        self.k._json.assert_awaited_once_with('stream/golf/a')
+    async def test_recovery_walks_ranked_sources_across_providers_skipping_current_and_tried(self):
+        row={'id':'0','sources':[{'url':'https://a.example/1','provider':'ppv'},{'url':'https://b.example/2','provider':'timstreams'},{'url':'https://c.example/3','provider':'rockylive'},{'provider':'ppv'}]}
+        self.assertEqual(await self.k._recovery_sources(row,'https://a.example/1',[]),'https://b.example/2')
+        self.assertEqual(await self.k._recovery_sources(row,'https://a.example/1',['https://b.example/2']),'https://c.example/3')
+        self.assertIsNone(await self.k._recovery_sources(row,'https://a.example/1',['https://b.example/2','https://c.example/3']))
 
-    async def test_source_catalog_prefers_viewers_then_english_on_ties(self):
-        row={'id':'0','sources':[{'source':'golf','id':'a'}]}
-        self.k._json=AsyncMock(return_value=[{'streamNo':1,'language':'English'},{'streamNo':2,'language':'French','hd':True,'viewers':900},{'streamNo':3,'language':'English','viewers':40},{'streamNo':4,'language':'English','viewers':900}])
-        result=await self.k._recovery_sources(row,'https://streamed.pk/watch/0/golf/1',[])
-        self.assertEqual(result,'https://streamed.pk/watch/0/golf/4')
+    async def test_recovery_prefers_fresh_catalog_sources_over_stale_plan_row(self):
+        row={'id':'0','sources':[{'url':'https://stale.example/1','provider':'ppv'}]}
+        self.k.catalog.last={'matches':[{'id':'0','sources':[{'url':'https://fresh.example/1','provider':'streamfree'}]}]}
+        self.assertEqual(await self.k._recovery_sources(row,None,[]),'https://fresh.example/1')
+
+    async def test_supplied_url_is_never_auto_replaced_but_catalog_transport_is(self):
+        row={'id':'0','sources':[{'url':'https://b.example/2','provider':'ppv'}]}
+        self.k._recovery['0']={'attempts':0,'tried':[],'url':'https://mine.example/','user_source':True}
+        self.assertIsNone(await self.k._recovery_sources(row,'https://mine.example/',[]))
+        self.k._recovery['0']['catalog']=True
+        self.assertEqual(await self.k._recovery_sources(row,'https://mine.example/',[]),'https://b.example/2')
+
+    def test_stream_rank_prefers_viewers_then_english_on_ties(self):
         self.assertEqual(stream_rank({'language':'English'}),(0,True,False))
         self.assertGreater(stream_rank({'language':'French','viewers':901}),stream_rank({'language':'English','viewers':900}))
 

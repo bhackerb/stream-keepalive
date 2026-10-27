@@ -11,6 +11,9 @@ from regular_browser import RegularBrowserKeeper,validate_url
 from session_planner import build_plan
 from native_host import read_message,write_message,launch_allowed
 from test_session_planner import D,game
+
+def source(url,provider='ppv',viewers=None,**extra):
+    return dict(url=url,provider=provider,label='admin',language='English',hd=False,viewers=viewers,**extra)
 class NativeTests(unittest.TestCase):
     def test_framing_and_origin_validation(self):
         f=io.BytesIO();write_message(f,{'event':'hello','label':'⚽'});f.seek(0)
@@ -34,7 +37,7 @@ class RegularTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):self.tmp.cleanup()
     def plan(self,n):
         games=[game(i)for i in range(n)]
-        for g in games:g['sources']=[{'source':'admin','id':g['id']}]
+        for g in games:g['sources']=[source('https://streamed.pk/watch/'+g['id']+'/admin/1')]
         return build_plan(games,{g['id']for g in games},{},{'sports':['hockey','baseball']},D,1000000)
     async def test_later_join_is_idempotent_and_never_reloads_current_games(self):
         await self.k._reconcile(self.plan(5));await self.k._reconcile(self.plan(5));await self.k._reconcile(self.plan(7))
