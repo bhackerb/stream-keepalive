@@ -11,6 +11,8 @@ from typing import Optional, TYPE_CHECKING
 
 from aiohttp import web
 
+from regular_browser import CatalogUnavailable
+
 if TYPE_CHECKING:
     from stream_keeper import StreamKeeper
 
@@ -101,6 +103,9 @@ class StreamKeeperAPI:
             if not isinstance(body, dict):
                 raise ValueError("Expected session object")
             return web.json_response(await self.keeper.session_action(body))
+        except CatalogUnavailable as exc:
+            logger.warning("Session catalog unavailable: %s", exc)
+            return web.json_response({"success": False, "message": f"{exc}; existing streams preserved"}, status=502)
         except (ValueError, TypeError) as exc:
             return web.json_response({"success": False, "message": str(exc)}, status=400)
         except Exception:

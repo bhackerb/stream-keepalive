@@ -35,6 +35,9 @@ from resource_monitor import ResourceMonitor
 from user_source import validate_user_source_url, USER_SOURCE_CAPABILITY, USER_SOURCE_VERSION
 
 log=logging.getLogger('stream-keeper.regular')
+
+class CatalogUnavailable(ValueError):
+    """Upstream stream catalog could not be read; existing streams are left untouched."""
 ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv')
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
@@ -755,12 +758,17 @@ class RegularBrowserKeeper:
     def extra_status(self):
         return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout}}
     async def _json(self,path):
-        async with self._client.get('https://streamed.pk/api/'+path) as res:
-            res.raise_for_status();value=await res.json()
-            if not isinstance(value,list):raise ValueError('Invalid Streamed catalog response')
-            if path.startswith('matches/'):
-                for m in value:wrestling_category(m)
-            return value
+        try:
+            async with self._client.get('https://streamed.pk/api/'+path) as res:
+                res.raise_for_status()
+                # The catalog sits behind a bot-challenge that answers 200 text/html to non-browser clients.
+                if 'json' not in (res.content_type or ''):raise CatalogUnavailable('Streamed catalog returned '+(res.content_type or 'no content type')+' for '+path)
+                value=await res.json()
+        except (aiohttp.ClientError,asyncio.TimeoutError)as e:raise CatalogUnavailable('Streamed catalog request failed for '+path+': '+type(e).__name__)from e
+        if not isinstance(value,list):raise CatalogUnavailable('Invalid Streamed catalog response for '+path)
+        if path.startswith('matches/'):
+            for m in value:wrestling_category(m)
+        return value
     async def discover(self,spec,until_ms=None):
         await self.refresh_displays()
         displays=self._displays();spec={**spec,'display':self._display_target(spec.get('display','dock'))}
