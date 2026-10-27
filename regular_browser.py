@@ -407,6 +407,8 @@ class RegularBrowserKeeper:
             await self.command_for(target,'reload');self._reload_times[target]=time.time()
             for key in list(self._frames):
                 if key[0]==target:del self._frames[key];self._progress.pop(key,None)
+            # A reloaded page starts from scratch, so the autoplay ladder runs again for it.
+            self._start_autoplay(target)
         if skipped and len(skipped)==len(targets):return '❌ Reload budget: at most once per stream per 10 minutes'
         return 'Explicit reload requested'+('; skipped (reloaded within 10 minutes): '+', '.join(skipped)if skipped else '')
     async def force_unmute(self,sid=None):
