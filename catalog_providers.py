@@ -6,14 +6,16 @@ failing only drops its sources. Per-provider health accumulates the consistency 
 (reachability, live coverage) that ranks playback choices and shows which sites hold up.
 """
 import asyncio
+import html
 import json
 import math
 import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -23,6 +25,7 @@ import aiohttp
 ET = ZoneInfo('America/New_York')
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0'
 HEALTH_WINDOW = 288  # polls kept per provider (~24h of 5-minute background polls)
+ALIAS_TTL_MS = 48 * 3600_000  # game ids must outlive a session so restarts never duplicate a window
 STALE_EVENT_MS = 8 * 3600_000  # 24/7 channels carry months-old start times; skip them
 MATCH_WINDOW_MS = 3 * 3600_000
 FINISHED_STATUSES = {'FT', 'AET', 'PEN', 'FIN', 'FINAL', 'ENDED', 'CANC', 'CANCELLED', 'PST', 'POSTP', 'ABD', 'AWD', 'WO'}
@@ -210,12 +213,44 @@ def parse_cdnlivetv(payload, now_ms):
     return events
 
 
+ONHOCKEY_LEAGUE = re.compile(r"<tbody class='[^']*'>.*?<b>([^<]+)</b>(.*?)(?=<tbody class=|$)", re.S)
+ONHOCKEY_GAME = re.compile(r"<tr class='game'[^>]*><td><text class='game_hour'[^>]*>(\d{1,2})</text>:(\d{2})</td><td>([^<]*)<div class='gamelinks'[^>]*>(.*?)</div>", re.S)
+ONHOCKEY_LINK = re.compile(r"<a href='(np_stream400\.php\?channel=//[^'\s]+)'[^>]*?title='([^']*)'[^>]*>([^<]*)</a>")
+
+
+def parse_onhockey(page, now_ms):
+    """OnHockey's board is a rolling ~24h window of UTC hours with no dates."""
+    now = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
+    events = []
+    for league, body in ONHOCKEY_LEAGUE.findall(page):
+        for hour, minute, title, links in ONHOCKEY_GAME.findall(body):
+            start = now.replace(hour=int(hour) % 24, minute=int(minute) % 60, second=0, microsecond=0)
+            if start < now - timedelta(hours=6):
+                start += timedelta(days=1)
+            elif start > now + timedelta(hours=20):
+                start -= timedelta(days=1)
+            streams = []
+            for segment in re.split(r'<br>', links):
+                language = re.match(r'\s*([a-z]+):', segment)
+                for href, channel, name in ONHOCKEY_LINK.findall(segment):
+                    label = ' · '.join(x for x in (html.unescape(channel).strip(), html.unescape(name).strip()) if x)
+                    streams.append(_stream('https://www.onhockey.tv/' + html.unescape(href), label or 'OnHockey',
+                                           language=language.group(1).capitalize() if language else None))
+            name = html.unescape(title).strip()
+            start_ms = int(start.timestamp() * 1000)
+            events.append(_event('onhockey', f'{league}|{name}|{hour}:{minute}', name, 'hockey', start_ms, streams, end_ms=start_ms + 12600_000))
+    return events
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
     label: str
     urls: tuple  # mirrors, tried in order
     parse: Callable
+    kind: str = 'json'
+    headers: tuple = ()  # extra request headers the site's own page sends
+    sports: tuple = ()  # specialists are scored only against live games in their sports
 
 
 PROVIDERS = (
@@ -224,6 +259,8 @@ PROVIDERS = (
     Provider('timstreams', 'TimStreams', ('https://timst.top/api/live-upcoming', 'https://tim-streams.com/api/live-upcoming'), parse_timstreams),
     Provider('rockylive', 'Rockylive', ('https://rockylive.st/api-event.php',), parse_rockylive),
     Provider('cdnlivetv', 'CDN Live TV', ('https://api.cdnlivetv.is/api/v1/events/sports/',), parse_cdnlivetv),
+    Provider('onhockey', 'OnHockey', ('https://www.onhockey.tv/schedule_table.php',), parse_onhockey, kind='html',
+             headers=(('Referer', 'https://www.onhockey.tv/'),), sports=('hockey',)),
 )
 
 
@@ -241,6 +278,11 @@ def same_game(a, b):
     return abs(a['start_ms'] - b['start_ms']) <= 5400_000 and bool(left | right) and len(left & right) / len(left | right) >= .5
 
 
+def naming_rank(event):
+    # Fullest team names name the game, so a short-form listing ("Detroit") never renames it.
+    return sum(len(team_tokens(t)) for t in event['teams']) if len(event['teams']) == 2 else 0
+
+
 def event_key(event):
     date = datetime.fromtimestamp(event['start_ms'] / 1000, ET).strftime('%Y-%m-%d')
     names = [words(t)[-1] for t in event['teams'] if words(t)] if len(event['teams']) == 2 else []
@@ -256,9 +298,12 @@ class ProviderHealth:
     def __init__(self, path):
         self.path = Path(path)
         self.polls = {}
+        self.aliases = {}  # 'provider|pid' -> [match id, last seen ms]
         try:
             saved = json.loads(self.path.read_text())
             self.polls = {k: v[-HEALTH_WINDOW:] for k, v in saved.get('polls', {}).items() if isinstance(v, list)}
+            self.aliases = {k: v for k, v in saved.get('aliases', {}).items()
+                            if isinstance(v, list) and len(v) == 2 and isinstance(v[0], str) and isinstance(v[1], int)}
         except (OSError, ValueError, AttributeError):
             pass
 
@@ -272,7 +317,7 @@ class ProviderHealth:
             temp = self.path.with_suffix('.tmp')
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w') as f:
-                f.write(json.dumps({'polls': self.polls}))
+                f.write(json.dumps({'polls': self.polls, 'aliases': self.aliases}))
             temp.replace(self.path)
         except OSError:
             pass  # evidence is advisory; never block playback on it
@@ -311,24 +356,24 @@ class Catalog:
         self.last_at = 0
         self.urls = set()
         self._previous_urls = set()
-        self._aliases = {}  # (provider, pid) -> match id; keeps ids stable as providers come and go
 
     async def _fetch_provider(self, client, provider, now_ms):
         error = None
         for url in provider.urls:
             started = time.monotonic()
             try:
-                async with client.get(url, headers={'User-Agent': USER_AGENT, 'Accept': 'application/json'}) as res:
+                headers = {'User-Agent': USER_AGENT, 'Accept': 'application/json' if provider.kind == 'json' else 'text/html', **dict(provider.headers)}
+                async with client.get(url, headers=headers) as res:
                     res.raise_for_status()
-                    if 'json' not in (res.content_type or ''):
+                    if provider.kind not in (res.content_type or ''):
                         raise ValueError('returned ' + (res.content_type or 'no content type'))
-                    payload = await res.json()
+                    payload = await res.json() if provider.kind == 'json' else await res.text()
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
                 error = f'{url}: {type(e).__name__} {str(e)[:120]}'.strip()
                 continue
             latency = int((time.monotonic() - started) * 1000)
             try:  # a changed schema is a provider failure, not a catalog crash
-                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, dict) else None
+                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, dict if provider.kind == 'json' else str) else None
             except (KeyError, TypeError, ValueError, AttributeError) as e:
                 events, error = None, f'{url}: schema changed ({type(e).__name__})'
             if events is None:
@@ -353,12 +398,13 @@ class Catalog:
             self.health.save()
             raise CatalogUnavailable('No stream catalog reachable: ' + '; '.join(f'{k} {v["error"]}' for k, v in polls.items())[:400])
         matches = self._merge(events, now_ms)
-        live = [m for m in matches if m['live']]
-        for name, poll in polls.items():
+        for provider in self.providers:
+            poll = polls[provider.name]
             if poll['ok']:
-                poll['live'] = sum(1 for m in live if name in m['providers'])
+                live = [m for m in matches if m['live'] and (not provider.sports or m['category'] in provider.sports)]
+                poll['live'] = sum(1 for m in live if provider.name in m['providers'])
                 poll['coverage'] = round(poll['live'] / len(live), 3) if live else None
-            self.health.record(name, poll)
+            self.health.record(provider.name, poll)
         self.health.save()
         for match in matches:
             match['sources'] = self.rank(match['sources'])
@@ -384,22 +430,25 @@ class Catalog:
             else:
                 clusters.append([event])
         matches, used = [], set()
+        aliases = self.health.aliases
         for cluster in clusters:
             primary = cluster[0]
-            mid = next((self._aliases[(e['provider'], e['pid'])] for e in cluster if (e['provider'], e['pid']) in self._aliases), None)
-            if not mid or mid in used:
-                base = min(event_key(e) for e in cluster)
+            best = max(cluster, key=lambda e: (naming_rank(e), -order.get(e['provider'], 99)))
+            known = Counter(aliases[f"{e['provider']}|{e['pid']}"][0] for e in cluster if f"{e['provider']}|{e['pid']}" in aliases)
+            mid = next((m for m, _ in known.most_common() if m not in used), None)
+            if not mid:
+                base = event_key(best)
                 mid, suffix = base, 2
                 while mid in used:
                     mid, suffix = f'{base}-{suffix}', suffix + 1
             used.add(mid)
             for e in cluster:
-                self._aliases[(e['provider'], e['pid'])] = mid
+                aliases[f"{e['provider']}|{e['pid']}"] = [mid, now_ms]
             start = min(e['start_ms'] for e in cluster)
             ends = [e['end_ms'] for e in cluster if e['end_ms']]
             declared = [e['live'] for e in cluster if e['live'] is not None]
             live = any(declared) if declared else start <= now_ms and (not ends or now_ms < max(ends))
-            teams = next((e['teams'] for e in cluster if len(e['teams']) == 2), [])
+            teams = best['teams'] if len(best['teams']) == 2 else []
             viewers = [e['viewers'] for e in cluster if e['viewers'] is not None]
             sources, seen = [], set()
             for e in cluster:
@@ -408,13 +457,13 @@ class Catalog:
                         seen.add(s['url'])
                         sources.append(dict(s, provider=e['provider']))
             matches.append({
-                'id': mid, 'title': primary['title'], 'category': primary['category'], 'date': start, 'live': live,
+                'id': mid, 'title': best['title'], 'category': primary['category'], 'date': start, 'live': live,
                 'teams': {'home': {'name': teams[0]}, 'away': {'name': teams[1]}} if teams else {},
                 'viewers': max(viewers) if viewers else None, 'providers': sorted({e['provider'] for e in cluster}),
                 'sources': sources,
             })
-        if len(self._aliases) > 20000:
-            self._aliases = {k: v for k, v in self._aliases.items() if v in used}
+        for key in [k for k, (_, seen_ms) in aliases.items() if now_ms - seen_ms > ALIAS_TTL_MS]:
+            del aliases[key]
         return matches
 
 

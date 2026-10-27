@@ -203,8 +203,14 @@ Installing the companion does not install an ad blocker.
 
 Streamed closed in October 2026. Session discovery now polls every provider in
 `catalog_providers.py` together (PPV.ST, StreamFree, TimStreams, Rockylive,
-CDN Live TV; mirrors tried in order) and merges the same game across sites, so
-no site is primary. One provider failing, walled, or changing its schema only
+CDN Live TV, and OnHockey for hockey; mirrors tried in order) and merges the
+same game across sites, so no site is primary. OnHockey has no API: its
+schedule table is read as HTML with the Referer its own page sends, its UTC
+hours resolve to the nearest day, and its links stay on allowlisted
+`onhockey.tv` wrapper pages (companion 0.2.6+). Specialist providers are
+scored only against live games in their own sports. Game ids come from the
+fullest team names and persist for 48 hours, so a short-name listing or a
+restart never renames a game that is already on screen. One provider failing, walled, or changing its schema only
 drops its sources; `/session` returns 502 only when every provider is down.
 
 Playback choices rank by provider consistency, then viewers, English, and HD.

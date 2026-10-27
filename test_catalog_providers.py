@@ -53,7 +53,27 @@ CDN = {'cdn-live-tv': {'NHL': [
     {'gameID': 'g2', 'event': 'Old Game', 'homeTeam': 'A', 'awayTeam': 'B', 'start': '2026-10-26 18:00', 'status': 'FT',
      'channels': [{'channel_name': 'X', 'url': 'https://cdn.example/old'}]},
 ], 'total_events_nhl': 2}}
-PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN}
+ONHOCKEY = """<table id='gametable'>
+<tbody class='NAp'><tr><td></td><td><b>NHL</b></td><td></td></tr>
+<tr class='game' onclick='javascript:Menu(this)'><td><text class='game_hour' align='left'>00</text>:30</td><td>Toronto - Calgary Flames
+<div class='gamelinks' onclick='event.stopPropagation()'>
+english:
+<a href='np_stream400.php?channel=//embed.example/nhl/tor-cgy/1' target='player_frame' title='SN+'>streamd</a>
+<a href='np_stream400.php?channel=//other.example/ch?id=4' target='player_frame' title='ESPN+'>vertex</a>
+<br>russian:
+<a href='np_stream400.php?channel=//ru.example/x' target='player_frame' title=''>embedv</a>
+<a href='np_vk.php?channel=-41593209%26id=456254371' target='player_frame' title=''>vklive</a>
+</div></td></tr>
+<tbody class='FI'><tr><td></td><td><b>Liiga</b></td><td></td></tr>
+<tr class='game' onclick='javascript:Menu(this)'><td><text class='game_hour' align='left'>16</text>:30</td><td>KalPa - Vaasan Sport
+<div class='gamelinks' onclick='event.stopPropagation()'>
+<a href='np_stream400.php?channel=//fi.example/kalpa' target='player_frame' title='Ruutu'>ruutu</a>
+</div></td></tr>
+<tr class='game' onclick='javascript:Menu(this)'><td><text class='game_hour' align='left'>17</text>:00</td><td>No Links - Yet
+<div class='gamelinks' onclick='event.stopPropagation()'>
+</div></td></tr>
+</table>"""
+PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY)}
 
 
 def fake_client(routes):
@@ -65,7 +85,7 @@ def fake_client(routes):
             cm.__aenter__ = AsyncMock(side_effect=value)
         else:
             content_type, payload = value if isinstance(value, tuple) else ('application/json', value)
-            res = MagicMock(content_type=content_type, raise_for_status=MagicMock(), json=AsyncMock(return_value=payload))
+            res = MagicMock(content_type=content_type, raise_for_status=MagicMock(), json=AsyncMock(return_value=payload), text=AsyncMock(return_value=payload))
             cm.__aenter__ = AsyncMock(return_value=res)
         cm.__aexit__ = AsyncMock(return_value=False)
         return cm
@@ -100,7 +120,8 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nba['viewers'], 6117)
         self.assertNotIn('https://tim.example/vip', [s['url'] for s in nba['sources']])
         nhl = self.game(result, 'flames', 'leafs')
-        self.assertEqual(nhl['providers'], ['cdnlivetv', 'rockylive', 'timstreams'])
+        self.assertEqual(nhl['providers'], ['cdnlivetv', 'onhockey', 'rockylive', 'timstreams'])
+        self.assertEqual(nhl['title'], 'Toronto Maple Leafs @ Calgary Flames')  # fullest names win over "Toronto"
 
     async def test_channels_stale_and_finished_events_are_not_games(self):
         result = await self.fetch()
@@ -159,11 +180,41 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         again = self.game(await self.fetch(routes), 'nuggets')
         self.assertEqual(again['id'], first)
 
+    async def test_onhockey_wrapper_links_languages_and_specialist_coverage(self):
+        result = await self.fetch()
+        nhl = self.game(result, 'flames', 'leafs')
+        onhockey = [s for s in nhl['sources'] if s['provider'] == 'onhockey']
+        self.assertEqual([s['url'] for s in onhockey], ['https://www.onhockey.tv/np_stream400.php?channel=//embed.example/nhl/tor-cgy/1',
+                                                       'https://www.onhockey.tv/np_stream400.php?channel=//other.example/ch?id=4',
+                                                       'https://www.onhockey.tv/np_stream400.php?channel=//ru.example/x'])
+        self.assertEqual([s['language'] for s in onhockey], ['English', 'English', 'Russian'])
+        self.assertEqual(onhockey[0]['label'], 'SN+ · streamd')
+        liiga = self.game(result, 'kalpa')
+        self.assertEqual((liiga['category'], liiga['live']), ('hockey', False))
+        self.assertNotIn('No Links - Yet', [m['title'] for m in result['matches']])
+        self.assertEqual(result['providers']['onhockey']['coverage'], 1.0)  # scored only against live hockey
+
+    def test_onhockey_hours_resolve_to_the_nearest_day(self):
+        page = ONHOCKEY.replace('>00</text>:30', '>23</text>:30')
+        just_after_midnight = 1793059800_000  # 2026-10-27 00:10 UTC
+        game = next(e for e in cp.parse_onhockey(page, just_after_midnight) if e and 'Toronto' in e['title'])
+        self.assertEqual(game['start_ms'], just_after_midnight - 40 * 60000)
+        kalpa = next(e for e in cp.parse_onhockey(ONHOCKEY, NOW) if e and 'KalPa' in e['title'])
+        self.assertEqual(kalpa['start_ms'], 1793118600_000)  # 16:30 UTC later the same day
+
+    async def test_ids_survive_restart_and_short_name_listings(self):
+        first = self.game(await self.fetch(), 'flames', 'leafs')['id']
+        restarted = cp.Catalog(Path(self.tmp.name) / 'health.json')
+        only_short = {cp.PROVIDERS[-1].urls[0]: ('text/html', ONHOCKEY)}
+        again = await restarted.fetch(fake_client(only_short), now_ms=NOW + 60000)
+        self.assertEqual(next(m for m in again['matches'] if 'Toronto' in m['title'])['id'], first)
+
     async def test_health_persists_and_reports_coverage(self):
         await self.fetch()
         reloaded = cp.Catalog(Path(self.tmp.name) / 'health.json')
         summary = reloaded.health.summary(reloaded.providers)
         self.assertEqual(summary['rockylive']['live'], 2)
+        self.assertEqual(summary['onhockey']['live'], 1)
         self.assertEqual(summary['rockylive']['coverage'], 1.0)
         self.assertEqual(summary['streamfree']['coverage'], .5)
 
