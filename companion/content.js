@@ -8,6 +8,9 @@ let skOwned=false, skFill=false, skEscaped=false, skLastTime=null, skLastFrames=
 let skAudio=null, skAudioRevision=0, skAudioGestureUntil=0, skAudioPending=false;
 const skWatched=new WeakSet();
 let skTickPending=false, skWatchPending=false;
+// Player controls for the server-driven autoplay ladder. Volume selectors only target UNMUTE state, never mute.
+const SK_PLAY_CONTROLS='.jw-display-icon-container,.jw-icon-display,.vjs-big-play-button,.plyr__control--overlaid,button[aria-label="Play"],button[title="Play"]';
+const SK_UNMUTE_CONTROLS='button[aria-label*="unmute" i],button[title*="unmute" i],.vjs-mute-control.vjs-vol-0,.jw-state-muted .jw-icon-volume';
 // Each owned frame hides its idle pointer, including iframe player surfaces.
 let skPointerMoved=Date.now();
 function skShowPointer(){document.getElementById('streamkeeper-cursor-style')?.remove();}
@@ -88,6 +91,24 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
       const confirmed=media.every(v=>v.muted===m.muted && (!('volume'in m)||v.volume===m.volume));
       respond({confirmed,muted:m.muted,...('volume'in m?{volume:m.volume}:{}),media_count:media.length,video_count:m.primary_only===true?1:document.querySelectorAll('video').length});
     }catch{respond({confirmed:false});}
+    return false;
+  }
+  // Autoplay ladder steps. The server decides which step runs next and confirms playback from health.
+  if(m.op==='play_control'){if(skOwned)document.querySelector(SK_PLAY_CONTROLS)?.click();respond(true);return false;}
+  if(m.op==='volume_control'){if(skOwned)document.querySelector(SK_UNMUTE_CONTROLS)?.click();respond(true);return false;}
+  if(m.op==='pointer'){
+    const v=[...document.querySelectorAll('video')].sort((a,b)=>b.videoWidth*b.videoHeight-a.videoWidth*a.videoHeight)[0];
+    if(!skOwned||!v){respond({clicked:false});return false;}
+    const r=v.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+    for(const type of ['pointerdown','mousedown','pointerup','mouseup','click'])v.dispatchEvent(new MouseEvent(type,{bubbles:true,cancelable:true,clientX:x,clientY:y,view:window}));
+    void v.play().catch(()=>{});respond({clicked:true});return false;
+  }
+  if(m.op==='frame_rects'){
+    // Top frame only: iframe geometry in screen pixels for the server's trusted X11 click.
+    if(window!==window.top){respond(null);return false;}
+    const dpr=window.devicePixelRatio||1;
+    respond({dpr,offset_x:window.screenX+(window.outerWidth-window.innerWidth)/2,offset_y:window.screenY+(window.outerHeight-window.innerHeight),
+      rects:[...document.querySelectorAll('iframe,video')].map(e=>{const r=e.getBoundingClientRect();return{tag:e.tagName,x:r.left,y:r.top,w:r.width,h:r.height};}).filter(r=>r.w>0&&r.h>0)});
     return false;
   }
   if(m.op==='seek'){

@@ -35,9 +35,14 @@ from resource_monitor import ResourceMonitor
 from user_source import validate_user_source_url, USER_SOURCE_CAPABILITY, USER_SOURCE_VERSION
 from catalog_providers import Catalog, CatalogUnavailable, stream_rank
 
+from os_click import click_point
 log=logging.getLogger('stream-keeper.regular')
 
 ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top','dailywrestling.cc','nightcityv.site','limemint.site','onhockey.tv')
+# Autoplay ladder: each step runs only if the previous one did not produce fresh video progress.
+AUTOPLAY_STEPS=('play','play_control','pointer','os_click')
+AUTOPLAY_GRACE=8
+AUTOPLAY_STEP_TIMEOUT=10
 PLAYBACK_CONFIRM_TIMEOUT=6
 UNMUTE_OBSERVE_TIMEOUT=4
 PLACEMENT_READY_TIMEOUT=40
@@ -114,7 +119,7 @@ class RegularBrowserKeeper:
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={}
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set()
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
         self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
@@ -366,6 +371,7 @@ class RegularBrowserKeeper:
                 saved=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
                 saved.update(url=url,user_source=True,catalog=True)
             self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id,user_source=user_source));self._save()
+            self._start_autoplay(sid)
             if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
                 self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
     async def watch_url(self,url,label=None):
@@ -469,6 +475,81 @@ class RegularBrowserKeeper:
             if not command.done():command.cancel()
             await asyncio.gather(command,return_exceptions=True)
 
+    def _autoplay_steps(self):
+        configured=self.config.get('session',{}).get('autoplay_steps')
+        if isinstance(configured,list)and configured:return tuple(step for step in AUTOPLAY_STEPS if step in configured)or AUTOPLAY_STEPS
+        return AUTOPLAY_STEPS
+
+    def _start_autoplay(self,sid):
+        task=asyncio.create_task(self._run_autoplay_ladder(sid))
+        self._autoplay_tasks.add(task);task.add_done_callback(self._autoplay_tasks.discard)
+
+    def _is_advancing(self,sid):
+        primary=self._primary_video(sid)
+        return bool(primary and primary[1][1].get('state')=='PLAYING'and primary[1][1].get('paused')is not True and not primary[1][1].get('ended'))
+
+    async def _wait_for_advance(self,sid,started,timeout):
+        # Returns 'advanced', 'stalled' (video seen but no progress) or 'no_telemetry' (no frame reported video).
+        loop=asyncio.get_running_loop();deadline=loop.time()+timeout;seen={};telemetry=False
+        while True:
+            for key,(observed,health)in list(self._frames.items()):
+                if key[0]!=sid or observed<=started or health.get('width',0)<=0 or health.get('height',0)<=0:continue
+                telemetry=True
+                prior=seen.get(key)
+                if prior is None:seen[key]=health
+                elif self._video_advanced(prior,health):return 'advanced'
+                else:seen[key]=health
+            remaining=deadline-loop.time()
+            if remaining<=0:return 'stalled'if telemetry else 'no_telemetry'
+            await asyncio.sleep(min(.5,remaining))
+
+    async def _frame_click(self,sid):
+        geometry=await self.command_for(sid,'frame_rects')
+        if not isinstance(geometry,dict)or'offset_x'not in geometry or'offset_y'not in geometry:raise ValueError('Player geometry unavailable')
+        rects=[r for r in geometry.get('rects',[])if r.get('tag')=='IFRAME'and r.get('w',0)>=200 and r.get('h',0)>=150]
+        if not rects:raise ValueError('No player frame to click')
+        frame=max(rects,key=lambda r:r['w']*r['h'])
+        dpr=float(geometry.get('dpr')or 1)
+        x=round((geometry['offset_x']+frame['x']+frame['w']/2)*dpr);y=round((geometry['offset_y']+frame['y']+frame['h']/2)*dpr)
+        if not any(d['x']<=x<d['x']+d['width']and d['y']<=y<d['y']+d['height']for d in self.display_probe.get('displays',{}).values()):raise ValueError('Click point is off the connected displays')
+        await asyncio.to_thread(click_point,x,y)
+
+    async def _autoplay_step(self,sid,step):
+        if step in('play','play_control','pointer'):return await self.command_for(sid,step)
+        if step=='os_click':return await self._frame_click(sid)
+        raise ValueError('Unknown autoplay step '+step)
+
+    def _record_autoplay(self,stream,step,outcome):
+        log.info('Autoplay step=%s outcome=%s stream=%s site=%s',step,outcome,stream.id,stream.site)
+        record=dict(at=round(time.time(),1),stream_id=stream.id,site=stream.site,step=step,outcome=outcome)
+        try:
+            with self.state_path.with_name('autoplay-outcomes.jsonl').open('a',encoding='utf-8')as handle:handle.write(json.dumps(record)+'\n')
+        except OSError as exc:log.warning('Autoplay outcome not recorded: %s',exc)
+
+    async def _run_autoplay_ladder(self,sid):
+        await asyncio.sleep(AUTOPLAY_GRACE)
+        stream=self.active_streams.get(sid)
+        if not stream:return
+        stats=stream.health_monitor.stats
+        if self._is_advancing(sid):
+            stats['autoplay']={'step':None,'state':'playing'};return
+        for step in self._autoplay_steps():
+            if sid not in self.active_streams or sid in self._releasing:return
+            stats['autoplay']={'step':step,'state':'trying'}
+            started=time.time()
+            try:await self._autoplay_step(sid,step)
+            except(ValueError,TimeoutError,OSError,NotImplementedError)as exc:log.info('Autoplay step %s failed for %s: %s',step,sid,exc)
+            outcome=await self._wait_for_advance(sid,started,AUTOPLAY_STEP_TIMEOUT)
+            self._record_autoplay(stream,step,outcome)
+            if outcome=='advanced':
+                stats['autoplay']={'step':step,'state':'playing'};return
+        stats['autoplay']={'step':None,'state':'needs_click'}
+
+    async def _embedded_unmute(self,sid):
+        # Cross-origin embeds report no media, so only an in-frame unmute control is tried; mute controls are never clicked.
+        try:await self.command_for(sid,'volume_control');return ['volume_control']
+        except(ValueError,TimeoutError)as exc:log.info('Embedded unmute failed for %s: %s',sid,exc);return[]
+
     async def resume_playback(self,sid):
         if not isinstance(sid,str)or not sid:raise ValueError('stream_id is required')
         async with self._lock:
@@ -512,6 +593,9 @@ class RegularBrowserKeeper:
                 args.update(volume=volume,primary_frame_id=primary[0][1])
             try:result=await self.command_for(sid,'audio',**args)
             except (ValueError,TimeoutError)as exc:raise ValueError(str(exc)+'; some audio settings may have changed. Refresh status before retrying')from exc
+            if not muted and isinstance(result,dict)and result.get('media_count')==0:
+                attempts=await self._embedded_unmute(sid)
+                return {'success':True,'stream_id':sid,'muted':muted,'confirmed':False,'message':'Player is embedded, so audio cannot be verified from the page; tried '+(', '.join(attempts)or'nothing')+'. Check the stream window for sound.'}
             if not isinstance(result,dict)or result.get('confirmed')is not True or result.get('muted')is not muted or type(result.get('media_count'))is not int or result['media_count']<1 or type(result.get('video_count'))is not int or not 1<=result['video_count']<=result['media_count'] or (volume is not None and (type(result.get('volume'))not in(int,float)or result.get('volume')!=volume or type(result.get('primary_frame_id'))is not int or result['primary_frame_id']!=args['primary_frame_id'])):
                 raise ValueError('Browser did not confirm all audio settings; some may have changed. Refresh status before retrying')
             stream.health_monitor.stats['muted']=muted

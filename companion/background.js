@@ -164,6 +164,9 @@ async function command(c) {
     await api.tabs.update(r.tabId,{muted:false});await rememberAudio(c.stream_id,r,{muted:false,volume:1});return result;
   }
   if(c.op==='play') return frameCommand(r.tabId,{op:c.op});
+  // Autoplay ladder steps (0.2.11). The server picks the step; these only run in owned frames.
+  if(c.op==='play_control'||c.op==='pointer'||c.op==='volume_control') return frameCommand(r.tabId,{op:c.op});
+  if(c.op==='frame_rects') return api.tabs.sendMessage(r.tabId,{sk:true,op:'frame_rects'},{frameId:0});
   if(c.op==='seek'){
     const to=c.to,delta=c.delta;
     if(!((typeof to==='number'&&Number.isFinite(to)&&to>=0&&delta===undefined)||(typeof delta==='number'&&Number.isFinite(delta)&&Math.abs(delta)<=86400&&to===undefined)))throw Error('Invalid seek');
