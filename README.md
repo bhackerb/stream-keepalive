@@ -1,5 +1,15 @@
 # StreamKeeper 🏒📺
 
+The multi-provider catalog now includes [Matchora's public schedule API](https://matchora.to/developers),
+with separate channel choices, language, advertised quality, and viewer counts.
+Finished/stale events and channels explicitly marked dead are excluded. Events
+without channel details can use their advertised aggregate player. Rockylive uses
+its current `/api/events.php?limit=1000` schedule endpoint, retaining the legacy
+endpoint as a fallback; its new entries open the site's event player. Both feed
+the existing merged catalog, source picker, and recovery choices through the
+catalog URL ownership path; no companion update is needed. Catalog reachability
+and advertised HD are not proof of successful playback or measured resolution.
+
 Companion 0.2.7 adds idle cursor hiding in owned, filled stream frames on both
 devices. After three seconds without input, the pointer hides; moving it or
 pressing Escape restores it. Parked, paused, ended, unowned and disconnected

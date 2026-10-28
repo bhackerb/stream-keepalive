@@ -73,7 +73,7 @@ english:
 <div class='gamelinks' onclick='event.stopPropagation()'>
 </div></td></tr>
 </table>"""
-PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY)}
+PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY), 'matchora': {'events': []}}
 
 
 def fake_client(routes):
@@ -99,6 +99,50 @@ def all_routes(**overrides):
 
 
 class CatalogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matchora_channels_merge_into_existing_game(self):
+        item = {'id': 'new', 'home': 'Denver Nuggets', 'away': 'Golden State Warriors',
+                'sport': 'Basketball', 'kickoff': 1793066400, 'live': True, 'watching': 23,
+                'channels': [{'name': 'Home broadcast', 'embed_url': 'https://matchora.to/embed/channel/1',
+                              'lang': 'English', 'quality': 'FHD', 'watching': 22},
+                             {'name': 'Dead', 'embed_url': 'https://matchora.to/embed/channel/2', 'dead': True},
+                             {'embed_url': 'http://insecure.example/player'}, None]}
+        provider = next(p for p in cp.PROVIDERS if p.name == 'matchora')
+        result = await self.fetch(all_routes(**{provider.urls[0]: {'events': [item]}}))
+        game = self.game(result, 'nuggets', 'warriors')
+        self.assertIn('matchora', game['providers'])
+        self.assertIn('ppv', game['providers'])
+        sources = [s for s in game['sources'] if s['provider'] == 'matchora']
+        self.assertEqual(len(sources), 1)
+        self.assertEqual((sources[0]['language'], sources[0]['hd'], sources[0]['viewers']), ('English', True, 22))
+        for change in ({'finished': True}, {'status': 'FT'}, {'kickoff': 1}, {'home': None}):
+            self.assertFalse(any(cp.parse_matchora({'events': [{**item, **change}]}, NOW)))
+
+    def test_matchora_fallback_and_dead_channels(self):
+        item = {'id': 'x', 'home': 'A', 'away': 'B', 'sport': 'Basketball', 'kickoff': NOW // 1000,
+                'channel_count': 1, 'embed_url': 'https://matchora.to/embed/match/x'}
+        self.assertEqual(cp.parse_matchora({'events': [item]}, NOW)[0]['streams'][0]['url'], item['embed_url'])
+        self.assertFalse(any(cp.parse_matchora({'events': [{**item, 'channels': [{'dead': True}]}]}, NOW)))
+        self.assertFalse(any(cp.parse_matchora({'events': [{**item, 'embed_url': 'http://bad.example/'}]}, NOW)))
+
+    async def test_current_rockylive_api_merges_event_page(self):
+        provider = next(p for p in cp.PROVIDERS if p.name == 'rockylive')
+        item = {'id': 9, 'title': 'Denver Nuggets vs Golden State Warriors', 'league': 'NBA',
+                'start_timestamp': 1793066400, 'event_url': 'https://rockylive.st/nba/game-9/'}
+        result = await self.fetch(all_routes(**{provider.urls[0]: {'success': True, 'events': [item]}}))
+        game = self.game(result, 'nuggets', 'warriors')
+        self.assertIn(item['event_url'], [s['url'] for s in game['sources']])
+        self.assertFalse(any(cp.parse_rockylive({'events': [{**item, 'start_timestamp': 1}]}, NOW)))
+        for change in ({'finished': True}, {'status': 'FT'}, {'dead': True}, {'event_url': 'http://bad.example/'}):
+            self.assertFalse(any(cp.parse_rockylive({'events': [{**item, **change}]}, NOW)))
+
+    async def test_rockylive_legacy_endpoint_fallback(self):
+        provider = next(p for p in cp.PROVIDERS if p.name == 'rockylive')
+        for failure in (aiohttp.ClientConnectionError('down'), ('text/html', '<html>Error</html>')):
+            routes = all_routes(**{provider.urls[0]: failure, provider.urls[1]: ROCKYLIVE})
+            result = await self.fetch(routes)
+            self.assertIn('rockylive', self.game(result, 'nuggets', 'warriors')['providers'])
+            self.assertEqual(self.catalog.health.polls['rockylive'][-1]['mirror'], provider.urls[1])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -205,7 +249,7 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
     async def test_ids_survive_restart_and_short_name_listings(self):
         first = self.game(await self.fetch(), 'flames', 'leafs')['id']
         restarted = cp.Catalog(Path(self.tmp.name) / 'health.json')
-        only_short = {cp.PROVIDERS[-1].urls[0]: ('text/html', ONHOCKEY)}
+        only_short = {next(p for p in cp.PROVIDERS if p.name == 'onhockey').urls[0]: ('text/html', ONHOCKEY)}
         again = await restarted.fetch(fake_client(only_short), now_ms=NOW + 60000)
         self.assertEqual(next(m for m in again['matches'] if 'Toronto' in m['title'])['id'], first)
 

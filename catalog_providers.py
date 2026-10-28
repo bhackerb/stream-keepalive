@@ -174,6 +174,18 @@ def parse_timstreams(payload, now_ms):
 
 def parse_rockylive(payload, now_ms):
     events = []
+    # The current public API advertises event pages rather than individual embeds.
+    for item in payload.get('events') or []:
+        if not isinstance(item, dict):
+            continue
+        start = _int(item.get('start_timestamp'))
+        if (not start or now_ms - start * 1000 > STALE_EVENT_MS or item.get('finished') is True or
+                item.get('dead') is True or str(item.get('status') or '').upper() in FINISHED_STATUSES or
+                not _https(item.get('event_url'))):
+            continue
+        events.append(_event('rockylive', item.get('id'), item.get('title'),
+                             category_of(item.get('league'), item.get('league_slug')), start * 1000,
+                             [_stream(item.get('event_url'), 'Rockylive player')]))
     for item in payload.get('matches') or []:
         if not isinstance(item, dict):
             continue
@@ -184,6 +196,43 @@ def parse_rockylive(payload, now_ms):
         streams = [_stream(s.get('link'), f"Rocky HD {s.get('hd')}", hd=True) for s in item.get('streams') or [] if isinstance(s, dict)]
         events.append(_event('rockylive', item.get('id'), item.get('title'), category_of(item.get('category'), item.get('league')), start * 1000, streams,
                              live=status == 'LIVE' or None))
+    return events
+
+
+def parse_matchora(payload, now_ms):
+    """Keep match-specific channel choices; never claim listing health is playback proof."""
+    events = []
+    for item in payload.get('events') or []:
+        if not isinstance(item, dict):
+            continue
+        start = _int(item.get('kickoff'))
+        if (not start or now_ms - start * 1000 > STALE_EVENT_MS or
+                item.get('finished') is True or str(item.get('status') or '').upper() in FINISHED_STATUSES):
+            continue
+        home, away = item.get('home'), item.get('away')
+        if not isinstance(home, str) or not home.strip() or not isinstance(away, str) or not away.strip():
+            continue
+        streams = []
+        seen = set()
+        for channel in item.get('channels') or []:
+            if not isinstance(channel, dict) or channel.get('dead') is True:
+                continue
+            url = channel.get('embed_url')
+            if not _https(url) or url in seen:
+                continue
+            seen.add(url)
+            quality = str(channel.get('quality') or '').upper()
+            streams.append(_stream(url, channel.get('name') or 'Matchora channel',
+                                   language=channel.get('lang'), hd=quality in ('HD', 'FHD', 'UHD', '4K', '1080P', '720P'),
+                                   viewers=_int(channel.get('watching'))))
+        # Some events expose only the aggregate player, without channel details.
+        if (not streams and not item.get('channels') and _int(item.get('channel_count')) and
+                _https(item.get('embed_url'))):
+            streams.append(_stream(item.get('embed_url'), 'Matchora player'))
+        events.append(_event('matchora', item.get('id'), f'{away} @ {home}',
+                             category_of(item.get('sport'), item.get('league')), start * 1000, streams,
+                             teams=[home, away], live=item.get('live') if type(item.get('live')) is bool else None,
+                             viewers=_int(item.get('watching'))))
     return events
 
 
@@ -257,10 +306,11 @@ PROVIDERS = (
     Provider('ppv', 'PPV.ST', ('https://api.ppv.st/api/streams', 'https://api.ppv.cx/api/streams'), parse_ppv),
     Provider('streamfree', 'StreamFree', ('https://strmfree.st/api/v1/streams', 'https://streamfree.top/api/v1/streams'), parse_streamfree),
     Provider('timstreams', 'TimStreams', ('https://timst.top/api/live-upcoming', 'https://tim-streams.com/api/live-upcoming'), parse_timstreams),
-    Provider('rockylive', 'Rockylive', ('https://rockylive.st/api-event.php',), parse_rockylive),
+    Provider('rockylive', 'Rockylive', ('https://rockylive.st/api/events.php?limit=1000', 'https://rockylive.st/api-event.php'), parse_rockylive),
     Provider('cdnlivetv', 'CDN Live TV', ('https://api.cdnlivetv.is/api/v1/events/sports/',), parse_cdnlivetv),
     Provider('onhockey', 'OnHockey', ('https://www.onhockey.tv/schedule_table.php',), parse_onhockey, kind='html',
              headers=(('Referer', 'https://www.onhockey.tv/'),), sports=('hockey',)),
+    Provider('matchora', 'Matchora', ('https://matchora.to/api/v1/schedule?watchable=1',), parse_matchora),
 )
 
 
