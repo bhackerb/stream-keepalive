@@ -32,4 +32,8 @@ regular-session.json
 regular-session.tmp
 provider-health.json
 provider-health.tmp
+playback-reliability.json
+playback-reliability.tmp
+discovery-report.json
+discovery-report.tmp
 config.yaml.before-regular

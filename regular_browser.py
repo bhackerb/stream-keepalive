@@ -207,10 +207,14 @@ class RegularBrowserKeeper:
         await self.refresh_resources()
         await self.refresh_displays()
         self._task=asyncio.create_task(self._loop())
+        self._reliability_task=asyncio.create_task(self._reliability_loop())
     async def shutdown(self):
         if self._placement_retry_task:self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
         if self._task:self._task.cancel();await asyncio.gather(self._task,return_exceptions=True)
+        reliability_task=getattr(self,'_reliability_task',None)
+        if reliability_task:reliability_task.cancel();await asyncio.gather(reliability_task,return_exceptions=True)
         self._save()
+        self.catalog.reliability.save(force=True)
         for ws in list(self.connections.values()):await ws.close()
         if self._client:await self._client.close()
         # Browser and playing tabs survive daemon shutdown.
@@ -376,6 +380,7 @@ class RegularBrowserKeeper:
                 saved=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time()))
                 saved.update(url=url,user_source=True,catalog=True)
             self._add(sid,dict(url=url,label=label,browser=browser,session_id=session_id,user_source=user_source));self._save()
+            self.catalog.reliability.opened(sid,url)
             self._start_autoplay(sid)
             if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
                 self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
@@ -637,10 +642,11 @@ class RegularBrowserKeeper:
         row=next((r for r in matches if r.get('id')==sid),None)
         if not row:raise ValueError('This game is no longer in the source catalog')
         labels={p.name:p.label for p in self.catalog.providers};counts={};choices=[]
-        for item in row['sources'][:30]:
+        for item in self.catalog.rank(row['sources'],row['category'])[:30]:
             counts[item['provider']]=counts.get(item['provider'],0)+1
             language=item['label']+(' · '+item['language']if item.get('language')else '')
-            choices.append(dict(url=item['url'],source=labels.get(item['provider'],item['provider']),provider=item['provider'],number=counts[item['provider']],language=language[:80],hd=item.get('hd')is True,viewers=item.get('viewers'),current=item['url']==stream.url))
+            choices.append(dict(url=item['url'],source=labels.get(item['provider'],item['provider']),provider=item['provider'],number=counts[item['provider']],language=language[:80],hd=item.get('hd')is True,viewers=item.get('viewers'),current=item['url']==stream.url,
+                                reliability=self.catalog.reliability.rating(item['provider'],row['category'],item['url'])))
         # Wrestling games may also switch to a watch-wrestling embed resolved by Mithrandir.
         return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling',user_source=custom)
 
@@ -850,7 +856,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.health.summary(self.catalog.providers),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
+        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.provider_summary(),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
     async def _catalog(self,max_age=0):
         # Every provider is polled together; one failing site only drops its sources.
         if self.catalog.last and time.time()-self.catalog.last_at<=max_age:return self.catalog.last
@@ -1115,6 +1121,7 @@ class RegularBrowserKeeper:
         if self.catalog.last:
             fresh=next((m for m in self.catalog.last['matches']if m['id']==row['id']),None)
             if fresh:sources=fresh['sources']
+        sources=self.catalog.rank([s for s in sources if isinstance(s,dict)and s.get('url')and s.get('provider')],row.get('category')or row.get('sport',''))
         return next((s['url']for s in sources if isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried),None)
 
     async def _recover_no_video(self,plan):
@@ -1262,6 +1269,60 @@ class RegularBrowserKeeper:
             self._save();await self.force_reload(sid)
         except (ValueError,TimeoutError):
             care.update(next_retry=time.time()+120,state='blocked',message='Exact owned tab could not be confirmed; no replacement opened');self._save()
+
+    async def _reliability_tick(self):
+        """Passive primary-video accounting, isolated from playback control.
+
+        Negative evidence needs fresh independent network checks; unavailable
+        checks, local resource pressure and simultaneous multi-stream stalls are
+        inconclusive. No startup/pause failures are attributed to a provider.
+        """
+        if os.environ.get('STREAMKEEPER_RELIABILITY_DISABLED')=='1':
+            self.catalog.reliability.observed.clear();return
+        now=time.time();samples=[]
+        self.catalog.reliability.forget(self.active_streams)
+        for sid,stream in self.active_streams.items():
+            context=self.catalog.source_context(stream.url)
+            primary=self._primary_video(sid)
+            eligible=(context and primary and not stream.parked and sid not in self.suppressed|self._ownership_lost|self._releasing
+                      and self._browser_ready.get(stream.browser))
+            if not eligible:
+                self.catalog.reliability.observed.pop(sid,None);continue
+            key,(at,health)=primary
+            samples.append((sid,stream,context,key,at,health))
+        buffering=[s for s in samples if s[-1].get('state')=='BUFFERING']
+        network_ok=False
+        if buffering and self._client and self.resources.snapshot.get('state')=='ok':
+            if now-getattr(self,'_reliability_network_at',0)>=30:
+                async def reachable(url):
+                    try:
+                        async with self._client.get(url,timeout=aiohttp.ClientTimeout(total=4),allow_redirects=False)as response:
+                            return response.status==200
+                    except (aiohttp.ClientError,asyncio.TimeoutError):return False
+                results=await asyncio.gather(*(reachable(url)for url in
+                    ('https://example.com/','https://www.mozilla.org/robots.txt')))
+                self._reliability_network_ok=all(results);self._reliability_network_at=time.time()
+            network_ok=getattr(self,'_reliability_network_ok',False)
+        # Several simultaneous stalls suggest a shared local/network problem.
+        network_ok=network_ok and len(buffering)==1
+        for sid,stream,context,key,at,health in samples:
+            primary=self._primary_video(sid)
+            if (not primary or self.active_streams.get(sid)is not stream or stream.parked or
+                    sid in self.suppressed|self._ownership_lost|self._releasing or self.catalog.source_context(stream.url)!=context):
+                self.catalog.reliability.observed.pop(sid,None);continue
+            key,(at,health)=primary
+            self.catalog.reliability.observe(sid,stream.url,*context,key,health,at,network_ok=network_ok)
+        self.catalog.reliability.save()
+
+    async def _reliability_loop(self):
+        # A separate, monotonic cadence keeps catalog I/O outside the evidence
+        # sampling interval. Skip missed intervals rather than replaying samples.
+        loop=asyncio.get_running_loop();deadline=loop.time()+10
+        while True:
+            await asyncio.sleep(max(0,deadline-loop.time()))
+            try:await self._reliability_tick()
+            except Exception:log.exception('Playback evidence unavailable; streams preserved')
+            deadline=max(deadline+10,loop.time()+.1)
 
     async def _loop(self):
         while True:

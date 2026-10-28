@@ -1,0 +1,11 @@
+[Unit]
+Description=Check FMHY for streaming provider candidates weekly
+
+[Timer]
+OnCalendar=Mon *-*-* 10:00:00 America/Denver
+Persistent=true
+RandomizedDelaySec=600
+Unit=streamkeeper-discovery.service
+
+[Install]
+WantedBy=timers.target

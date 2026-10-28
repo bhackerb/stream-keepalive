@@ -1,0 +1,14 @@
+[Unit]
+Description=StreamKeeper weekly provider discovery report
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ben
+WorkingDirectory=/home/ben/testies/stream-keepalive
+ExecStart=/usr/bin/python3 provider_discovery.py
+EnvironmentFile=-/etc/default/streamkeeper-discovery
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true

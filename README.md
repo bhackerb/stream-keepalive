@@ -1,5 +1,10 @@
 # StreamKeeper 🏒📺
 
+Playback-based source ranking and a weekly FMHY candidate discovery report are
+documented in [SOURCE_RELIABILITY.md](SOURCE_RELIABILITY.md). Ranking learns from
+fresh primary-video progress and corroborated buffering; discovery never installs
+new providers automatically or interrupts viewing.
+
 The multi-provider catalog now includes [Matchora's public schedule API](https://matchora.to/developers),
 with separate channel choices, language, advertised quality, and viewer counts.
 Finished/stale events and channels explicitly marked dead are excluded. Events

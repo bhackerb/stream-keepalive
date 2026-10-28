@@ -21,6 +21,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from playback_reliability import PlaybackReliability
 
 ET = ZoneInfo('America/New_York')
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0'
@@ -402,6 +403,7 @@ class Catalog:
     def __init__(self, health_path, providers=PROVIDERS, disabled=()):
         self.providers = tuple(p for p in providers if p.name not in set(disabled))
         self.health = ProviderHealth(health_path)
+        self.reliability = PlaybackReliability(Path(health_path).with_name('playback-reliability.json'))
         self.last = None
         self.last_at = 0
         self.urls = set()
@@ -457,7 +459,7 @@ class Catalog:
             self.health.record(provider.name, poll)
         self.health.save()
         for match in matches:
-            match['sources'] = self.rank(match['sources'])
+            match['sources'] = self.rank(match['sources'], match['category'])
         self._previous_urls, self.urls = self.urls, {s['url'] for m in matches for s in m['sources']}
         self.last, self.last_at = {'matches': matches, 'providers': self.health.summary(self.providers), 'fetched_at': now_ms}, time.time()
         return self.last
@@ -465,9 +467,24 @@ class Catalog:
     def known_url(self, url):
         return url in self.urls or url in self._previous_urls
 
-    def rank(self, sources):
+    def rank(self, sources, sport=''):
         # Consistent providers first (coarse buckets so noise cannot reshuffle), then viewers, English, HD.
-        return sorted(sources, key=lambda s: (round(self.health.score(s['provider']), 1), *stream_rank(s)), reverse=True)
+        return sorted(sources, key=lambda s: (round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
+                      round(self.health.score(s['provider']), 1), *stream_rank(s)), reverse=True)
+
+    def source_context(self, url):
+        for match in (self.last or {}).get('matches', []):
+            for source in match['sources']:
+                if source['url'] == url:
+                    return source['provider'], match['category']
+        return None
+
+    def provider_summary(self):
+        summary = self.health.summary(self.providers)
+        for name, row in summary.items():
+            sports = sorted({r['sport'] for r in self.reliability.rows.values() if r['provider'] == name})
+            row['playback'] = {sport: self.reliability.evidence(name, sport) for sport in sports}
+        return summary
 
     def _merge(self, events, now_ms):
         order = {p.name: i for i, p in enumerate(self.providers)}
