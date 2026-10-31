@@ -130,6 +130,18 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(1000)
         self.assertEqual(self.k._recovery_sources.await_args.args[3],'bintv')
 
+    async def test_no_alternate_after_reload_releases_the_slot_for_another_game(self):
+        await self.setup_stream();self.k._recovery['0']={'attempts':1,'tried':[],'since':1,'last_action':1}
+        self.k._recovery_sources=AsyncMock(return_value=None)
+        async def commands(browser,op,**args):
+            if op=='inventory':return {'0':{}}if '0'in self.k.active_streams else {}
+            return True
+        self.k.command=AsyncMock(side_effect=commands)
+        await self.tick(1000)
+        self.assertIn('close',[c.args[1] for c in self.k.command.await_args_list])
+        self.assertIn('0',self.k.suppressed)
+        self.assertIn('released',self.k._recovery['0']['message'])
+
     def test_short_loading_stalls_count_only_after_playback(self):
         self.k._count_buffering('0','LOADING')  # startup loading
         self.assertEqual(self.k._buffer_watch['0']['episodes'],0)

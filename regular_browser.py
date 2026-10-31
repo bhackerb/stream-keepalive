@@ -1218,6 +1218,10 @@ class RegularBrowserKeeper:
                     url=await asyncio.wait_for(self._recovery_sources(live[sid],stream.url,record['tried'],current_provider),20)
                     if not buffer_switch and not self._recoverable_failure(sid,time.time()):continue
                     if not url:
+                        # No alternate after a reload: release the slot so the allocator can fill it with another game.
+                        if record['attempts']>=1 or buffer_switch:
+                            record.update(last_action=time.time(),message='No alternate source; released the slot for another game');self._save()
+                            await self.command_for(sid,'close');self.suppressed.add(sid);self._save();continue
                         record.update(last_action=time.time(),message='No alternate source available; waiting');continue
                     # Close and drain inventory before reopening the same canonical
                     # match ID, using the already signed companion's finite commands.
