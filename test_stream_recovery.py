@@ -213,6 +213,15 @@ class BufferingTests(unittest.IsolatedAsyncioTestCase):
     async def health(self,now,current,state='LOADING',frames=20,stall=0,**extra):
         with patch('regular_browser.time.time',return_value=now):
             await self.k._event('firefox',{'event':'health','stream_id':'0','frame_id':0,'health':{'state':state,'current_time':current,'width':1280,'height':720,'decoded_frames':frames,'stall_seconds':stall,**extra}})
+    async def test_loading_with_no_video_for_thirty_seconds_is_a_failed_source(self):
+        await self.setup_stream()
+        with patch('regular_browser.time.time',return_value=1000):
+            await self.k._event('firefox',{'event':'health','stream_id':'0','frame_id':0,'health':{'state':'LOADING','current_time':0,'width':0,'height':0,'decoded_frames':0,'stall_seconds':10}})
+        self.assertNotEqual(self.k.active_streams['0'].health_monitor.stats.get('state'),'NO_VIDEO')
+        with patch('regular_browser.time.time',return_value=1031):
+            await self.k._event('firefox',{'event':'health','stream_id':'0','frame_id':0,'health':{'state':'LOADING','current_time':0,'width':0,'height':0,'decoded_frames':0,'stall_seconds':31}})
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats.get('state'),'NO_VIDEO')
+
     async def test_loading_needs_observed_prior_video_progress_before_buffering(self):
         await self.setup_stream()
         await self.health(1000,10,stall=100)

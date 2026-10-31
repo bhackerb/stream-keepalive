@@ -310,6 +310,9 @@ class RegularBrowserKeeper:
             # Startup loading alone never proves that a stream was playing.
             if h.get('state')=='LOADING' and progress is not None and 15<=now-progress and (now-progress<=300 or self._protected(sid)) and h.get('stall_seconds',0)>=15 and h.get('paused')is not True and not h.get('ended') and h.get('width',0)>0:
                 h['state']='BUFFERING'
+            # A stream that loads but never produces video (0x0 for 30s or more) is a failed source, not startup.
+            elif h.get('state')=='LOADING' and not h.get('width',0) and h.get('stall_seconds',0)>=30 and h.get('paused')is not True and not h.get('ended'):
+                h['state']='NO_VIDEO'
             record=self._recovery.get(sid)
             if record:
                 if h.get('state')not in ('NO_VIDEO','BUFFERING') or now-record.get('last_health',now)>=12:record.pop('since',None)
