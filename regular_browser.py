@@ -1189,6 +1189,8 @@ class RegularBrowserKeeper:
             now=time.time();record=self._recovery.get(sid)
             buffer_switch=bool(record and record.get('buffer_switch'))
             if(not buffer_switch and not self._recoverable_failure(sid,now))or sid not in live:
+                if record and record.get('message') and self.active_streams.get(sid) and self.active_streams[sid].health_monitor.stats.get('state')=='NO_VIDEO':
+                    log.info('Recovery skipped for %s: live=%s recoverable=%s',sid,sid in live,self._recoverable_failure(sid,now))
                 if record:
                     record.pop('since',None)
                     if self.active_streams[sid].health_monitor.stats.get('state')=='PLAYING':record['message']='Playback restored; remaining budget retained'
