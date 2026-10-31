@@ -94,10 +94,10 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.k._recovery['0']['catalog']=True
         self.assertEqual(await self.k._recovery_sources(row,'https://mine.example/',[]),'https://b.example/2')
 
-    async def test_sixth_buffering_episode_switches_provider_without_spending_failure_attempts(self):
+    async def test_fourth_buffering_episode_switches_provider_without_spending_failure_attempts(self):
         await self.setup_stream()
         self.k.catalog.source_context=MagicMock(return_value=('ppv','american-football'))
-        for _ in range(5):
+        for _ in range(3):
             self.k._count_buffering('0',True);self.k._count_buffering('0',False)
         self.assertNotIn('buffer_switch',self.k._recovery['0'])
         self.k._count_buffering('0',True)
@@ -259,6 +259,7 @@ class BufferingTests(unittest.IsolatedAsyncioTestCase):
     async def test_loading_and_playing_each_reset_the_sustained_buffering_timer(self):
         for state in ('LOADING','PLAYING'):
             with self.subTest(state=state):
+                self.k._buffer_watch.clear()  # each subtest counts its own buffering episodes
                 await self.seed_buffering();await self.sustain_until(1021,1075)
                 await self.health(1078,11,state,frames=40,stall=0)
                 self.assertNotIn('since',self.k._recovery['0'])

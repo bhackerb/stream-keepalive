@@ -46,7 +46,7 @@ AUTOPLAY_STEP_TIMEOUT=10
 # A live stream that stops reporting for this long counts as failed, but only if it was not playing.
 SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
-BUFFER_SWITCH_EPISODES=5  # switch provider after more than this many buffering episodes on one stream
+BUFFER_SWITCH_EPISODES=3  # switch provider after more than this many buffering episodes on one stream
 BUFFER_SWITCH_BUDGET=4  # provider switches per stream, separate from the failure-recovery attempts
 # A frame that reported playing within this window may still be playing unseen; recovery waits for it to age out.
 STALE_PLAYING_GUARD=120
