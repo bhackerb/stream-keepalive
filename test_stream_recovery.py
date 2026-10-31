@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock,patch
+from unittest.mock import AsyncMock,MagicMock,patch
 from regular_browser import RegularBrowserKeeper,stream_rank
 import test_regular_browser as fixtures
 
@@ -93,6 +93,28 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.k._recovery_sources(row,'https://mine.example/',[]))
         self.k._recovery['0']['catalog']=True
         self.assertEqual(await self.k._recovery_sources(row,'https://mine.example/',[]),'https://b.example/2')
+
+    async def test_sixth_buffering_episode_switches_provider_without_spending_failure_attempts(self):
+        await self.setup_stream()
+        self.k.catalog.source_context=MagicMock(return_value=('ppv','american-football'))
+        for _ in range(5):
+            self.k._count_buffering('0',True);self.k._count_buffering('0',False)
+        self.assertNotIn('buffer_switch',self.k._recovery['0'])
+        self.k._count_buffering('0',True)
+        self.assertTrue(self.k._recovery['0']['buffer_switch'])
+        self.k._recovery_sources=AsyncMock(return_value='https://streamed.su/watch/0/golf/3')
+        async def commands(browser,op,**args):
+            if op=='inventory':return {'0':{}}if '0'in self.k.active_streams else {}
+            if op=='close':await self.k._event('firefox',{'event':'closed','stream_id':'0'})
+            return True
+        self.k.command=AsyncMock(side_effect=commands)
+        await self.tick(1000)
+        self.assertEqual(self.k._recovery_sources.await_args.args[3],'ppv')
+        self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['inventory','close','inventory','open'])
+        self.assertEqual(self.k.active_streams['0'].url,'https://streamed.su/watch/0/golf/3')
+        self.assertNotIn('buffer_switch',self.k._recovery['0'])
+        self.assertEqual((self.k._recovery['0']['attempts'],self.k._recovery['0']['buffer_switches']),(0,1))
+        self.assertEqual((self.k._buffer_watch['0']['episodes'],self.k._buffer_watch['0']['switches']),(0,1))
 
     def test_stream_rank_prefers_viewers_then_english_on_ties(self):
         self.assertEqual(stream_rank({'language':'English'}),(0,True,False))

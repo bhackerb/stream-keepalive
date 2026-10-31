@@ -46,6 +46,8 @@ AUTOPLAY_STEP_TIMEOUT=10
 # A live stream that stops reporting for this long counts as failed, but only if it was not playing.
 SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
+BUFFER_SWITCH_EPISODES=5  # switch provider after more than this many buffering episodes on one stream
+BUFFER_SWITCH_BUDGET=4  # provider switches per stream, separate from the failure-recovery attempts
 # A frame that reported playing within this window may still be playing unseen; recovery waits for it to age out.
 STALE_PLAYING_GUARD=120
 PLAYBACK_CONFIRM_TIMEOUT=6
@@ -78,6 +80,8 @@ def recovery_record(value):
     record={'attempts':value['attempts'],'tried':value['tried']}
     if value.get('user_source')is True:record['user_source']=True
     if value.get('user_source')is True and value.get('catalog')is True:record['catalog']=True
+    if value.get('buffer_switch')is True:record['buffer_switch']=True
+    if type(value.get('buffer_switches'))is int and 0<=value['buffer_switches']<=BUFFER_SWITCH_BUDGET:record['buffer_switches']=value['buffer_switches']
     validator=validate_user_source_url if record.get('user_source')else validate_url
     try:
         for url in record['tried']:validator(url)
@@ -124,7 +128,7 @@ class RegularBrowserKeeper:
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={}
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={};self._buffer_watch={}
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
         self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
@@ -316,6 +320,7 @@ class RegularBrowserKeeper:
             duration=best.get('duration')
             s.health_monitor.stats['duration']=round(duration,1)if type(duration)in(int,float)and math.isfinite(duration)and duration>0 else None
             s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),stall_duration=str(round(best.get('stall_seconds',0),1)))
+            self._count_buffering(sid,best.get('state')=='BUFFERING')
             # Playback aggregation can favor a small PLAYING ad. Audio controls
             # must describe the same fresh primary video that volume targets.
             primary=self._primary_video(sid)
@@ -856,7 +861,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.provider_summary(),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
+        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','buffering':{sid:dict(w)for sid,w in self._buffer_watch.items()if sid in self.active_streams},'audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.provider_summary(),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
     async def _catalog(self,max_age=0):
         # Every provider is polled together; one failing site only drops its sources.
         if self.catalog.last and time.time()-self.catalog.last_at<=max_age:return self.catalog.last
@@ -1083,6 +1088,26 @@ class RegularBrowserKeeper:
         plan.update(mode='manual',selected=[r for r in plan['live']if r['id']in wanted],overflow=[r for r in plan['live']if r['id']not in wanted],placements=placements)
         self._visible_ids=tuple(p['stream_id']for p in placements);self._save()
 
+    def _count_buffering(self,sid,buffering):
+        # One episode is one transition into BUFFERING. Past the threshold, the recovery loop switches provider.
+        watch=self._buffer_watch.setdefault(sid,dict(episodes=0,switches=0,buffering=False))
+        if buffering and not watch['buffering']:
+            watch['episodes']+=1
+            record=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time(),message='Waiting for video'))
+            if watch['episodes']>BUFFER_SWITCH_EPISODES and not record.get('buffer_switch'):
+                record.update(buffer_switch=True,message=f"{watch['episodes']} buffering episodes; switching provider")
+            self._buffer_log(sid,'buffering',watch)
+        watch['buffering']=buffering
+
+    def _buffer_log(self,sid,event,watch):
+        # Provider names and counts only; stream URLs stay out of the watch log.
+        stream=self.active_streams.get(sid)
+        source=self.catalog.source_context(stream.url)if stream and stream.url else None
+        row=dict(at=round(time.time()),stream_id=sid,event=event,episodes=watch['episodes'],switches=watch['switches'],provider=source[0]if source else None)
+        try:
+            with self.state_path.with_name('buffer-watch.jsonl').open('a')as f:f.write(json.dumps(row)+'\n')
+        except OSError:pass
+
     def _recoverable_failure(self,sid,now):
         stream=self.active_streams.get(sid)
         if not self.session or not stream or stream.session_id!=self.session['id'] or stream.parked:return False
@@ -1113,7 +1138,7 @@ class RegularBrowserKeeper:
         return url or first
     def _openable(self,sid):
         return sid not in self.active_streams and sid not in self.suppressed|self._ownership_lost|self._releasing
-    async def _recovery_sources(self,row,current,tried):
+    async def _recovery_sources(self,row,current,tried,exclude_provider=None):
         # A URL Ben supplied is never replaced automatically; catalog URLs fall through every provider.
         saved=self._recovery.get(row['id'],{})
         if saved.get('user_source')is True and not saved.get('catalog'):return None
@@ -1122,7 +1147,7 @@ class RegularBrowserKeeper:
             fresh=next((m for m in self.catalog.last['matches']if m['id']==row['id']),None)
             if fresh:sources=fresh['sources']
         sources=self.catalog.rank([s for s in sources if isinstance(s,dict)and s.get('url')and s.get('provider')],row.get('category')or row.get('sport',''))
-        return next((s['url']for s in sources if isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried),None)
+        return next((s['url']for s in sources if isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried and(exclude_provider is None or s.get('provider')!=exclude_provider)),None)
 
     async def _recover_no_video(self,plan):
         # Called under the same lock as layout/stop. One action per minute tick,
@@ -1150,36 +1175,41 @@ class RegularBrowserKeeper:
                 except Exception:continue
         for sid in list(self.active_streams):
             now=time.time();record=self._recovery.get(sid)
-            if not self._recoverable_failure(sid,now)or sid not in live:
+            buffer_switch=bool(record and record.get('buffer_switch'))
+            if(not buffer_switch and not self._recoverable_failure(sid,now))or sid not in live:
                 if record:
                     record.pop('since',None)
                     if self.active_streams[sid].health_monitor.stats.get('state')=='PLAYING':record['message']='Playback restored; remaining budget retained'
                 continue
             if record is None:record=self._recovery[sid]={'attempts':0,'tried':[],'created_at':now,'message':'Waiting for video'}
             record.setdefault('since',now)
-            if record['attempts']>=3:
+            if buffer_switch:
+                if record.get('buffer_switches',0)>=BUFFER_SWITCH_BUDGET:
+                    record['message']='Buffer switches exhausted; choose a source manually';continue
+            elif record['attempts']>=3:
                 record['message']='Automatic recovery exhausted; choose a source manually';continue
-            if now-record['since']<90 or now-record.get('last_action',0)<90:continue
+            if(not buffer_switch and now-record['since']<90)or now-record.get('last_action',0)<90:continue
             stream=self.active_streams[sid];stage='audit'
             try:
                 # Audit proves the exact owned tab still exists. Exceptions or
                 # inventory errors block any destructive command.
                 audit=await self.command(stream.browser,'inventory')
                 if not isinstance(audit,dict)or sid not in audit or self._inventory_errors.get(stream.browser):raise ValueError('Ownership audit failed')
-                if not self._recoverable_failure(sid,time.time()):continue
+                if not buffer_switch and not self._recoverable_failure(sid,time.time()):continue
                 # A dead-source page will not recover on reload; go straight to an alternate.
-                if record['attempts']==0 and not self._dead_source(sid,time.time()):
+                if not buffer_switch and record['attempts']==0 and not self._dead_source(sid,time.time()):
                     if time.time()-self._reload_times.get(sid,0)<600:continue
                     record.update(attempts=1,last_action=time.time(),since=time.time(),message='One automatic refresh requested')
                     self._save();await self.force_reload(sid)
                 else:
-                    url=await asyncio.wait_for(self._recovery_sources(live[sid],stream.url,record['tried']),20)
-                    if not self._recoverable_failure(sid,time.time()):continue
+                    current_provider=(self.catalog.source_context(stream.url)or(None,))[0]if buffer_switch else None
+                    url=await asyncio.wait_for(self._recovery_sources(live[sid],stream.url,record['tried'],current_provider),20)
+                    if not buffer_switch and not self._recoverable_failure(sid,time.time()):continue
                     if not url:
                         record.update(last_action=time.time(),message='No alternate source available; waiting');continue
                     # Close and drain inventory before reopening the same canonical
                     # match ID, using the already signed companion's finite commands.
-                    record.update(attempts=record['attempts']+1,last_action=time.time(),since=time.time(),pending_release=True,url=url,message='Trying alternate source')
+                    record.update(attempts=record['attempts']+(0 if buffer_switch else 1),buffer_switches=record.get('buffer_switches',0)+(1 if buffer_switch else 0),last_action=time.time(),since=time.time(),pending_release=True,url=url,message='Switching provider after buffering' if buffer_switch else 'Trying alternate source')
                     record['tried']=list(dict.fromkeys([*record['tried'],stream.url,url]))
                     self._releasing.add(sid);self._save()
                     stage='close';closed=await self.command_for(sid,'close');stage='drain'
@@ -1191,6 +1221,10 @@ class RegularBrowserKeeper:
                     for key in list(self._frames):
                         if key[0]==sid:del self._frames[key];self._progress.pop(key,None)
                     await self._open(sid,url,stream.team,stream.browser,stream.session_id)
+                    if buffer_switch:
+                        # The new provider starts with a clean episode count; the switch is recorded in the watch log.
+                        record.pop('buffer_switch',None);watch=self._buffer_watch[sid]=dict(episodes=0,switches=self._buffer_watch.get(sid,{}).get('switches',0)+1,buffering=False)
+                        self._buffer_log(sid,'switched',watch)
                     self._manual_signature=();self._layout_ids=()
                     await self._reconcile(plan)
                 self._save();return
