@@ -115,6 +115,21 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.k._recovery['0']['attempts'],self.k._recovery['0']['buffer_switches']),(0,1))
         self.assertEqual((self.k._buffer_watch['0']['episodes'],self.k._buffer_watch['0']['switches']),(0,1))
 
+    async def test_switch_excludes_last_known_provider_when_catalog_no_longer_lists_the_url(self):
+        await self.setup_stream()
+        self.k.catalog.source_context=MagicMock(return_value=('bintv','american-football'))
+        self.k._count_buffering('0','BUFFERING');self.k._count_buffering('0','PLAYING')
+        self.k.catalog.source_context=MagicMock(return_value=None)
+        self.k._count_buffering('0','BUFFERING')
+        self.k._recovery_sources=AsyncMock(return_value='https://streamed.su/watch/0/golf/4')
+        async def commands(browser,op,**args):
+            if op=='inventory':return {'0':{}}if '0'in self.k.active_streams else {}
+            if op=='close':await self.k._event('firefox',{'event':'closed','stream_id':'0'})
+            return True
+        self.k.command=AsyncMock(side_effect=commands)
+        await self.tick(1000)
+        self.assertEqual(self.k._recovery_sources.await_args.args[3],'bintv')
+
     def test_short_loading_stalls_count_only_after_playback(self):
         self.k._count_buffering('0','LOADING')  # startup loading
         self.assertEqual(self.k._buffer_watch['0']['episodes'],0)

@@ -80,6 +80,7 @@ def recovery_record(value):
     record={'attempts':value['attempts'],'tried':value['tried']}
     if value.get('user_source')is True:record['user_source']=True
     if value.get('user_source')is True and value.get('catalog')is True:record['catalog']=True
+    if isinstance(value.get('provider'),str)and 0<len(value['provider'])<=80:record['provider']=value['provider']
     if value.get('buffer_switch')is True:record['buffer_switch']=True
     if type(value.get('buffer_switches'))is int and 0<=value['buffer_switches']<=BUFFER_SWITCH_BUDGET:record['buffer_switches']=value['buffer_switches']
     validator=validate_user_source_url if record.get('user_source')else validate_url
@@ -1109,7 +1110,9 @@ class RegularBrowserKeeper:
         # Provider names and counts only; stream URLs stay out of the watch log.
         stream=self.active_streams.get(sid)
         source=self.catalog.source_context(stream.url)if stream and stream.url else None
-        row=dict(at=round(time.time()),stream_id=sid,event=event,episodes=watch['episodes'],switches=watch['switches'],provider=source[0]if source else None)
+        # Remember the last provider seen, so a catalog refresh that drops this URL cannot erase it.
+        if source:watch['provider']=source[0]
+        row=dict(at=round(time.time()),stream_id=sid,event=event,episodes=watch['episodes'],switches=watch['switches'],provider=watch.get('provider'))
         try:
             with self.state_path.with_name('buffer-watch.jsonl').open('a')as f:f.write(json.dumps(row)+'\n')
         except OSError:pass
@@ -1208,14 +1211,15 @@ class RegularBrowserKeeper:
                     record.update(attempts=1,last_action=time.time(),since=time.time(),message='One automatic refresh requested')
                     self._save();await self.force_reload(sid)
                 else:
-                    current_provider=(self.catalog.source_context(stream.url)or(None,))[0]if buffer_switch else None
+                    current_provider=((self.catalog.source_context(stream.url)or(None,))[0]or record.get('provider')or self._buffer_watch.get(sid,{}).get('provider'))if buffer_switch else None
                     url=await asyncio.wait_for(self._recovery_sources(live[sid],stream.url,record['tried'],current_provider),20)
                     if not buffer_switch and not self._recoverable_failure(sid,time.time()):continue
                     if not url:
                         record.update(last_action=time.time(),message='No alternate source available; waiting');continue
                     # Close and drain inventory before reopening the same canonical
                     # match ID, using the already signed companion's finite commands.
-                    record.update(attempts=record['attempts']+(0 if buffer_switch else 1),buffer_switches=record.get('buffer_switches',0)+(1 if buffer_switch else 0),last_action=time.time(),since=time.time(),pending_release=True,url=url,message='Switching provider after buffering' if buffer_switch else 'Trying alternate source')
+                    chosen_provider=(self.catalog.source_context(url)or(None,))[0]
+                    record.update(attempts=record['attempts']+(0 if buffer_switch else 1),buffer_switches=record.get('buffer_switches',0)+(1 if buffer_switch else 0),last_action=time.time(),since=time.time(),pending_release=True,url=url,provider=chosen_provider or record.get('provider'),message='Switching provider after buffering' if buffer_switch else 'Trying alternate source')
                     record['tried']=list(dict.fromkeys([*record['tried'],stream.url,url]))
                     self._releasing.add(sid);self._save()
                     stage='close';closed=await self.command_for(sid,'close');stage='drain'
@@ -1229,7 +1233,7 @@ class RegularBrowserKeeper:
                     await self._open(sid,url,stream.team,stream.browser,stream.session_id)
                     if buffer_switch:
                         # The new provider starts with a clean episode count; the switch is recorded in the watch log.
-                        record.pop('buffer_switch',None);watch=self._buffer_watch[sid]=dict(episodes=0,switches=self._buffer_watch.get(sid,{}).get('switches',0)+1,buffering=False)
+                        record.pop('buffer_switch',None);watch=self._buffer_watch[sid]=dict(episodes=0,switches=self._buffer_watch.get(sid,{}).get('switches',0)+1,buffering=False,provider=record.get('provider'))
                         self._buffer_log(sid,'switched',watch)
                     self._manual_signature=();self._layout_ids=()
                     await self._reconcile(plan)
