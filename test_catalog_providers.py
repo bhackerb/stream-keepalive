@@ -177,6 +177,19 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((event['category'], event['teams'], event['end_ms']), ('american-football', ['Indiana Hoosiers', 'Minnesota Golden Gophers'], (IU_MINNESOTA_START + 10800) * 1000))
         self.assertFalse(cp.parse_reedstreams({'not': 'a list'}, IU_MINNESOTA_NOW))
 
+    async def test_540p_variant_ranks_first_without_overriding_provider_health(self):
+        self.assertEqual(cp._height('https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu_540p'), 540)
+        self.assertEqual(cp._height('https://streamfree.example/embed/gsw-den1080p', 'StreamFree'), 1080)
+        self.assertIsNone(cp._height('https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu', 'CBS'))
+        ntv = {'all': [{'id': 'ppv-31100', 'title': 'Minnesota Golden Gophers at Indiana Hoosiers', 'category': 'American Football',
+                        'date': IU_MINNESOTA_START * 1000, 'sources': [
+                            {'source': 'main', 'url': 'https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu'},
+                            {'source': 'alt', 'url': 'https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu_540p'}]}]}
+        routes = all_routes(**{'https://ntv.st/api/get-matches?server=raptor&type=both': ntv})
+        result = await self.catalog.fetch(fake_client(routes), now_ms=IU_MINNESOTA_NOW)
+        game = next(m for m in result['matches'] if 'ntvst' in m['providers'])
+        self.assertTrue(game['sources'][0]['url'].endswith('_540p'))
+
     def test_bintv_live_group_and_thetvapp_live_rows(self):
         [event] = cp.parse_bintv({'Live Events': [{'id': 'minnesota-golden-gophers-v-indiana-hoosiers-401858501',
                                                    'name': 'Minnesota Golden Gophers @ Indiana Hoosiers', 'category': 'American Football',

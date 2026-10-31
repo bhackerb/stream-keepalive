@@ -80,8 +80,20 @@ def team_tokens(name):
     return {w for w in words(name) if len(w) >= 3 and w not in GENERIC}
 
 
+PREFERRED_HEIGHT = 540  # lower-bitrate variants first: HD feeds were buffering on home connections
+HEIGHT = re.compile(r'(?<!\d)(\d{3,4})p(?!\w)')
+
+
+def _height(*texts):
+    for text in texts:
+        match = HEIGHT.search(str(text or '').lower())
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def stream_rank(item):
-    # Most-watched source first; English and then HD only break ties. Unknown counts rank as zero.
+    # The preferred height first, then most-watched; English and then HD only break ties. Unknown counts rank as zero.
     viewers = item.get('viewers') if type(item.get('viewers')) in (int, float) and math.isfinite(item['viewers']) else 0
     language = str(item.get('language') or '').strip().lower()
     english = language == 'english' or language.startswith('english') and not language[7:8].isalpha()
@@ -110,7 +122,8 @@ def _event(provider, pid, title, category, start_ms, streams, *, teams=None, end
 
 
 def _stream(url, label, *, language=None, hd=False, viewers=None):
-    return {'url': url, 'label': str(label or 'Stream')[:80], 'language': language, 'hd': bool(hd), 'viewers': viewers}
+    return {'url': url, 'label': str(label or 'Stream')[:80], 'language': language, 'hd': bool(hd), 'viewers': viewers,
+            'height': _height(url, label)}
 
 
 # --------------------------------------------------------------------------- adapters
@@ -626,9 +639,10 @@ class Catalog:
         return url in self.urls or url in self._previous_urls
 
     def rank(self, sources, sport=''):
-        # Consistent providers first (coarse buckets so noise cannot reshuffle), then viewers, English, HD.
+        # Consistent providers first (coarse buckets so noise cannot reshuffle), then the preferred height, viewers, English, HD.
         return sorted(sources, key=lambda s: (round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
-                      round(self.health.score(s['provider']), 1), *stream_rank(s)), reverse=True)
+                      round(self.health.score(s['provider']), 1), s.get('height') == PREFERRED_HEIGHT, *stream_rank(s)),
+                      reverse=True)
 
     def source_context(self, url):
         for match in (self.last or {}).get('matches', []):
