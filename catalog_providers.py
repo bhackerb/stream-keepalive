@@ -54,7 +54,7 @@ CATEGORY_LABELS = (
 
 
 def category_of(*labels):
-    text = ' '.join(str(label) for label in labels if label).lower()
+    text = ' '.join(str(label) for label in labels if label).lower().replace('-', ' ')  # slugs: american-football
     for category, pattern in CATEGORY_LABELS:
         if re.search(pattern, text):
             return category
@@ -292,6 +292,82 @@ def parse_onhockey(page, now_ms):
     return events
 
 
+def parse_ninetyminutes(payload, now_ms):
+    """90minutes' public DamiTV-backed API: category groups of events with embed sources."""
+    events = []
+    for group in payload.get('streams') or []:
+        for item in (group.get('streams') or []) if isinstance(group, dict) else []:
+            if not isinstance(item, dict) or item.get('always_live'):
+                continue
+            start, end = _int(item.get('starts_at')), _int(item.get('ends_at'))
+            if not start or now_ms - start * 1000 > STALE_EVENT_MS:
+                continue
+            teams = item.get('teams') or {}
+            names = [(teams.get(side) or {}).get('name') for side in ('home', 'away')]
+            streams = [_stream(s.get('embed'), s.get('name') or '90minutes', viewers=None)
+                       for s in item.get('sources') or [] if isinstance(s, dict)]
+            events.append(_event('ninetyminutes', item.get('id'), item.get('name'),
+                                 category_of(group.get('category_name'), item.get('category_name'), item.get('league')),
+                                 start * 1000, streams, teams=names if all(names) else None,
+                                 end_ms=end * 1000 if end else None, viewers=_int(item.get('viewers')) or None,
+                                 live=True if item.get('status') == 'live' else None))
+    return events
+
+
+SPORTSBITE_LIVE_STATUS = {'offline'}
+
+
+def parse_sportsbite(payload, now_ms):
+    """SportsBite's match listing: each event carries its own iframe embed options."""
+    events = []
+    for day in payload.get('days') or []:
+        for item in (day.get('events') or []) if isinstance(day, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            start = _int(item.get('kickoffMs'))
+            if not start or now_ms - start > STALE_EVENT_MS:
+                continue
+            streams = []
+            for s in item.get('streams') or []:
+                if not isinstance(s, dict) or str(s.get('status') or '').lower() in SPORTSBITE_LIVE_STATUS:
+                    continue
+                streams.append(_stream(s.get('manifest_url'), s.get('label') or s.get('name') or 'SportsBite',
+                                       language=s.get('language'), hd=s.get('quality') == 'HD',
+                                       viewers=_int(s.get('viewers'))))
+            teams = item.get('teams') or {}
+            names = [(teams.get(side) or {}).get('name') for side in ('home', 'away')]
+            events.append(_event('sportsbite', item.get('streamed_event_id') or item.get('slug'), item.get('title'),
+                                 category_of(item.get('sport'), item.get('category'), item.get('tournament_slug')),
+                                 start, streams, teams=names if all(names) else None,
+                                 live=item.get('live') if type(item.get('live')) is bool else None,
+                                 viewers=_int(item.get('viewers_total')) or None))
+    return events
+
+
+WATCHSPORTS_ROW = re.compile(r'<a href="(/[a-z0-9-]+/\d+)"([^>]*\bgame-row\b[^>]*)>')
+WATCHSPORTS_LABEL = re.compile(r'aria-label="([^"]*)"')
+WATCHSPORTS_SPORTS = {'cfb': 'college football', 'wnba': 'wnba', 'nba': 'nba', 'nhl': 'nhl', 'mma': 'mma', 'f1': 'f1'}
+
+
+def parse_watchsports(page, now_ms):
+    """Live rows on WatchSports' homepage. Each row links a player page that holds its own embeds."""
+    events = []
+    for href, attrs in WATCHSPORTS_ROW.findall(page):
+        label = WATCHSPORTS_LABEL.search(attrs)
+        if 'is-live' not in attrs or not label:
+            continue
+        text = html.unescape(label.group(1))
+        title = text.split(' - ')[0].strip()
+        count = re.search(r'(\d+) streams', text)
+        sport = href.split('/')[1]
+        streams = [_stream('https://watchsports.su' + href,
+                           f'WatchSports ({count.group(1)} streams)' if count else 'WatchSports page')]
+        # Listing rows carry no kickoff time, only a live state, so the poll time anchors them.
+        events.append(_event('watchsports', href, title, category_of(WATCHSPORTS_SPORTS.get(sport, sport), title),
+                             now_ms, streams, live=True))
+    return events
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -312,6 +388,11 @@ PROVIDERS = (
     Provider('onhockey', 'OnHockey', ('https://www.onhockey.tv/schedule_table.php',), parse_onhockey, kind='html',
              headers=(('Referer', 'https://www.onhockey.tv/'),), sports=('hockey',)),
     Provider('matchora', 'Matchora', ('https://matchora.to/api/v1/schedule?watchable=1',), parse_matchora),
+    Provider('ninetyminutes', '90minutes', ('https://www.90minutes.pro/api/streams',), parse_ninetyminutes,
+             headers=(('Referer', 'https://www.90minutes.pro/'),)),
+    Provider('sportsbite', 'SportsBite', ('https://sportsbite.org/api/forestgump/matches',), parse_sportsbite,
+             headers=(('Referer', 'https://sportsbite.org/'),)),
+    Provider('watchsports', 'WatchSports', ('https://watchsports.su/',), parse_watchsports, kind='html'),
 )
 
 

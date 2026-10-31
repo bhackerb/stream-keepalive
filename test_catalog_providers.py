@@ -73,7 +73,26 @@ english:
 <div class='gamelinks' onclick='event.stopPropagation()'>
 </div></td></tr>
 </table>"""
-PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY), 'matchora': {'events': []}}
+PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY), 'matchora': {'events': []},
+            'ninetyminutes': {'streams': []}, 'sportsbite': {'days': []}, 'watchsports': ('text/html', '')}
+IU_MINNESOTA_START = 1793475000
+IU_MINNESOTA_NOW = (IU_MINNESOTA_START + 600) * 1000
+NINETYMINUTES_IU_MN = {'streams': [{'category': 'american-football', 'streams': [
+    {'id': 'espn-401858501', 'name': 'Indiana Hoosiers vs Minnesota Golden Gophers', 'starts_at': IU_MINNESOTA_START,
+     'ends_at': IU_MINNESOTA_START + 10800, 'status': 'live', 'viewers': 13, 'category_name': 'american-football',
+     'league': 'NCAA - Football', 'teams': {'home': {'name': 'Indiana Hoosiers'}, 'away': {'name': 'Minnesota Golden Gophers'}},
+     'sources': [{'name': 'Server 1', 'embed': 'https://damitv.st/embed/?id=espn-401858501'},
+                 {'name': 'Plain http', 'embed': 'http://insecure.example/x'}]},
+    {'id': 'stale', 'name': 'Old Game', 'starts_at': 1, 'ends_at': 2, 'sources': [{'embed': 'https://old.example/x'}]}]}]}
+SPORTSBITE_IU_MN = {'days': [{'events': [
+    {'title': 'Minnesota Golden Gophers at Indiana Hoosiers', 'streamed_event_id': 'ppv-minnesota-golden-gophers-at-indiana-hoosiers',
+     'sport': 'american-football', 'kickoffMs': IU_MINNESOTA_START * 1000, 'live': True, 'viewers_total': 40,
+     'teams': {'home': {'name': 'Minnesota Golden Gophers'}, 'away': {'name': 'Indiana Hoosiers'}},
+     'streams': [{'label': 'CBS', 'manifest_url': 'https://sportsbite.org/tlive-embed/embed/x', 'quality': 'HD',
+                  'language': 'English', 'status': 'online', 'viewers': 0},
+                 {'label': 'Down', 'manifest_url': 'https://sportsbite.org/y', 'status': 'offline'}]}]}]}
+WATCHSPORTS_IU_MN = ('text/html', '<a href="/cfb/401858501" class="game-row matchup is-live" aria-label="Minnesota vs Indiana - Live - 14 streams - Popular right now - Memorial Stadium (Bloomington, IN)"><span>x</span></a>'
+                     '<a href="/nba/1" class="game-row matchup" aria-label="Old Game - Final - 2 streams"></a>')
 
 
 def fake_client(routes):
@@ -123,6 +142,39 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cp.parse_matchora({'events': [item]}, NOW)[0]['streams'][0]['url'], item['embed_url'])
         self.assertFalse(any(cp.parse_matchora({'events': [{**item, 'channels': [{'dead': True}]}]}, NOW)))
         self.assertFalse(any(cp.parse_matchora({'events': [{**item, 'embed_url': 'http://bad.example/'}]}, NOW)))
+
+    def test_ninetyminutes_keeps_https_embeds_of_current_games_only(self):
+        [event] = cp.parse_ninetyminutes(NINETYMINUTES_IU_MN, IU_MINNESOTA_NOW)
+        self.assertEqual(event['category'], 'american-football')
+        self.assertEqual(event['teams'], ['Indiana Hoosiers', 'Minnesota Golden Gophers'])
+        self.assertTrue(event['live'])
+        self.assertEqual(event['viewers'], 13)
+        self.assertEqual([s['url'] for s in event['streams']], ['https://damitv.st/embed/?id=espn-401858501'])
+
+    def test_sportsbite_keeps_online_embeds_and_marks_hd(self):
+        [event] = cp.parse_sportsbite(SPORTSBITE_IU_MN, IU_MINNESOTA_NOW)
+        self.assertEqual(event['category'], 'american-football')
+        self.assertEqual(event['teams'], ['Minnesota Golden Gophers', 'Indiana Hoosiers'])
+        self.assertTrue(event['live'])
+        self.assertEqual([(s['url'], s['hd']) for s in event['streams']], [('https://sportsbite.org/tlive-embed/embed/x', True)])
+        self.assertFalse(any(cp.parse_sportsbite({'days': [{'events': [{**SPORTSBITE_IU_MN['days'][0]['events'][0], 'kickoffMs': 1000}]}]}, IU_MINNESOTA_NOW)))
+
+    def test_watchsports_lists_only_live_rows_as_player_pages(self):
+        [event] = cp.parse_watchsports(WATCHSPORTS_IU_MN[1], IU_MINNESOTA_NOW)
+        self.assertEqual(event['title'], 'Minnesota vs Indiana')
+        self.assertEqual(event['category'], 'american-football')
+        self.assertEqual(event['streams'][0]['url'], 'https://watchsports.su/cfb/401858501')
+        self.assertEqual(event['streams'][0]['label'], 'WatchSports (14 streams)')
+
+    async def test_iu_minnesota_merges_across_new_providers_with_flipped_home_away(self):
+        routes = all_routes(**{'https://www.90minutes.pro/api/streams': NINETYMINUTES_IU_MN,
+                               'https://sportsbite.org/api/forestgump/matches': SPORTSBITE_IU_MN,
+                               'https://watchsports.su/': WATCHSPORTS_IU_MN})
+        result = await self.catalog.fetch(fake_client(routes), now_ms=IU_MINNESOTA_NOW)
+        game = next(m for m in result['matches'] if 'watchsports' in m['providers'])
+        self.assertEqual(game['providers'], ['ninetyminutes', 'sportsbite', 'watchsports'])
+        self.assertEqual(len(game['sources']), 3)
+        self.assertTrue(game['live'])
 
     async def test_current_rockylive_api_merges_event_page(self):
         provider = next(p for p in cp.PROVIDERS if p.name == 'rockylive')
