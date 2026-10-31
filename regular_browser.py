@@ -323,7 +323,7 @@ class RegularBrowserKeeper:
             duration=best.get('duration')
             s.health_monitor.stats['duration']=round(duration,1)if type(duration)in(int,float)and math.isfinite(duration)and duration>0 else None
             s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),stall_duration=str(round(best.get('stall_seconds',0),1)))
-            self._count_buffering(sid,best.get('state'))
+            self._count_buffering(sid,'LOADING' if best.get('state')=='LOADING' and best.get('stall_seconds',0)>=3 else ('IDLE' if best.get('state')=='LOADING' else best.get('state')))
             # Playback aggregation can favor a small PLAYING ad. Audio controls
             # must describe the same fresh primary video that volume targets.
             primary=self._primary_video(sid)
