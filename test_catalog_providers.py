@@ -360,6 +360,16 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary['rockylive']['coverage'], 1.0)
         self.assertEqual(summary['streamfree']['coverage'], .5)
 
+    def test_finished_games_leave_the_selector_and_live_ones_stay(self):
+        def event(**changes):
+            return {'title': 'Minnesota Golden Gophers at Indiana Hoosiers', 'category': 'american-football', 'teams': None,
+                    'start_ms': IU_MINNESOTA_START * 1000, 'live': None, 'end_ms': None, **changes}
+        now = IU_MINNESOTA_NOW
+        self.assertTrue(cp.keep_unfinished(event(), now))
+        self.assertFalse(cp.keep_unfinished(event(live=False, start_ms=IU_MINNESOTA_START * 1000 - 5 * 3600_000), now))
+        self.assertTrue(cp.keep_unfinished(event(live=True, start_ms=IU_MINNESOTA_START * 1000 - 5 * 3600_000), now))
+        self.assertFalse(cp.keep_unfinished(event(end_ms=IU_MINNESOTA_START * 1000 - 1000), now))
+
     def test_category_labels(self):
         self.assertEqual(cp.category_of('Australian Football', 'AFL'), 'other')
         self.assertEqual(cp.category_of('American Football', 'NFL'), 'american-football')

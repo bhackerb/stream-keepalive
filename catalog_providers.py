@@ -92,6 +92,21 @@ def _height(*texts):
     return None
 
 
+OVER_GRACE_MS = 4 * 3600_000  # a listed game is over this long after kickoff when no end time is published
+
+
+def is_over(event, now_ms):
+    if event.get('live') is True:
+        return False
+    end = event.get('end_ms')
+    return bool((end and end < now_ms) or event['start_ms'] < now_ms - OVER_GRACE_MS)
+
+
+def keep_unfinished(event, now_ms):
+    # League membership is decided by Mithrandir's ESPN-backed league filters, never by guessing from titles.
+    return not is_over(event, now_ms)
+
+
 def stream_rank(item):
     # The preferred height first, then most-watched; English and then HD only break ties. Unknown counts rank as zero.
     viewers = item.get('viewers') if type(item.get('viewers')) in (int, float) and math.isfinite(item['viewers']) else 0
@@ -612,7 +627,7 @@ class Catalog:
         results = await asyncio.gather(*(self._fetch_provider(client, p, now_ms) for p in self.providers))
         events, polls = [], {}
         for provider, (poll, provider_events) in zip(self.providers, results):
-            fresh = [e for e in provider_events if not e['end_ms'] or e['end_ms'] > now_ms - 900_000]
+            fresh = [e for e in provider_events if (not e['end_ms'] or e['end_ms'] > now_ms - 900_000) and keep_unfinished(e, now_ms)]
             polls[provider.name] = dict(poll, at=int(now_ms / 1000), events=len(fresh))
             events.extend(fresh)
         if not any(p['ok'] for p in polls.values()):
