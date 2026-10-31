@@ -46,7 +46,7 @@ AUTOPLAY_STEP_TIMEOUT=10
 # A live stream that stops reporting for this long counts as failed, but only if it was not playing.
 SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
-BUFFER_SWITCH_EPISODES=3  # switch provider after more than this many buffering episodes on one stream
+BUFFER_SWITCH_EPISODES=1  # switch provider after more than this many buffering episodes on one stream
 BUFFER_SWITCH_BUDGET=4  # provider switches per stream, separate from the failure-recovery attempts
 # A frame that reported playing within this window may still be playing unseen; recovery waits for it to age out.
 STALE_PLAYING_GUARD=120
@@ -320,7 +320,7 @@ class RegularBrowserKeeper:
             duration=best.get('duration')
             s.health_monitor.stats['duration']=round(duration,1)if type(duration)in(int,float)and math.isfinite(duration)and duration>0 else None
             s.health_monitor.stats.update(state=best.get('state','UNKNOWN'),resolution=f"{best.get('width',0)}x{best.get('height',0)}",current_time=str(round(best.get('current_time',0),2)),stall_duration=str(round(best.get('stall_seconds',0),1)))
-            self._count_buffering(sid,best.get('state')=='BUFFERING')
+            self._count_buffering(sid,best.get('state'))
             # Playback aggregation can favor a small PLAYING ad. Audio controls
             # must describe the same fresh primary video that volume targets.
             primary=self._primary_video(sid)
@@ -1088,11 +1088,14 @@ class RegularBrowserKeeper:
         plan.update(mode='manual',selected=[r for r in plan['live']if r['id']in wanted],overflow=[r for r in plan['live']if r['id']not in wanted],placements=placements)
         self._visible_ids=tuple(p['stream_id']for p in placements);self._save()
 
-    def _count_buffering(self,sid,buffering):
-        # One episode is one transition into BUFFERING. Past the threshold, the recovery loop switches provider.
-        watch=self._buffer_watch.setdefault(sid,dict(episodes=0,switches=0,buffering=False))
+    def _count_buffering(self,sid,state):
+        # One episode is one transition into a stall. BUFFERING always counts; LOADING counts only after the
+        # stream has played since its last episode, so short stalls count without counting startup loading.
+        watch=self._buffer_watch.setdefault(sid,dict(episodes=0,switches=0,buffering=False,playing=False))
+        if state=='PLAYING':watch['playing']=True
+        buffering=state=='BUFFERING'or state=='LOADING'and watch.get('playing',False)
         if buffering and not watch['buffering']:
-            watch['episodes']+=1
+            watch['episodes']+=1;watch['playing']=False
             record=self._recovery.setdefault(sid,dict(attempts=0,tried=[],created_at=time.time(),message='Waiting for video'))
             if watch['episodes']>BUFFER_SWITCH_EPISODES and not record.get('buffer_switch'):
                 record.update(buffer_switch=True,message=f"{watch['episodes']} buffering episodes; switching provider")

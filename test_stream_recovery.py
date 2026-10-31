@@ -94,13 +94,12 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.k._recovery['0']['catalog']=True
         self.assertEqual(await self.k._recovery_sources(row,'https://mine.example/',[]),'https://b.example/2')
 
-    async def test_fourth_buffering_episode_switches_provider_without_spending_failure_attempts(self):
+    async def test_second_buffering_episode_switches_provider_without_spending_failure_attempts(self):
         await self.setup_stream()
         self.k.catalog.source_context=MagicMock(return_value=('ppv','american-football'))
-        for _ in range(3):
-            self.k._count_buffering('0',True);self.k._count_buffering('0',False)
+        self.k._count_buffering('0','BUFFERING');self.k._count_buffering('0','PLAYING')
         self.assertNotIn('buffer_switch',self.k._recovery['0'])
-        self.k._count_buffering('0',True)
+        self.k._count_buffering('0','BUFFERING')
         self.assertTrue(self.k._recovery['0']['buffer_switch'])
         self.k._recovery_sources=AsyncMock(return_value='https://streamed.su/watch/0/golf/3')
         async def commands(browser,op,**args):
@@ -115,6 +114,12 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('buffer_switch',self.k._recovery['0'])
         self.assertEqual((self.k._recovery['0']['attempts'],self.k._recovery['0']['buffer_switches']),(0,1))
         self.assertEqual((self.k._buffer_watch['0']['episodes'],self.k._buffer_watch['0']['switches']),(0,1))
+
+    def test_short_loading_stalls_count_only_after_playback(self):
+        self.k._count_buffering('0','LOADING')  # startup loading
+        self.assertEqual(self.k._buffer_watch['0']['episodes'],0)
+        self.k._count_buffering('0','PLAYING');self.k._count_buffering('0','LOADING');self.k._count_buffering('0','PLAYING')
+        self.assertEqual(self.k._buffer_watch['0']['episodes'],1)
 
     def test_stream_rank_prefers_viewers_then_english_on_ties(self):
         self.assertEqual(stream_rank({'language':'English'}),(0,True,False))
@@ -198,7 +203,10 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('0',self.k._releasing);self.assertEqual(self.k.active_streams['0'].url,'https://streamed.pk/watch/0/golf/2')
 
 class BufferingTests(unittest.IsolatedAsyncioTestCase):
-    asyncSetUp=fixtures.RegularTests.asyncSetUp
+    async def asyncSetUp(self):
+        await fixtures.RegularTests.asyncSetUp(self)
+        # These tests cover the sustained-stall timer; the episode cap has its own tests in RecoveryTests.
+        patcher=patch('regular_browser.BUFFER_SWITCH_EPISODES',99);patcher.start();self.addCleanup(patcher.stop)
     asyncTearDown=fixtures.RegularTests.asyncTearDown
     plan=fixtures.RegularTests.plan
     setup_stream=RecoveryTests.setup_stream
@@ -235,7 +243,7 @@ class BufferingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.k.active_streams['0'].health_monitor.stats['state'],'LOADING');self.k.command.assert_not_awaited()
 
     async def seed_buffering(self):
-        await self.setup_stream();self.k._frames.clear();self.k._progress.clear();self.k._recovery.clear();self.k._reload_times.clear()
+        await self.setup_stream();self.k._frames.clear();self.k._progress.clear();self.k._recovery.clear();self.k._reload_times.clear();self.k._buffer_watch.clear()
         await self.health(1000,10,'PLAYING');await self.health(1003,11,'PLAYING',frames=40)
         await self.health(1018,11,frames=40,stall=15)
         with patch('regular_browser.time.time',return_value=1018):await self.k._recover_no_video(self.p)
