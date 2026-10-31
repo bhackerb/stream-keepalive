@@ -368,6 +368,76 @@ def parse_watchsports(page, now_ms):
     return events
 
 
+def parse_ntvst(payload, now_ms):
+    """NTV's match list (times in epoch milliseconds); each match lists its own embed sources."""
+    events = []
+    for item in payload.get('all') or []:
+        if not isinstance(item, dict):
+            continue
+        start = _int(item.get('date'))
+        if not start or now_ms - start > STALE_EVENT_MS:
+            continue
+        streams = [_stream(s.get('url'), s.get('source') or 'NTV', language=None)
+                   for s in item.get('sources') or [] if isinstance(s, dict)]
+        events.append(_event('ntvst', item.get('id'), item.get('title'),
+                             category_of(item.get('category'), item.get('tournament')), start, streams,
+                             live=True if item.get('live') is True else None))
+    return events
+
+
+def parse_reedstreams(payload, now_ms):
+    """ReedStreams' match feed: a bare list, times in epoch milliseconds, embeds per source."""
+    events = []
+    for item in payload if isinstance(payload, list) else []:
+        if not isinstance(item, dict):
+            continue
+        start = _int(item.get('date'))
+        if not start or now_ms - start > STALE_EVENT_MS:
+            continue
+        teams = item.get('teams') or {}
+        names = [(teams.get(side) or {}).get('name') for side in ('home', 'away')]
+        streams = [_stream(s.get('embedUrl'), s.get('name') or 'ReedStreams')
+                   for s in item.get('sources') or [] if isinstance(s, dict)]
+        events.append(_event('reedstreams', item.get('id'), item.get('title'),
+                             category_of(item.get('category'), item.get('league_name')), start, streams,
+                             teams=names if all(names) else None, end_ms=_int(item.get('ends_at'))))
+    return events
+
+
+def parse_bintv(payload, now_ms):
+    """BINTV's live group: no kickoff times, so listed live games anchor to the poll time."""
+    events = []
+    for item in payload.get('Live Events') or []:
+        if not isinstance(item, dict):
+            continue
+        streams = [_stream(s.get('url'), s.get('name') or 'BINTV') for s in item.get('streams') or [] if isinstance(s, dict)]
+        events.append(_event('bintv', item.get('id'), item.get('name'), category_of(item.get('category')),
+                             now_ms, streams, live=True))
+    return events
+
+
+THETVAPP_ROW = re.compile(r'<a class="game"([^>]*)>')
+THETVAPP_SPORTS = {'cfb': 'college football', 'nba': 'nba', 'wnba': 'wnba', 'nhl': 'nhl', 'mls': 'mls',
+                   'ufc': 'ufc', 'boxing': 'boxing'}
+
+
+def parse_thetvapp(page, now_ms):
+    """TheTVApp's live rows; each row links a game page that embeds its own player."""
+    events = []
+    for attrs in THETVAPP_ROW.findall(page):
+        fields = dict(re.findall(r'(data-[a-z-]+|href)="([^"]*)"', attrs))
+        if fields.get('data-status') != 'live' or not fields.get('href', '').startswith('https://'):
+            continue
+        sport = html.unescape(fields.get('data-sport', ''))
+        title = html.unescape(fields.get('data-search', '')).strip()
+        if sport and title.endswith(' ' + sport):
+            title = title[:-len(sport) - 1].strip()
+        events.append(_event('thetvapp', fields['href'].rsplit('/', 1)[-1], title,
+                             category_of(THETVAPP_SPORTS.get(sport.lower(), sport), title), now_ms,
+                             [_stream(fields['href'], 'TheTVApp player')], live=True))
+    return events
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -393,6 +463,13 @@ PROVIDERS = (
     Provider('sportsbite', 'SportsBite', ('https://sportsbite.org/api/forestgump/matches',), parse_sportsbite,
              headers=(('Referer', 'https://sportsbite.org/'),)),
     Provider('watchsports', 'WatchSports', ('https://watchsports.su/',), parse_watchsports, kind='html'),
+    Provider('ntvst', 'NTV', ('https://ntv.st/api/get-matches?server=raptor&type=both',), parse_ntvst,
+             headers=(('Referer', 'https://ntv.st/'),)),
+    Provider('reedstreams', 'ReedStreams', ('https://api.reedstreams.link/api/matches/all',), parse_reedstreams,
+             headers=(('Referer', 'https://reedstreams.to/'),)),
+    Provider('bintv', 'BINTV', ('https://bintvjson.lovable.app/api/public/bintvjson',), parse_bintv,
+             headers=(('Referer', 'https://www.bintv.cc/'),)),
+    Provider('thetvapp', 'TheTVApp', ('https://thetvapp.plus/v13',), parse_thetvapp, kind='html'),
 )
 
 
@@ -506,7 +583,7 @@ class Catalog:
                 continue
             latency = int((time.monotonic() - started) * 1000)
             try:  # a changed schema is a provider failure, not a catalog crash
-                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, dict if provider.kind == 'json' else str) else None
+                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, (dict, list) if provider.kind == 'json' else str) else None
             except (KeyError, TypeError, ValueError, AttributeError) as e:
                 events, error = None, f'{url}: schema changed ({type(e).__name__})'
             if events is None:

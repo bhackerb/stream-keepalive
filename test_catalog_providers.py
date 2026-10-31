@@ -74,7 +74,8 @@ english:
 </div></td></tr>
 </table>"""
 PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY), 'matchora': {'events': []},
-            'ninetyminutes': {'streams': []}, 'sportsbite': {'days': []}, 'watchsports': ('text/html', '')}
+            'ninetyminutes': {'streams': []}, 'sportsbite': {'days': []}, 'watchsports': ('text/html', ''),
+            'ntvst': {'all': []}, 'reedstreams': [], 'bintv': {'Live Events': []}, 'thetvapp': ('text/html', '')}
 IU_MINNESOTA_START = 1793475000
 IU_MINNESOTA_NOW = (IU_MINNESOTA_START + 600) * 1000
 NINETYMINUTES_IU_MN = {'streams': [{'category': 'american-football', 'streams': [
@@ -158,6 +159,38 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event['live'])
         self.assertEqual([(s['url'], s['hd']) for s in event['streams']], [('https://sportsbite.org/tlive-embed/embed/x', True)])
         self.assertFalse(any(cp.parse_sportsbite({'days': [{'events': [{**SPORTSBITE_IU_MN['days'][0]['events'][0], 'kickoffMs': 1000}]}]}, IU_MINNESOTA_NOW)))
+
+    def test_ntvst_and_reedstreams_read_epoch_millisecond_feeds(self):
+        ntv = {'all': [{'id': 'ppv-31100', 'title': 'Minnesota Golden Gophers at Indiana Hoosiers', 'category': 'American Football',
+                        'tournament': 'College Football', 'date': IU_MINNESOTA_START * 1000, 'ends': IU_MINNESOTA_START * 1000 + 10800000,
+                        'live': True, 'sources': [{'source': 'collegefootball', 'url': 'https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu'},
+                                                  {'source': 'alt', 'url': 'http://insecure.example/x'}]}]}
+        [event] = cp.parse_ntvst(ntv, IU_MINNESOTA_NOW)
+        self.assertEqual((event['category'], event['live'], event['start_ms']), ('american-football', True, IU_MINNESOTA_START * 1000))
+        self.assertEqual([s['url'] for s in event['streams']], ['https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu'])
+        reed = [{'id': 'minnesota-golden-gophers-at-indiana-hoosiers', 'title': 'Minnesota Golden Gophers at Indiana Hoosiers',
+                 'category': 'american-football', 'league_name': 'NCAA College Football', 'date': IU_MINNESOTA_START * 1000,
+                 'ends_at': IU_MINNESOTA_START * 1000 + 10800000,
+                 'teams': {'home': {'name': 'Indiana Hoosiers'}, 'away': {'name': 'Minnesota Golden Gophers'}},
+                 'sources': [{'name': 'Server 1', 'embedUrl': 'https://taifood-blog.asia/embed/cfb/2026-10-31/minn-iu'}]}]
+        [event] = cp.parse_reedstreams(reed, IU_MINNESOTA_NOW)
+        self.assertEqual((event['category'], event['teams'], event['end_ms']), ('american-football', ['Indiana Hoosiers', 'Minnesota Golden Gophers'], (IU_MINNESOTA_START + 10800) * 1000))
+        self.assertFalse(cp.parse_reedstreams({'not': 'a list'}, IU_MINNESOTA_NOW))
+
+    def test_bintv_live_group_and_thetvapp_live_rows(self):
+        [event] = cp.parse_bintv({'Live Events': [{'id': 'minnesota-golden-gophers-v-indiana-hoosiers-401858501',
+                                                   'name': 'Minnesota Golden Gophers @ Indiana Hoosiers', 'category': 'American Football',
+                                                   'status': 'live', 'streams': [{'name': 'CBS', 'url': 'https://bintv-sources.pages.dev/?id=x'}]}]},
+                                 IU_MINNESOTA_NOW)
+        self.assertEqual((event['category'], event['teams'], event['streams'][0]['label']),
+                         ('american-football', ['Minnesota Golden Gophers', 'Indiana Hoosiers'], 'CBS'))
+        page = ('<a class="game" data-league-id="9825" data-game data-sport="CFB" data-status="live" '
+                'data-search="Indiana Hoosiers vs Minnesota Golden Gophers CFB" href="https://thetvapp.plus/tv-live/cfb/minnesota-golden-gophers-indiana-hoosiers/8699335232">'
+                '<span>x</span></a>'
+                '<a class="game" data-sport="CFB" data-status="soon" data-search="Later CFB" href="https://thetvapp.plus/tv-live/cfb/later/1">')
+        [event] = cp.parse_thetvapp(page, IU_MINNESOTA_NOW)
+        self.assertEqual((event['title'], event['category'], event['pid']), ('Indiana Hoosiers vs Minnesota Golden Gophers', 'american-football', '8699335232'))
+        self.assertEqual(event['streams'][0]['url'], 'https://thetvapp.plus/tv-live/cfb/minnesota-golden-gophers-indiana-hoosiers/8699335232')
 
     def test_watchsports_lists_only_live_rows_as_player_pages(self):
         [event] = cp.parse_watchsports(WATCHSPORTS_IU_MN[1], IU_MINNESOTA_NOW)
