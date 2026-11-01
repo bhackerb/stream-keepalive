@@ -205,6 +205,18 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((event['title'], event['category'], event['pid']), ('Indiana Hoosiers vs Minnesota Golden Gophers', 'american-football', '8699335232'))
         self.assertEqual(event['streams'][0]['url'], 'https://thetvapp.plus/tv-live/cfb/minnesota-golden-gophers-indiana-hoosiers/8699335232')
 
+    async def test_watchsports_game_page_expands_to_each_source_option(self):
+        game_page = ('<a href="https://app.my1click.top/sc.php?51" class="stream-link" target="_blank">StreamCenterNCAAF Stream HD ( NO Lags )\n(opens in new tab)</a>'
+                     '<a class="other" href="https://example.com/x">skip</a>'
+                     '<a class="stream-link" href="https://reddittrend.sbs/r/social.php?x">VIPSPORTSCFB Stream</a>')
+        result = await self.fetch(all_routes(**{'https://watchsports.su/': WATCHSPORTS_IU_MN,
+                                                'https://watchsports.su/cfb/401858501': ('text/html', game_page)}))
+        game = next(m for m in result['matches'] if 'watchsports' in m['providers'])
+        ws = [s for s in game['sources'] if s['provider'] == 'watchsports']
+        self.assertEqual([(s['url'], s['label']) for s in ws],
+                         [('https://app.my1click.top/sc.php?51', 'StreamCenterNCAAF Stream HD ( NO Lags )'),
+                          ('https://reddittrend.sbs/r/social.php?x', 'VIPSPORTSCFB Stream')])
+
     def test_watchsports_lists_only_live_rows_as_player_pages(self):
         [event] = cp.parse_watchsports(WATCHSPORTS_IU_MN[1], IU_MINNESOTA_NOW)
         self.assertEqual(event['title'], 'Minnesota vs Indiana')

@@ -377,6 +377,22 @@ WATCHSPORTS_LABEL = re.compile(r'aria-label="([^"]*)"')
 WATCHSPORTS_SPORTS = {'cfb': 'college football', 'wnba': 'wnba', 'nba': 'nba', 'nhl': 'nhl', 'mma': 'mma', 'f1': 'f1'}
 
 
+WATCHSPORTS_STREAM = re.compile(r'<a\b([^>]*)>(.*?)</a>', re.S)
+
+
+def parse_watchsports_streams(page):
+    """A game page lists each source as an outbound link; each one is a playable option on its own."""
+    streams = []
+    for attrs, label in WATCHSPORTS_STREAM.findall(page):
+        href = re.search(r'href="(https://[^"]+)"', attrs)
+        if 'class="stream-link"' not in attrs or not href:
+            continue
+        name = re.sub(r'\s+', ' ', re.sub(r'\(opens in new tab\)', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', label)))).strip()
+        name = re.split(r'\s+(?:\d{3,4}p\b|iOS\b|Android\b|PlayStation\b|\d+\s+votes\b)', name)[0].strip()
+        streams.append(_stream(href.group(1), name or 'WatchSports source'))
+    return streams
+
+
 def parse_watchsports(page, now_ms):
     """Live rows on WatchSports' homepage. Each row links a player page that holds its own embeds."""
     events = []
@@ -475,6 +491,7 @@ class Provider:
     kind: str = 'json'
     headers: tuple = ()  # extra request headers the site's own page sends
     sports: tuple = ()  # specialists are scored only against live games in their sports
+    detail: Callable | None = None  # optional per-event page parser; its streams replace the listed ones
 
 
 PROVIDERS = (
@@ -490,7 +507,8 @@ PROVIDERS = (
              headers=(('Referer', 'https://www.90minutes.pro/'),)),
     Provider('sportsbite', 'SportsBite', ('https://sportsbite.org/api/forestgump/matches',), parse_sportsbite,
              headers=(('Referer', 'https://sportsbite.org/'),)),
-    Provider('watchsports', 'WatchSports', ('https://watchsports.su/',), parse_watchsports, kind='html'),
+    Provider('watchsports', 'WatchSports', ('https://watchsports.su/',), parse_watchsports, kind='html',
+             detail=parse_watchsports_streams),
     Provider('ntvst', 'NTV', ('https://ntv.st/api/get-matches?server=raptor&type=both',), parse_ntvst,
              headers=(('Referer', 'https://ntv.st/'),)),
     Provider('reedstreams', 'ReedStreams', ('https://api.reedstreams.link/api/matches/all',), parse_reedstreams,
@@ -595,6 +613,28 @@ class Catalog:
         self.urls = set()
         self._previous_urls = set()
 
+    async def _expand_details(self, client, provider, events, limit=40):
+        """Replace a listing's link with the game's own source options. A failed page keeps the listing link."""
+        sem = asyncio.Semaphore(6)
+
+        async def expand(event):
+            url = event['streams'][0]['url'] if event['streams'] else None
+            if not url:
+                return event
+            async with sem:
+                try:
+                    async with client.get(url, headers={'User-Agent': USER_AGENT, 'Accept': 'text/html'}) as res:
+                        res.raise_for_status()
+                        if 'html' not in (res.content_type or ''):
+                            return event
+                        page = await res.text()
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    return event
+            streams = provider.detail(page)
+            return dict(event, streams=streams) if streams else event
+
+        return list(await asyncio.gather(*(expand(e) for e in events[:limit]))) + events[limit:]
+
     async def _fetch_provider(self, client, provider, now_ms):
         error = None
         for url in provider.urls:
@@ -617,6 +657,8 @@ class Catalog:
             if events is None:
                 error = error or f'{url}: unexpected payload'
                 continue
+            if provider.detail:
+                events = await self._expand_details(client, provider, events)
             return {'ok': True, 'mirror': url, 'latency_ms': latency}, events
         return {'ok': False, 'error': error}, []
 
