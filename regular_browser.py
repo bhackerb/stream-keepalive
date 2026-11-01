@@ -1201,7 +1201,9 @@ class RegularBrowserKeeper:
                 if record.get('buffer_switches',0)>=BUFFER_SWITCH_BUDGET:
                     record['message']='Buffer switches exhausted; choose a source manually';continue
             elif record['attempts']>=3:
-                record['message']='Automatic recovery exhausted; choose a source manually';continue
+                # Recovery is spent: release the slot so the allocator can fill it with another game.
+                record.update(message='Automatic recovery exhausted; released the slot for another game',last_action=time.time());self._save()
+                await self.command_for(sid,'close');self.suppressed.add(sid);self._save();continue
             if(not buffer_switch and now-record['since']<90)or now-record.get('last_action',0)<90:continue
             stream=self.active_streams[sid];stage='audit'
             try:
