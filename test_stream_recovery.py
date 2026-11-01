@@ -154,6 +154,15 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('0',self.k.suppressed)
         self.k._recovery_sources.assert_not_awaited()
 
+    async def test_periodic_pass_forgets_tried_sources_but_not_exhausted_ones(self):
+        await self.setup_stream()
+        self.k._recovery['0']={'attempts':1,'tried':['https://a.example/old','https://b.example/bad'],'url':'https://b.example/bad','since':1,'last_action':1}
+        self.k._recovery['x']={'attempts':3,'tried':['https://c.example/old'],'url':'https://c.example/old'}
+        self.k.command=AsyncMock(return_value=True)
+        await self.k._periodic_refresh({'0':{'id':'0'}})
+        self.assertEqual(self.k._recovery['0']['tried'],['https://b.example/bad'])
+        self.assertEqual(self.k._recovery['x']['tried'],['https://c.example/old'])
+
     def test_short_loading_stalls_count_only_after_playback(self):
         self.k._count_buffering('0','LOADING')  # startup loading
         self.assertEqual(self.k._buffer_watch['0']['episodes'],0)

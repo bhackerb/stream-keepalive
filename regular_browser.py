@@ -48,6 +48,7 @@ SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
 BUFFER_SWITCH_EPISODES=1  # switch provider after more than this many buffering episodes on one stream
 BUFFER_SWITCH_BUDGET=4  # provider switches per stream, separate from the failure-recovery attempts
+REFRESH_INTERVAL_S=600  # providers restart on their own, so earlier failures are retried this often
 # A frame that reported playing within this window may still be playing unseen; recovery waits for it to age out.
 STALE_PLAYING_GUARD=120
 PLAYBACK_CONFIRM_TIMEOUT=6
@@ -129,7 +130,7 @@ class RegularBrowserKeeper:
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
-        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={};self._buffer_watch={}
+        self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={};self._buffer_watch={};self._last_refresh_pass=0
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
         self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
@@ -1161,11 +1162,26 @@ class RegularBrowserKeeper:
         sources=self.catalog.rank([s for s in sources if isinstance(s,dict)and s.get('url')and s.get('provider')],row.get('category')or row.get('sport',''))
         return next((s['url']for s in sources if isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried and(exclude_provider is None or s.get('provider')!=exclude_provider)),None)
 
+    async def _periodic_refresh(self,live):
+        # Providers restart on their own, so a source that failed earlier may work now: forget the tried
+        # sources of streams still in recovery, and reload tabs that still show no video.
+        for sid,record in list(self._recovery.items()):
+            if sid not in self.active_streams or sid not in live or record.get('pending_release') or record.get('attempts',0)>=3:continue
+            record['tried']=[record['url']]if record.get('url')else[]
+        for sid in list(self.active_streams):
+            if sid in live and self.active_streams[sid].health_monitor.stats.get('state')=='NO_VIDEO' and self._recoverable_failure(sid,time.time()):
+                try:await self.force_reload(sid)
+                except Exception as e:log.warning('Periodic reload failed for %s: %s',sid,type(e).__name__)
+        self._save()
+
     async def _recover_no_video(self,plan):
         # Called under the same lock as layout/stop. One action per minute tick,
         # one refresh and at most two alternate players per match, across restarts.
         try:await self._check_memory()
         except ValueError as exc:self.errors=[str(exc)];return
+        if time.time()-self._last_refresh_pass>=REFRESH_INTERVAL_S:
+            self._last_refresh_pass=time.time()
+            await self._periodic_refresh({r['id']:r for r in plan['live']})
         live={r['id']:r for r in plan['live']}
         if self.local_keepalive.get('enabled'):return
         for sid,record in list(self._recovery.items()):
