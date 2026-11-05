@@ -205,6 +205,21 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((event['title'], event['category'], event['pid']), ('Indiana Hoosiers vs Minnesota Golden Gophers', 'american-football', '8699335232'))
         self.assertEqual(event['streams'][0]['url'], 'https://thetvapp.plus/tv-live/cfb/minnesota-golden-gophers-indiana-hoosiers/8699335232')
 
+    def test_poll_anchored_live_listing_keeps_the_scheduled_kickoff(self):
+        # BINTV's live list has no kickoff, so its start is the poll time. It must not move a 20:00 game to now.
+        kickoff = NOW + 2 * 3600_000
+        scheduled = cp._event('matchora', 'm1', 'Calgary Flames @ Seattle Kraken', 'hockey', kickoff,
+                              [cp._stream('https://a.example/watch', 'A')], live=False)
+        anchored = cp.parse_bintv({'Live Events': [{'id': 'b1', 'name': 'Calgary Flames @ Seattle Kraken', 'category': 'Hockey',
+                                                    'streams': [{'name': 'B', 'url': 'https://bintv-sources.pages.dev/?id=y'}]}]}, NOW)
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = cp.Catalog(Path(tmp) / 'health.json')
+            [before] = catalog._merge([scheduled, *anchored], NOW)
+            [after] = catalog._merge([scheduled, *anchored], kickoff)
+        self.assertEqual((before['date'], before['live'], before['title']), (kickoff, False, 'Calgary Flames @ Seattle Kraken'))
+        self.assertEqual((after['date'], after['live']), (kickoff, True))
+        self.assertEqual(len(before['sources']), 2)
+
     async def test_watchsports_game_page_expands_to_each_source_option(self):
         game_page = ('<a href="https://app.my1click.top/sc.php?51" class="stream-link" target="_blank">StreamCenterNCAAF Stream HD ( NO Lags )\n(opens in new tab)</a>'
                      '<a class="other" href="https://example.com/x">skip</a>'

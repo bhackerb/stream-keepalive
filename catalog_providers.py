@@ -29,6 +29,7 @@ HEALTH_WINDOW = 288  # polls kept per provider (~24h of 5-minute background poll
 ALIAS_TTL_MS = 48 * 3600_000  # game ids must outlive a session so restarts never duplicate a window
 STALE_EVENT_MS = 8 * 3600_000  # 24/7 channels carry months-old start times; skip them
 MATCH_WINDOW_MS = 3 * 3600_000
+LIVE_KICKOFF_SLACK_MS = 5 * 60_000  # a poll-anchored live flag may lead a kickoff by this much
 FINISHED_STATUSES = {'FT', 'AET', 'PEN', 'FIN', 'FINAL', 'ENDED', 'CANC', 'CANCELLED', 'PST', 'POSTP', 'ABD', 'AWD', 'WO'}
 
 
@@ -455,8 +456,11 @@ def parse_bintv(payload, now_ms):
         if not isinstance(item, dict):
             continue
         streams = [_stream(s.get('url'), s.get('name') or 'BINTV') for s in item.get('streams') or [] if isinstance(s, dict)]
-        events.append(_event('bintv', item.get('id'), item.get('name'), category_of(item.get('category')),
-                             now_ms, streams, live=True))
+        event = _event('bintv', item.get('id'), item.get('name'), category_of(item.get('category')),
+                       now_ms, streams, live=True)
+        if event:
+            event['anchored'] = True  # the start is the poll time, not a kickoff; _merge prefers scheduled kickoffs
+            events.append(event)
     return events
 
 
@@ -729,7 +733,9 @@ class Catalog:
         aliases = self.health.aliases
         for cluster in clusters:
             primary = cluster[0]
-            best = max(cluster, key=lambda e: (naming_rank(e), -order.get(e['provider'], 99)))
+            # Poll-anchored listings have no kickoff. Their start is the poll time, so they must not name or date the game.
+            dated = [e for e in cluster if not e.get('anchored')] or cluster
+            best = max(dated, key=lambda e: (naming_rank(e), -order.get(e['provider'], 99)))
             known = Counter(aliases[f"{e['provider']}|{e['pid']}"][0] for e in cluster if f"{e['provider']}|{e['pid']}" in aliases)
             mid = next((m for m, _ in known.most_common() if m not in used), None)
             if not mid:
@@ -740,9 +746,11 @@ class Catalog:
             used.add(mid)
             for e in cluster:
                 aliases[f"{e['provider']}|{e['pid']}"] = [mid, now_ms]
-            start = min(e['start_ms'] for e in cluster)
+            start = min(e['start_ms'] for e in dated)
+            # A poll-anchored "live" flag only means live once the scheduled kickoff has arrived.
+            anchored_live = not any(not e.get('anchored') for e in cluster) or start <= now_ms + LIVE_KICKOFF_SLACK_MS
             ends = [e['end_ms'] for e in cluster if e['end_ms']]
-            declared = [e['live'] for e in cluster if e['live'] is not None]
+            declared = [e['live'] for e in cluster if e['live'] is not None and (anchored_live or not e.get('anchored'))]
             live = any(declared) if declared else start <= now_ms and (not ends or now_ms < max(ends))
             teams = best['teams'] if len(best['teams']) == 2 else []
             viewers = [e['viewers'] for e in cluster if e['viewers'] is not None]
