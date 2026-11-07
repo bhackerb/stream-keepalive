@@ -525,14 +525,29 @@ PROVIDERS = (
 
 # --------------------------------------------------------------------------- merge
 
+def same_team(left, right):
+    """Accept full names and leading short names, never a shared mascot/region."""
+    a, b = words(left), words(right)
+    a = ['saint' if t == 'st' else t for t in a]
+    b = ['saint' if t == 'st' else t for t in b]
+    if len(a) > len(b):
+        a, b = b, a
+    if not a or a != b[:len(a)]:
+        return False
+    # These extend the institution/club identity rather than naming its mascot.
+    qualifiers = {'state', 'tech', 'a', 'and', 'united', 'city', 'fc', 'cf'}
+    return len(a) == len(b) or b[len(a)] not in qualifiers
+
+
 def same_game(a, b):
     if a['category'] != b['category'] and 'other' not in (a['category'], b['category']):
         return False
     if abs(a['start_ms'] - b['start_ms']) > MATCH_WINDOW_MS:
         return False
     if len(a['teams']) == 2 and len(b['teams']) == 2:
-        (a1, a2), (b1, b2) = map(team_tokens, a['teams']), map(team_tokens, b['teams'])
-        return bool((a1 & b1 and a2 & b2) or (a1 & b2 and a2 & b1))
+        (a1, a2), (b1, b2) = a['teams'], b['teams']
+        return ((same_team(a1, b1) and same_team(a2, b2)) or
+                (same_team(a1, b2) and same_team(a2, b1)))
     left, right = set(words(a['title'])), set(words(b['title']))
     return abs(a['start_ms'] - b['start_ms']) <= 5400_000 and bool(left | right) and len(left & right) / len(left | right) >= .5
 
@@ -724,20 +739,23 @@ class Catalog:
         clusters = []
         for event in sorted(events, key=lambda e: (order.get(e['provider'], 99), e['start_ms'])):
             for cluster in clusters:
-                if any(same_game(event, other) for other in cluster):
+                if all(same_game(event, other) for other in cluster):
                     cluster.append(event)
                     break
             else:
                 clusters.append([event])
         matches, used = [], set()
         aliases = self.health.aliases
+        # A formerly merged alias must not steal another distinct game's natural ID.
+        natural_ids = {event_key(max([e for e in c if not e.get('anchored')] or c,
+                                    key=naming_rank)) for c in clusters}
         for cluster in clusters:
             primary = cluster[0]
             # Poll-anchored listings have no kickoff. Their start is the poll time, so they must not name or date the game.
             dated = [e for e in cluster if not e.get('anchored')] or cluster
             best = max(dated, key=lambda e: (naming_rank(e), -order.get(e['provider'], 99)))
             known = Counter(aliases[f"{e['provider']}|{e['pid']}"][0] for e in cluster if f"{e['provider']}|{e['pid']}" in aliases)
-            mid = next((m for m, _ in known.most_common() if m not in used), None)
+            mid = next((m for m, _ in known.most_common() if m not in used and (m not in natural_ids or m == event_key(best))), None)
             if not mid:
                 base = event_key(best)
                 mid, suffix = base, 2

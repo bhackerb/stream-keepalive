@@ -406,6 +406,36 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cp.category_of('Profesional Wrestling'), 'wrestling')
         self.assertEqual(cp.category_of('Motorsport'), 'motor-sports')
 
+    def test_kentucky_tennessee_stay_separate_with_poisoned_aliases(self):
+        base = dict(category='american-football', start_ms=NOW, end_ms=None,
+                    live=False, viewers=None, streams=[])
+        def event(pid, teams, offset=0):
+            return dict(base, provider='ppv', pid=pid, teams=teams,
+                        title=' @ '.join(teams), start_ms=NOW + offset)
+        kentucky = event('k', ['Kentucky Wildcats', 'Tennessee Volunteers'])
+        short = event('s', ['Tennessee', 'Kentucky'])
+        western = event('w', ['Western Kentucky Hilltoppers', 'Middle Tennessee Blue Raiders'], -9900000)
+        wrong = cp.event_key(kentucky)
+        for row in (kentucky, short, western):
+            self.catalog.health.aliases['ppv|' + row['pid']] = [wrong, NOW]
+        merged = self.catalog._merge([western, kentucky, short], NOW)
+        self.assertEqual(len(merged), 2)
+        by_id = {m['id']: m for m in merged}
+        self.assertEqual(by_id[wrong]['title'], kentucky['title'])
+        self.assertEqual(by_id[cp.event_key(western)]['title'], western['title'])
+        self.assertEqual(self.catalog.health.aliases['ppv|w'][0], cp.event_key(western))
+
+    def test_team_identity_preserves_qualifiers_and_mascots(self):
+        for a, b in [('Kentucky', 'Western Kentucky Hilltoppers'),
+                     ('Tennessee Volunteers', 'Middle Tennessee Blue Raiders'),
+                     ('Kansas', 'Kansas State Wildcats'),
+                     ('Manchester United', 'Manchester City'),
+                     ('Auburn Tigers', 'Missouri Tigers')]:
+            self.assertFalse(cp.same_team(a, b), (a, b))
+        for a, b in [('Kentucky', 'Kentucky Wildcats'), ('Toronto', 'Toronto Maple Leafs'),
+                     ('Calgary Flames', 'Calgary Flames')]:
+            self.assertTrue(cp.same_team(a, b), (a, b))
+
     def test_different_games_do_not_merge(self):
         base = dict(provider='x', pid='1', category='hockey', start_ms=NOW, end_ms=None, live=None, viewers=None, streams=[])
         a = dict(base, title='Calgary Flames - Toronto Maple Leafs', teams=['Calgary Flames', 'Toronto Maple Leafs'])
