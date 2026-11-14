@@ -30,6 +30,7 @@ class PlacementReadinessTests(unittest.IsolatedAsyncioTestCase):
                 self.markers.append(args['value'])
                 if not self.ready:raise ValueError(self.fail)
                 return True
+            if op=='fill':return True  # a newly placed tab is told to fill its window
             raise AssertionError('Unexpected operation: '+op)
         self.k.command=AsyncMock(side_effect=command)
         self.run=AsyncMock(side_effect=lambda plans,**_: {'success':True,'windows':[{'geometry':{k:p[k]for k in ('x','y','width','height')},'borderless':True}for p in plans]})
@@ -55,7 +56,7 @@ class PlacementReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.k.layout_status['success']);self.assertFalse(self.k.layout_status.get('pending'))
         self.assertEqual(self.run.await_count,3) # identify, move, verify
         self.assertEqual(sum(op=='open'for op,_ in self.ops),1)
-        self.assertTrue(all(op in ('open','title','marker','inventory')for op,_ in self.ops))
+        self.assertTrue(all(op in ('open','title','marker','inventory','fill')for op,_ in self.ops))
         self.assertEqual(self.k.layout_status['placements'][0]['width'],3440)
         self.assertEqual(self.k.layout_status['placements'][0]['height'],1440)
         await self.k._reconcile(self.k.plan)
@@ -142,3 +143,24 @@ class PlacementReadinessTests(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class FillOnPlacementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_tab_is_filled_once_after_successful_placement(self):
+        from regular_browser import RegularBrowserKeeper
+        k = RegularBrowserKeeper.__new__(RegularBrowserKeeper)
+        k._needs_fill, k._releasing = {'a'}, set()
+        k.active_streams = {'a': object(), 'b': object()}
+        calls = []
+
+        async def command_for(sid, op, **args):
+            calls.append((sid, op, args))
+            return True
+        k.command_for = command_for
+        placements = [{'stream_id': 'a'}, {'stream_id': 'b'}]
+        await k._apply_fill(placements, {'success': True})
+        await k._apply_fill(placements, {'success': True})
+        self.assertEqual(calls, [('a', 'fill', {'enabled': True})])
+        k._needs_fill = {'a'}
+        await k._apply_fill(placements, {'success': True, 'pending': True})
+        self.assertEqual(len(calls), 1)

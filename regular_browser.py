@@ -133,6 +133,7 @@ class RegularBrowserKeeper:
         self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={};self._buffer_watch={};self._last_refresh_pass=0
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
         self._unplaced=set()  # streams whose placement failed (slow embed load); retried by _maintain_tv_focus
+        self._needs_fill=set()  # newly opened tabs whose player has not yet been told to fill its window
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
         self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
         self._local_care={};self._display_checked=0
@@ -398,6 +399,7 @@ class RegularBrowserKeeper:
             self._start_autoplay(sid)
             if isinstance(record,dict)and all(k in record for k in ('tabId','windowId','token')):
                 self._placement_startup[sid]=(self.active_streams[sid],dict(record),asyncio.get_running_loop().time()+PLACEMENT_READY_TIMEOUT)
+            self._needs_fill.add(sid)
     async def watch_url(self,url,label=None):
         try:
             if len(self.active_streams)>=self.max_streams:raise ValueError('Stream capacity reached')
@@ -803,9 +805,20 @@ class RegularBrowserKeeper:
             self._placement_retry_task=None
         result=await self._place_once(placements)
         self._note_placement(placements,result)
+        await self._apply_fill(placements,result)
         if result.get('pending'):
             self._placement_retry_task=asyncio.create_task(self._retry_placement(placements,generation,self.session,self.manual_layout))
         return result
+
+    async def _apply_fill(self,placements,result):
+        """A tab opened by a source switch or recovery starts unfilled; give it the fill a manual restore would."""
+        if result.get('pending') or not result.get('success'):return
+        for p in placements:
+            sid=p['stream_id']
+            if sid in self._needs_fill and sid in self.active_streams and sid not in self._releasing:
+                try:
+                    if await self.command_for(sid,'fill',enabled=True) is True:self._needs_fill.discard(sid)
+                except Exception:log.exception('Player fill deferred; will retry on next placement')
 
     def _note_placement(self,placements,result):
         ids={p['stream_id']for p in placements}
@@ -840,6 +853,7 @@ class RegularBrowserKeeper:
                     log.exception('New owned tab placement retry failed')
                     result=self.layout_status={'success':False,'message':'Placement retry failed: '+(str(exc)or type(exc).__name__)}
                 self._note_placement(placements,result)
+                await self._apply_fill(placements,result)
                 if result.get('pending'):continue
                 if result['success']:
                     if manual is not None:self._manual_signature=tuple((p['stream_id'],p['x'],p['y'],p['width'],p['height'])for p in placements)
