@@ -552,9 +552,9 @@ def nhl_team(name):
     return next(iter(found)) if found and len(found) == 1 else None
 
 
-def same_team(left, right):
+def same_team(left, right, sport='hockey'):
     """Accept full names and leading short names, never a shared mascot/region."""
-    nl, nr = nhl_team(left), nhl_team(right)
+    nl, nr = (nhl_team(left), nhl_team(right)) if sport in ('hockey', 'other') else (None, None)
     if nl and nr:
         return nl == nr
     a, b = words(left), words(right)
@@ -576,8 +576,9 @@ def same_game(a, b):
         return False
     if len(a['teams']) == 2 and len(b['teams']) == 2:
         (a1, a2), (b1, b2) = a['teams'], b['teams']
-        return ((same_team(a1, b1) and same_team(a2, b2)) or
-                (same_team(a1, b2) and same_team(a2, b1)))
+        sport = a['category'] if a['category'] != 'other' else b['category']
+        return ((same_team(a1, b1, sport) and same_team(a2, b2, sport)) or
+                (same_team(a1, b2, sport) and same_team(a2, b1, sport)))
     left, right = set(words(a['title'])), set(words(b['title']))
     return abs(a['start_ms'] - b['start_ms']) <= 5400_000 and bool(left | right) and len(left & right) / len(left | right) >= .5
 
