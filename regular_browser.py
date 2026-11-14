@@ -1218,8 +1218,8 @@ class RegularBrowserKeeper:
                     record['message']='Buffer switches exhausted; choose a source manually';continue
             elif record['attempts']>=3:
                 # Recovery is spent: release the slot so the allocator can fill it with another game.
-                record.update(message='Automatic recovery exhausted; released the slot for another game',last_action=time.time());self._save()
-                await self.command_for(sid,'close');self.suppressed.add(sid);self._save();continue
+                # Never close a tab the user is watching: keep it open and stop auto-recovering it.
+                record.update(message='Automatic recovery exhausted; stream left open, choose a source manually',last_action=time.time());self._save();continue
             if(not buffer_switch and now-record['since']<90)or now-record.get('last_action',0)<90:continue
             stream=self.active_streams[sid];stage='audit'
             try:
@@ -1240,8 +1240,7 @@ class RegularBrowserKeeper:
                     if not url:
                         # No alternate after a reload: release the slot so the allocator can fill it with another game.
                         if record['attempts']>=1 or buffer_switch:
-                            record.update(last_action=time.time(),message='No alternate source; released the slot for another game');self._save()
-                            await self.command_for(sid,'close');self.suppressed.add(sid);self._save();continue
+                            record.update(last_action=time.time(),message='No alternate source; stream left open');self._save();continue
                         record.update(last_action=time.time(),message='No alternate source available; waiting');continue
                     # Close and drain inventory before reopening the same canonical
                     # match ID, using the already signed companion's finite commands.
