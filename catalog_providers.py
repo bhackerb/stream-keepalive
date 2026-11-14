@@ -6,6 +6,7 @@ failing only drops its sources. Per-provider health accumulates the consistency 
 (reachability, live coverage) that ranks playback choices and shows which sites hold up.
 """
 import asyncio
+import base64
 import html
 import json
 import math
@@ -514,6 +515,33 @@ def parse_viprow(page, now_ms):
     return events
 
 
+STREAMIC_CATEGORIES = {'hokej': 'hockey', 'pilkanozna': 'soccer', 'pilkanozna_wazne': 'soccer', 'koszykowka': 'basketball',
+                       'americanfootball': 'american football', 'mma': 'mma', 'boks': 'boxing', 'baseball': 'baseball',
+                       'tenis': 'tennis', 'dart': 'darts'}
+
+
+def parse_streamic(payload, now_ms):
+    """Streami's feed is base64 JSON. Keep only English-language embeds from http(s) hosts that are not search pages."""
+    events = []
+    for item in payload if isinstance(payload, list) else []:
+        if not isinstance(item, dict):
+            continue
+        start = _int(item.get('startTime'))
+        streams = []
+        for group in item.get('_embeds') or []:
+            language = str(group.get('language') or '') if isinstance(group, dict) else ''
+            if not language.lower().startswith('english'):
+                continue
+            embeds = group.get('embeds') or {}
+            for embed in (embeds.values() if isinstance(embeds, dict) else embeds):
+                url = embed.get('embed') if isinstance(embed, dict) else None
+                if _https(url) and 'google.com' not in url:
+                    streams.append(_stream(url, language.split('|', 1)[-1].strip() or 'Streami', language='English', hd=str(embed.get('label')).upper() in ('HD', 'FHD')))
+        if start:
+            events.append(_event('streamic', item.get('id'), item.get('title'), category_of(STREAMIC_CATEGORIES.get(item.get('category'), item.get('category'))), start * 1000, streams))
+    return events
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -536,6 +564,8 @@ PROVIDERS = (
     Provider('onhockey', 'OnHockey', ('https://www.onhockey.tv/schedule_table.php',), parse_onhockey, kind='html',
              headers=(('Referer', 'https://www.onhockey.tv/'),), sports=('hockey',)),
     Provider('viprow', 'VipRow', tuple(f'https://viprow.im/sports/{slug}/x/1/' for slug in VIPROW_SPORTS), parse_viprow, kind='html', merge=True),
+    Provider('streamic', 'Streami', ('https://streamic.st/api/getEvents.php',), parse_streamic, kind='json64',
+             headers=(('Referer', 'https://streamic.st/'),)),
     Provider('matchora', 'Matchora', ('https://matchora.to/api/v1/schedule?watchable=1',), parse_matchora),
     Provider('ninetyminutes', '90minutes', ('https://www.90minutes.pro/api/streams',), parse_ninetyminutes,
              headers=(('Referer', 'https://www.90minutes.pro/'),)),
@@ -725,18 +755,22 @@ class Catalog:
         for url in provider.urls:
             started = time.monotonic()
             try:
-                headers = {'User-Agent': USER_AGENT, 'Accept': 'application/json' if provider.kind == 'json' else 'text/html', **dict(provider.headers)}
+                kind = 'json' if provider.kind == 'json64' else provider.kind
+                headers = {'User-Agent': USER_AGENT, 'Accept': 'application/json' if kind == 'json' else 'text/html', **dict(provider.headers)}
                 async with client.get(url, headers=headers) as res:
                     res.raise_for_status()
-                    if provider.kind not in (res.content_type or ''):
+                    if kind not in (res.content_type or ''):
                         raise ValueError('returned ' + (res.content_type or 'no content type'))
-                    payload = await res.json() if provider.kind == 'json' else await res.text()
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+                    if provider.kind == 'json64':
+                        payload = json.loads(base64.b64decode((await res.text()).strip()))
+                    else:
+                        payload = await res.json() if kind == 'json' else await res.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
                 error = f'{url}: {type(e).__name__} {str(e)[:120]}'.strip()
                 continue
             latency = int((time.monotonic() - started) * 1000)
             try:  # a changed schema is a provider failure, not a catalog crash
-                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, (dict, list) if provider.kind == 'json' else str) else None
+                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, (dict, list) if kind == 'json' else str) else None
             except (KeyError, TypeError, ValueError, AttributeError) as e:
                 events, error = None, f'{url}: schema changed ({type(e).__name__})'
             if events is None:
@@ -801,10 +835,11 @@ class Catalog:
         return self._failing
 
     def rank(self, sources, sport=''):
-        # Hosts that routinely fail to start sink below everything; then consistent providers (coarse buckets so noise
+        # Hosts that routinely fail to start sink below everything; hockey defaults to OnHockey (best measured
+        # buffering, 1100+ min tracked); then consistent providers (coarse buckets so noise
         # cannot reshuffle), then the preferred height, viewers, English, HD.
         failing = self.failing_hosts()
-        return sorted(sources, key=lambda s: ((urlparse(s['url']).hostname or '').removeprefix('www.') not in failing, round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
+        return sorted(sources, key=lambda s: ((urlparse(s['url']).hostname or '').removeprefix('www.') not in failing, sport == 'hockey' and s['provider'] == 'onhockey', round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
                       round(self.health.score(s['provider']), 1), s.get('height') == PREFERRED_HEIGHT, *stream_rank(s)),
                       reverse=True)
 

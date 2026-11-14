@@ -76,7 +76,8 @@ english:
 PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY), 'matchora': {'events': []},
             'ninetyminutes': {'streams': []}, 'sportsbite': {'days': []}, 'watchsports': ('text/html', ''),
             'ntvst': {'all': []}, 'reedstreams': [], 'bintv': {'Live Events': []}, 'thetvapp': ('text/html', ''),
-            'viprow': ('text/html', 'ftbPageData = { sports: {"name":"Ice Hockey"}, schedule: {} }')}
+            'viprow': ('text/html', 'ftbPageData = { sports: {"name":"Ice Hockey"}, schedule: {} }'),
+            'streamic': ('application/json', 'W10=')}
 IU_MINNESOTA_START = 1793475000
 IU_MINNESOTA_NOW = (IU_MINNESOTA_START + 600) * 1000
 NINETYMINUTES_IU_MN = {'streams': [{'category': 'american-football', 'streams': [
@@ -530,3 +531,27 @@ class LiveFlagTests(unittest.TestCase):
             matches = cp.Catalog(Path(d) / 'h.json')._merge(events, now)
         self.assertEqual(len(matches), 1)
         self.assertTrue(matches[0]['live'])
+
+
+class HockeyDefaultTests(unittest.TestCase):
+    def test_hockey_defaults_to_onhockey_but_other_sports_do_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            catalog = cp.Catalog(Path(d) / 'h.json')
+            sources = [dict(cp._stream('https://a.example/1', 'a', viewers=900), provider='ppv'),
+                       dict(cp._stream('https://www.onhockey.tv/np_stream400.php?channel=//x/1', 'b'), provider='onhockey')]
+            self.assertEqual(catalog.rank(sources, 'hockey')[0]['provider'], 'onhockey')
+            self.assertEqual(catalog.rank(sources, 'basketball')[0]['provider'], 'ppv')
+
+
+class StreamicTests(unittest.TestCase):
+    def test_only_english_http_embeds_are_kept_and_polish_categories_map(self):
+        feed = [{'id': 'x', 'title': 'Toronto Maple Leafs - Edmonton Oilers', 'category': 'hokej', 'startTime': 1794700800,
+                 '_embeds': [{'language': 'English | Premier Sports 2', 'embeds': {'1': {'embed': 'https://streamic.st/e/vip/EN/premiersports2.php', 'label': 'HD'},
+                                                                                 '2': {'embed': 'https://google.com/play', 'label': 'SD'}}},
+                             {'language': 'Deutsch | Sky', 'embeds': {'1': {'embed': 'https://de.example/s', 'label': 'HD'}}}]},
+                {'id': 'y', 'title': 'No English - Anywhere', 'category': 'hokej', 'startTime': 1794700800,
+                 '_embeds': [{'language': 'Deutsch | Sky', 'embeds': {'1': {'embed': 'https://de.example/s', 'label': 'HD'}}}]}]
+        events = [e for e in cp.parse_streamic(feed, 0) if e]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['category'], 'hockey')
+        self.assertEqual([s['url'] for s in events[0]['streams']], ['https://streamic.st/e/vip/EN/premiersports2.php'])
