@@ -66,6 +66,9 @@ class StreamKeeperAPI:
         self.app.router.add_post("/switch", self.handle_switch)
         self.app.router.add_get("/player-sources", self.handle_player_sources)
         self.app.router.add_get("/provider-stats", self.handle_provider_stats)
+        self.app.router.add_post("/probe", self.handle_probe)
+        self.app.router.add_get("/probe/{sid}", self.handle_probe_report)
+        self.app.router.add_delete("/probe/{sid}", self.handle_probe_close)
         self.app.router.add_get("/screenshot", self.handle_screenshot)
         self.app.router.add_post("/layout", self.handle_layout)
         self.app.router.add_post("/tab-view", self.handle_tab_view)
@@ -469,6 +472,26 @@ class StreamKeeperAPI:
             "success": not result.startswith("\u274c"),
             "message": result,
         })
+
+    async def handle_probe(self, request):
+        if not hasattr(self.keeper, 'probe_open'):
+            return web.json_response({'error': 'probes need regular browser mode'}, status=400)
+        try:
+            body = await request.json()
+            sid = await self.keeper.probe_open(str(body.get('url', '')).strip(), body.get('label'))
+            return web.json_response({'success': True, 'stream_id': sid})
+        except (ValueError, TimeoutError) as e:
+            return web.json_response({'success': False, 'message': str(e)}, status=400)
+
+    async def handle_probe_report(self, request):
+        return web.json_response(await self.keeper.probe_report(request.match_info['sid']))
+
+    async def handle_probe_close(self, request):
+        try:
+            await self.keeper.probe_close(request.match_info['sid'])
+            return web.json_response({'success': True})
+        except ValueError as e:
+            return web.json_response({'success': False, 'message': str(e)}, status=400)
 
     async def handle_provider_stats(self,request):
         import provider_stats

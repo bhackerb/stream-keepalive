@@ -39,3 +39,6 @@ discovery-report.tmp
 config.yaml.before-regular
 provider-stats.json
 PROVIDER_REPORT.md
+site-tests.jsonl
+site-test-report.json
+SITE_TEST_REPORT.md

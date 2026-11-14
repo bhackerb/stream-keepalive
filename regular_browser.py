@@ -408,6 +408,45 @@ class RegularBrowserKeeper:
             await self._open('manual-'+uuid.uuid4().hex[:12],url,label or 'Stream',self.browser_engine)
             return 'Stream window opened in your regular browser; playback may need a click'
         except ValueError as e:return '❌ '+str(e)
+    async def probe_open(self,url,label=None):
+        """Open any https page as an isolated test stream: full TV placement, no session, never auto-recovered."""
+        validate_user_source_url(url)
+        if any(not sid.startswith('probe-')for sid in self.active_streams):raise ValueError('Real streams are active; probes only run on an idle controller')
+        sid='probe-'+uuid.uuid4().hex[:10]
+        async with self._lock:
+            self._recovery[sid]=dict(attempts=0,tried=[],created_at=time.time(),user_source=True,url=url)
+            await self._open(sid,url,label or 'Probe',self.browser_engine)
+            tv=self._displays().get('tv')
+            if tv:
+                try:await self._place([dict(stream_id=sid,display='tv',x=tv['x'],y=tv['y'],width=tv['width'],height=tv['height'])])
+                except Exception:log.exception('Probe placement deferred')
+        return sid
+
+    async def probe_report(self,sid):
+        s=self.active_streams.get(sid)
+        if not s:return {'present':False}
+        now=time.time()
+        rows={str(k[1]):dict(age=round(now-v[0],1),state=v[1].get('state'),w=v[1].get('width'),h=v[1].get('height'),t=v[1].get('current_time'),paused=v[1].get('paused'),page_error=v[1].get('page_error'),buffer_ahead=v[1].get('buffer_ahead_seconds'))for k,v in self._frames.items()if k[0]==sid}
+        out={'present':True,'url':s.url,'health':dict(s.health_monitor.stats),'frames':rows,'buffering':dict(self._buffer_watch.get(sid,{})),'autoplay':getattr(s,'autoplay',None),'needs_fill':sid in self._needs_fill,'unplaced':sid in self._unplaced}
+        try:
+            inv=await asyncio.wait_for(self.command(s.browser,'inventory'),4);out['fill']=(inv.get(sid)or{}).get('fill')if isinstance(inv,dict)else None
+        except Exception:out['fill']=None
+        try:
+            from x11_windows import window_for_page,window_matches
+            tv=self._displays().get('tv');wid=await asyncio.wait_for(window_for_page(s.page),6)
+            out['window_fullscreen']=bool(tv and await asyncio.to_thread(window_matches,wid,dict(x=tv['x'],y=tv['y'],width=tv['width'],height=tv['height']),fullscreen=True))
+        except Exception as e:out['window_fullscreen']=None;out['window_error']=type(e).__name__
+        return out
+
+    async def probe_close(self,sid):
+        if not sid.startswith('probe-'):raise ValueError('Only probe streams can be closed here')
+        async with self._lock:
+            if sid in self.active_streams:
+                self.suppressed.add(sid)
+                try:await self.command_for(sid,'close')
+                finally:
+                    self.active_streams.pop(sid,None);self._releasing.discard(sid);self._recovery.pop(sid,None);self._needs_fill.discard(sid);self._unplaced.discard(sid)
+            self._save()
     async def watch(self,team,site=None):return '❌ Choose a listed live game or a Streamed watch URL'
     async def keepalive(self):return 'Companion health is report-only; personal tabs are not automatically adopted'
     async def stop(self,sid=None):
