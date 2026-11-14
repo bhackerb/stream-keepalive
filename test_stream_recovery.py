@@ -36,7 +36,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('0',self.k.suppressed);self.assertEqual(self.k.active_streams['0'].url,'https://streamed.pk/watch/0/golf/2')
         self.k._recovery_sources.return_value='https://streamed.pk/watch/0/admin/3';await self.tick(1270)
         self.assertEqual(self.k._recovery['0']['attempts'],3)
-        self.k.command.reset_mock();await self.tick(1400);self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['close']);self.assertIn('0',self.k.suppressed)
+        self.k.command.reset_mock();await self.tick(1400);self.assertEqual([c.args[1]for c in self.k.command.await_args_list],[]);self.assertNotIn('0',self.k.suppressed)
         fresh=RegularBrowserKeeper(self.config);self.assertEqual(fresh._recovery['0']['attempts'],3);self.assertNotIn('since',fresh._recovery['0'])
 
     async def test_playing_child_paused_loading_stale_and_disconnected_never_mutate(self):
@@ -138,9 +138,9 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             return True
         self.k.command=AsyncMock(side_effect=commands)
         await self.tick(1000)
-        self.assertIn('close',[c.args[1] for c in self.k.command.await_args_list])
-        self.assertIn('0',self.k.suppressed)
-        self.assertIn('released',self.k._recovery['0']['message'])
+        self.assertNotIn('close',[c.args[1] for c in self.k.command.await_args_list])
+        self.assertNotIn('0',self.k.suppressed)
+        self.assertIn('left open',self.k._recovery['0']['message'])
 
     async def test_exhausted_failure_recovery_releases_the_slot(self):
         await self.setup_stream();self.k._recovery['0']={'attempts':3,'tried':[],'since':1,'last_action':1}
@@ -150,8 +150,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             return True
         self.k.command=AsyncMock(side_effect=commands)
         await self.tick(1000)
-        self.assertIn('close',[c.args[1] for c in self.k.command.await_args_list])
-        self.assertIn('0',self.k.suppressed)
+        self.assertNotIn('close',[c.args[1] for c in self.k.command.await_args_list])
+        self.assertNotIn('0',self.k.suppressed)
         self.k._recovery_sources.assert_not_awaited()
 
     async def test_periodic_pass_forgets_tried_sources_but_not_exhausted_ones(self):
