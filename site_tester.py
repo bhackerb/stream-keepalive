@@ -30,8 +30,11 @@ SECTIONS = ('live-tv', 'live-sports')
 SKIP_LABELS = {'status', 'mirrors', 'discord', 'telegram', 'guide', 'rss', 'reddit', 'subreddit', 'twitter', 'github'}
 SKIP_HOSTS = ('discord.', 't.me', 'telegram.', 'reddit.', 'twitter.', 'x.com', 'github.', 'youtube.', 'facebook.', 'instagram.', 'fmhy.')
 HINT = re.compile(r'watch|stream|live|match|event|game|channel|embed|play|/nhl|/nba|/nfl|/mlb|/soccer|/hockey|/tv', re.I)
-AVOID = re.compile(r'login|register|signup|contact|dmca|privacy|terms|about|faq|discord|telegram|\.(png|jpg|css|js|svg)(\?|$)|#$', re.I)
-PLAY_TIMEOUT, SAMPLE_SECONDS, MAX_CANDIDATES = 50, 40, 3
+AVOID = re.compile(r'login|register|signup|contact|dmca|privacy|terms|about|faq|discord|telegram|cdn-cgi|/apps?\b|\.(png|jpg|css|js|svg|json)(\?|$)|#$', re.I)
+AD_HOSTS = ('pubmatic', 'doubleclick', 'googlesyndication', 'googletagmanager', 'adservice', 'adnxs', 'criteo', 'taboola', 'outbrain',
+            'rubiconproject', 'openx', 'amazon-adsystem', 'facebook.', 'google.com', 'adsterra', 'popads', 'propeller', 'exoclick', 'ads.')
+LISTING = re.compile(r'/(events?|channels?|tv|schedule|dailygrid|matches|sports?|categories|category|leagues?|all)/?$', re.I)
+PLAY_TIMEOUT, SAMPLE_SECONDS, MAX_CANDIDATES, MAX_PROBES_PER_SITE = 50, 40, 3, 4
 
 
 class SectionLinks(HTMLParser):
@@ -92,6 +95,7 @@ def score(url, text, host):
     s += 1 if text else 0
     path = urlsplit(url).path.strip('/')
     s += 1 if path.count('/') >= 1 or re.search(r'\d', path) else 0
+    s -= 3 if LISTING.search(urlsplit(url).path) else 0
     return s
 
 
@@ -188,7 +192,7 @@ async def candidates(session, host, home_url, index=None):
         page.frames += [f for f in frames if f not in page.frames]
         info['rendered'] = True
     cands = [u for u, _ in sorted(ranked.items(), key=lambda kv: -kv[1])][:MAX_CANDIDATES]
-    for frame in page.frames[:2]:
+    for frame in [f for f in page.frames if not any(a in (urlsplit(f).hostname or '') for a in AD_HOSTS)][:2]:
         if frame.startswith('https://') and frame not in cands:
             cands.append(frame)
     if not cands and final.startswith('https://'):
@@ -309,7 +313,12 @@ async def main():
                 break
             base = dict(at=int(time.time()), site=host, label=sites[host]['label'], section=sites[host]['section'], **info)
             result = None
-            for url in cands:
+            tried, queue = set(), list(cands)
+            while queue and len(tried) < MAX_PROBES_PER_SITE:
+                url = queue.pop(0)
+                if url in tried:
+                    continue
+                tried.add(url)
                 if any(not s['stream_id'].startswith('probe-') for s in (await api(session, 'GET', '/status', key)).get('streams', [])):
                     print('Real stream appeared; stopping.')
                     summarize()
@@ -318,6 +327,15 @@ async def main():
                 print(f"{host:28}{result['outcome']:12}{url[:70]}")
                 if result['outcome'] == 'playing':
                     break
+                if result['outcome'] in ('no_video', 'dead_page') and len(tried) < 2 and info.get('tier') != 'catalog':
+                    # The candidate may be a listing: render it and try the best deeper link on the same site.
+                    try:
+                        links, frames, _ = await render_links(url)
+                    except Exception:
+                        links, frames = [], []
+                    deeper = sorted(((score(u, t, host), u.split('#')[0]) for u, t in links), reverse=True)
+                    queue += [u for sc, u in deeper if sc >= 3 and u not in tried and u != url][:2]
+                    queue += [f for f in frames if f.startswith('https://') and not any(a in (urlsplit(f).hostname or '') for a in AD_HOSTS)][:1]
             if result is None:
                 result = dict(outcome='unreachable' if info.get('status') != 200 else 'no_candidates')
                 print(f"{host:28}{result['outcome']}")
