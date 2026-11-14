@@ -555,3 +555,14 @@ class StreamicTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['category'], 'hockey')
         self.assertEqual([s['url'] for s in events[0]['streams']], ['https://streamic.st/e/vip/EN/premiersports2.php'])
+
+
+class FailureMemoryTests(unittest.TestCase):
+    def test_a_source_that_just_failed_is_tried_last_for_any_game(self):
+        with tempfile.TemporaryDirectory() as d:
+            catalog = cp.Catalog(Path(d) / 'h.json')
+            sources = [dict(cp._stream('https://a.example/1', 'a', viewers=900), provider='ppv'),
+                       dict(cp._stream('https://b.example/1', 'b', viewers=1), provider='matchora')]
+            self.assertEqual(catalog.rank(sources, 'basketball')[0]['url'], 'https://a.example/1')
+            catalog.note_failure('https://a.example/1')
+            self.assertEqual(catalog.rank(sources, 'basketball')[0]['url'], 'https://b.example/1')

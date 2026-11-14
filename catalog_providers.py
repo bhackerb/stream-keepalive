@@ -27,6 +27,7 @@ from playback_reliability import PlaybackReliability
 
 ET = ZoneInfo('America/New_York')
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0'
+RECENT_FAILURE_S = 3 * 3600  # a source that failed is tried last for this long
 HEALTH_WINDOW = 288  # polls kept per provider (~24h of 5-minute background polls)
 ALIAS_TTL_MS = 48 * 3600_000  # game ids must outlive a session so restarts never duplicate a window
 STALE_EVENT_MS = 8 * 3600_000  # 24/7 channels carry months-old start times; skip them
@@ -814,6 +815,19 @@ class Catalog:
     def known_url(self, url):
         return url in self.urls or url in self._previous_urls
 
+    def note_failure(self, url):
+        """Remember a source that just failed so the next pick (any game) tries it last for a while."""
+        if not hasattr(self, '_failed'):
+            self._failed = {}
+        self._failed[url] = time.time()
+
+    def recently_failed(self):
+        failed = getattr(self, '_failed', {})
+        cutoff = time.time() - RECENT_FAILURE_S
+        for url in [u for u, at in failed.items() if at < cutoff]:
+            del failed[url]
+        return failed
+
     def failing_hosts(self):
         """Embed hosts whose recent autoplay almost never produced playback (>=10 steps, <10% advanced)."""
         if time.time() - getattr(self, '_failing_at', 0) < 120:
@@ -838,8 +852,8 @@ class Catalog:
         # Hosts that routinely fail to start sink below everything; hockey defaults to OnHockey (best measured
         # buffering, 1100+ min tracked); then consistent providers (coarse buckets so noise
         # cannot reshuffle), then the preferred height, viewers, English, HD.
-        failing = self.failing_hosts()
-        return sorted(sources, key=lambda s: ((urlparse(s['url']).hostname or '').removeprefix('www.') not in failing, sport == 'hockey' and s['provider'] == 'onhockey', round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
+        failing, failed = self.failing_hosts(), self.recently_failed()
+        return sorted(sources, key=lambda s: (s['url'] not in failed, (urlparse(s['url']).hostname or '').removeprefix('www.') not in failing, sport == 'hockey' and s['provider'] == 'onhockey', round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
                       round(self.health.score(s['provider']), 1), s.get('height') == PREFERRED_HEIGHT, *stream_rank(s)),
                       reverse=True)
 

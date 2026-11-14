@@ -22,8 +22,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         with patch('regular_browser.time.time',return_value=now):await self.k._recover_no_video(self.p)
 
     async def test_wait_refresh_switch_order_budget_and_restart(self):
-        await self.setup_stream();await self.tick(1000);await self.tick(1089)
-        self.k.command.assert_not_awaited();await self.tick(1090)
+        await self.setup_stream();await self.tick(1000);await self.tick(1059)
+        self.k.command.assert_not_awaited();await self.tick(1060)
         self.assertEqual([c.args[1]for c in self.k.command.await_args_list],['inventory','reload'])
         self.k._recovery_sources=AsyncMock(return_value='https://streamed.pk/watch/0/golf/2')
         async def commands(browser,op,**args):
@@ -38,6 +38,23 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.k._recovery['0']['attempts'],3)
         self.k.command.reset_mock();await self.tick(1400);self.assertEqual([c.args[1]for c in self.k.command.await_args_list],[]);self.assertNotIn('0',self.k.suppressed)
         fresh=RegularBrowserKeeper(self.config);self.assertEqual(fresh._recovery['0']['attempts'],3);self.assertNotIn('since',fresh._recovery['0'])
+
+    async def test_dead_source_page_is_replaced_after_fifteen_seconds(self):
+        await self.setup_stream()
+        self.k._recovery_sources=AsyncMock(return_value='https://streamed.pk/watch/0/golf/9')
+        async def commands(browser,op,**args):
+            if op=='inventory':return {'0':{}}if '0'in self.k.active_streams else {}
+            if op=='close':await self.k._event('firefox',{'event':'closed','stream_id':'0'})
+            return True
+        self.k.command=AsyncMock(side_effect=commands)
+        self.k._frames[('0',0)]=(1000,{'state':'NO_VIDEO','page_error':True})
+        with patch('regular_browser.time.time',return_value=1000):await self.k._recover_no_video(self.p)
+        self.k._frames[('0',0)]=(1014,{'state':'NO_VIDEO','page_error':True})
+        with patch('regular_browser.time.time',return_value=1014):await self.k._recover_no_video(self.p)
+        self.k.command.assert_not_awaited()
+        self.k._frames[('0',0)]=(1016,{'state':'NO_VIDEO','page_error':True})
+        with patch('regular_browser.time.time',return_value=1016):await self.k._recover_no_video(self.p)
+        self.assertIn('close',[c.args[1] for c in self.k.command.await_args_list])
 
     async def test_playing_child_paused_loading_stale_and_disconnected_never_mutate(self):
         await self.setup_stream();self.k._recovery['0']={'attempts':0,'tried':[],'since':1}
@@ -177,8 +194,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.setup_stream();await self.tick(1000)
         with patch('regular_browser.time.time',return_value=1040):
             await self.k._event('firefox',{'event':'health','stream_id':'0','frame_id':0,'health':{'state':'LOADING'}})
-        await self.tick(1090);self.k.command.assert_not_awaited();await self.tick(1179);self.k.command.assert_not_awaited()
-        await self.tick(1180);self.assertEqual(self.k._recovery['0']['attempts'],1)
+        await self.tick(1090);self.k.command.assert_not_awaited();await self.tick(1149);self.k.command.assert_not_awaited()
+        await self.tick(1150);self.assertEqual(self.k._recovery['0']['attempts'],1)
 
     async def test_stale_child_evidence_blocks_recovery(self):
         await self.setup_stream();self.k._recovery['0']={'attempts':0,'tried':[],'since':1}
@@ -363,3 +380,23 @@ class BufferingTests(unittest.IsolatedAsyncioTestCase):
         # last observed progress is over five minutes old.
         self.k._frames[('0',0)][1]['state']='BUFFERING'
         self.assertFalse(self.k._recoverable_failure('0',1304))
+
+
+class SourceProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_definite_dead_links_are_skipped_but_bot_blocks_are_not(self):
+        import aiohttp
+        k = RegularBrowserKeeper.__new__(RegularBrowserKeeper)
+
+        class Res:
+            def __init__(self, status): self.status = status
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class Client:
+            def __init__(self, status): self.status = status
+            def get(self, url, **kw): return Res(self.status)
+        for status, alive in ((200, True), (403, True), (404, False), (410, False), (503, False)):
+            k._client = Client(status)
+            self.assertEqual(await k._source_alive('https://x.example/'), alive, status)
+        k._client = None
+        self.assertTrue(await k._source_alive('https://x.example/'))

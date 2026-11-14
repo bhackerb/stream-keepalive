@@ -48,6 +48,8 @@ SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
 BUFFER_SWITCH_EPISODES=1  # switch provider after more than this many buffering episodes on one stream
 BUFFER_SWITCH_BUDGET=4  # provider switches per stream, separate from the failure-recovery attempts
+DEAD_SOURCE_WAIT=15  # a page that reports 403/404/5xx has nothing to wait for
+RECOVERY_WAIT=60  # seconds a stream must stay failed before recovery acts (the autoplay ladder needs ~48s)
 REFRESH_INTERVAL_S=600  # providers restart on their own, so earlier failures are retried this often
 # A frame that reported playing within this window may still be playing unseen; recovery waits for it to age out.
 STALE_PLAYING_GUARD=120
@@ -1163,6 +1165,13 @@ class RegularBrowserKeeper:
         buffering=[(key,v)for key,v in self._frames.items()if key[0]==sid and now-v[0]<12 and v[1].get('state')=='BUFFERING']
         return bool(buffering)and all(v[1].get('state')in ('NO_VIDEO','BUFFERING')for v in rows)and all(key in self._progress and 15<=now-self._progress[key]<=300 and v[1].get('paused')is not True and not v[1].get('ended')for key,v in buffering)
 
+    def _failure_wait(self,sid,now):
+        """How long a failure must persist before acting: dead pages at once, no-video shortly, buffering keeps its 90s meaning."""
+        if self._dead_source(sid,now):return DEAD_SOURCE_WAIT
+        rows=[v for (i,_),v in self._frames.items()if i==sid and now-v[0]<12]
+        if rows and all(v[1].get('state')=='NO_VIDEO'for v in rows):return RECOVERY_WAIT
+        return 90
+
     def _dead_source(self,sid,now):
         return any(key[0]==sid and now-v[0]<12 and v[1].get('page_error')is True for key,v in self._frames.items())
 
@@ -1186,7 +1195,20 @@ class RegularBrowserKeeper:
             fresh=next((m for m in self.catalog.last['matches']if m['id']==row['id']),None)
             if fresh:sources=fresh['sources']
         sources=self.catalog.rank([s for s in sources if isinstance(s,dict)and s.get('url')and s.get('provider')],row.get('category')or row.get('sport',''))
-        return next((s['url']for s in sources if isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried and(exclude_provider is None or s.get('provider')!=exclude_provider)),None)
+        for s in sources:
+            if not(isinstance(s,dict)and s.get('url')and s['url']!=current and s['url']not in tried and(exclude_provider is None or s.get('provider')!=exclude_provider)):continue
+            if await self._source_alive(s['url']):return s['url']
+            self.catalog.note_failure(s['url']);tried.append(s['url'])  # dead link: skip it without spending a recovery attempt
+        return None
+
+    async def _source_alive(self,url):
+        """Cheap pre-flight: only a definite 404/410/5xx or an unreachable host counts as dead (403 is usually bot-blocking)."""
+        if not self._client:return True
+        try:
+            async with self._client.get(url,timeout=aiohttp.ClientTimeout(total=5),headers={'User-Agent':'Mozilla/5.0'},allow_redirects=True)as res:
+                return not(res.status in(404,410)or res.status>=500)
+        except(aiohttp.ClientConnectorError,aiohttp.ServerDisconnectedError):return False
+        except Exception:return True
 
     async def _periodic_refresh(self,live):
         # Providers restart on their own, so a source that failed earlier may work now: forget the tried
@@ -1246,7 +1268,7 @@ class RegularBrowserKeeper:
                 # Recovery is spent: release the slot so the allocator can fill it with another game.
                 # Never close a tab the user is watching: keep it open and stop auto-recovering it.
                 record.update(message='Automatic recovery exhausted; stream left open, choose a source manually',last_action=time.time());self._save();continue
-            if(not buffer_switch and now-record['since']<90)or now-record.get('last_action',0)<90:continue
+            if(not buffer_switch and now-record['since']<self._failure_wait(sid,now))or now-record.get('last_action',0)<90:continue
             stream=self.active_streams[sid];stage='audit'
             try:
                 # Audit proves the exact owned tab still exists. Exceptions or
@@ -1273,6 +1295,7 @@ class RegularBrowserKeeper:
                     chosen_provider=(self.catalog.source_context(url)or(None,))[0]
                     record.update(attempts=record['attempts']+(0 if buffer_switch else 1),buffer_switches=record.get('buffer_switches',0)+(1 if buffer_switch else 0),last_action=time.time(),since=time.time(),pending_release=True,url=url,provider=chosen_provider or record.get('provider'),message='Switching provider after buffering' if buffer_switch else 'Trying alternate source')
                     record['tried']=list(dict.fromkeys([*record['tried'],stream.url,url]))
+                    self.catalog.note_failure(stream.url)
                     self._releasing.add(sid);self._save()
                     stage='close';closed=await self.command_for(sid,'close');stage='drain'
                     if closed is not True:raise ValueError('Source close unconfirmed')
@@ -1440,7 +1463,12 @@ class RegularBrowserKeeper:
                 except Exception:
                     log.exception('Local keepalive deferred; selected tab preserved')
                 if not self.session or self.local_keepalive.get('enabled'):continue
-                if time.time()-getattr(self,'_last_catalog_poll',0)<60:continue
+                if time.time()-getattr(self,'_last_catalog_poll',0)<60:
+                    # Between catalog polls still watch for failures every loop so a dead source is replaced in seconds, not minutes.
+                    if self.plan:
+                        try:await self._recover_no_video(self.plan)
+                        except Exception:log.exception('Fast recovery pass failed; preserving playing windows')
+                    continue
                 self._last_catalog_poll=time.time()
                 if time.time()*1000>self.session['until_ms']:
                     self.session=None;self._save();continue # leave playing games alone

@@ -42,7 +42,7 @@ class StreamKeeperAPI:
         self.api_config = config.get("api", {})
         self.port = self.api_config.get("port", 8890)
         self.api_key = self.api_config.get("api_key", "")
-        self.app = web.Application(middlewares=[self._auth_middleware])
+        self.app = web.Application(middlewares=[self._compress_middleware, self._auth_middleware])
         self._setup_routes()
         self._runner: Optional[web.AppRunner] = None
         self._start_time = time.time()
@@ -69,6 +69,15 @@ class StreamKeeperAPI:
         self.app.router.add_get("/screenshot", self.handle_screenshot)
         self.app.router.add_post("/layout", self.handle_layout)
         self.app.router.add_post("/tab-view", self.handle_tab_view)
+
+    @web.middleware
+    async def _compress_middleware(self, request: web.Request, handler):
+        """Session and status payloads reach ~500KB while games run; compress JSON for clients that accept it."""
+        response = await handler(request)
+        if (isinstance(response, web.Response) and response.body is not None and len(response.body) > 2048
+                and "json" in (response.content_type or "")):
+            response.enable_compression()
+        return response
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
