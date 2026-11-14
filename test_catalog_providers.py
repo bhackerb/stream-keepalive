@@ -75,7 +75,8 @@ english:
 </table>"""
 PAYLOADS = {'ppv': PPV, 'streamfree': STREAMFREE, 'timstreams': TIMSTREAMS, 'rockylive': ROCKYLIVE, 'cdnlivetv': CDN, 'onhockey': ('text/html', ONHOCKEY), 'matchora': {'events': []},
             'ninetyminutes': {'streams': []}, 'sportsbite': {'days': []}, 'watchsports': ('text/html', ''),
-            'ntvst': {'all': []}, 'reedstreams': [], 'bintv': {'Live Events': []}, 'thetvapp': ('text/html', '')}
+            'ntvst': {'all': []}, 'reedstreams': [], 'bintv': {'Live Events': []}, 'thetvapp': ('text/html', ''),
+            'viprow': ('text/html', 'ftbPageData = { sports: {"name":"Ice Hockey"}, schedule: {} }')}
 IU_MINNESOTA_START = 1793475000
 IU_MINNESOTA_NOW = (IU_MINNESOTA_START + 600) * 1000
 NINETYMINUTES_IU_MN = {'streams': [{'category': 'american-football', 'streams': [
@@ -497,3 +498,21 @@ class NhlCityNameTests(unittest.TestCase):
             self.assertTrue(cp.same_team(a, b), (a, b))
         self.assertFalse(cp.same_team('Kitchener Rangers', 'Rangers'))
         self.assertFalse(cp.same_team('Boston University', 'Bruins'))
+
+
+class VipRowTests(unittest.TestCase):
+    PAGE = ('window.ftbPageData = { sports: {"id":6,"name":"Ice Hockey","slug":"ice-hockey"}, schedule: {'
+            '"1":{"id":1,"name":"Vancouver Canucks - New York Rangers","start":"1794621600","end":"1794632400",'
+            '"links":"[{\\"name\\":\\"NHL\\",\\"url\\":\\"https://todaystreams.cc/play/10\\",\\"quality\\":\\"HD\\"}]"},'
+            '"2":{"id":2,"name":"No Links - Yet","start":"1794621600","end":"1794632400"}}, x: 1 }')
+
+    def test_only_games_with_embeds_become_events(self):
+        events = cp.parse_viprow(self.PAGE, 1794621700000)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['category'], 'hockey')
+        self.assertEqual(events[0]['streams'][0]['url'], 'https://todaystreams.cc/play/10')
+        self.assertTrue(events[0]['streams'][0]['hd'])
+
+    def test_missing_schedule_is_a_provider_failure(self):
+        with self.assertRaises(ValueError):
+            cp.parse_viprow('<html></html>', 0)

@@ -37,3 +37,5 @@ playback-reliability.tmp
 discovery-report.json
 discovery-report.tmp
 config.yaml.before-regular
+provider-stats.json
+PROVIDER_REPORT.md

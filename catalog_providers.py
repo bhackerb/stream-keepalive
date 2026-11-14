@@ -15,7 +15,7 @@ import time
 import unicodedata
 from urllib.parse import urlparse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -487,6 +487,33 @@ def parse_thetvapp(page, now_ms):
     return events
 
 
+VIPROW_SPORTS = ('ice-hockey', 'american-football', 'basketball', 'football', 'baseball', 'mma-events', 'boxing', 'motorsports')
+
+
+def parse_viprow(page, now_ms):
+    """Any VipRow event page embeds the whole sport's schedule; games near kickoff carry direct embed links."""
+    match = re.search(r'schedule:\s*', page)
+    sport = re.search(r'sports:\s*(\{[^}]*\})', page)
+    if not match:
+        raise ValueError('no schedule')
+    schedule, _ = json.JSONDecoder().raw_decode(page[match.end():])
+    category = category_of(json.loads(sport.group(1)).get('name') if sport else None)
+    rows = schedule.values() if isinstance(schedule, dict) else schedule
+    events = []
+    for item in rows:
+        if not isinstance(item, dict) or not item.get('links'):
+            continue
+        try:
+            links = json.loads(item['links']) if isinstance(item['links'], str) else item['links']
+            start, end = int(item['start']) * 1000, int(item.get('end') or 0) * 1000 or None
+        except (TypeError, ValueError):
+            continue
+        streams = [_stream(link.get('url'), (link.get('name') or '').strip() or 'VipRow', hd=str(link.get('quality')).upper() == 'HD')
+                   for link in links if isinstance(link, dict)]
+        events.append(_event('viprow', item.get('id'), item.get('name'), category, start, streams, end_ms=end))
+    return events
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -497,6 +524,7 @@ class Provider:
     headers: tuple = ()  # extra request headers the site's own page sends
     sports: tuple = ()  # specialists are scored only against live games in their sports
     detail: Callable | None = None  # optional per-event page parser; its streams replace the listed ones
+    merge: bool = False  # every URL is a different slice of the catalog: fetch and combine them all
 
 
 PROVIDERS = (
@@ -507,6 +535,7 @@ PROVIDERS = (
     Provider('cdnlivetv', 'CDN Live TV', ('https://api.cdnlivetv.is/api/v1/events/sports/',), parse_cdnlivetv),
     Provider('onhockey', 'OnHockey', ('https://www.onhockey.tv/schedule_table.php',), parse_onhockey, kind='html',
              headers=(('Referer', 'https://www.onhockey.tv/'),), sports=('hockey',)),
+    Provider('viprow', 'VipRow', tuple(f'https://viprow.im/sports/{slug}/x/1/' for slug in VIPROW_SPORTS), parse_viprow, kind='html', merge=True),
     Provider('matchora', 'Matchora', ('https://matchora.to/api/v1/schedule?watchable=1',), parse_matchora),
     Provider('ninetyminutes', '90minutes', ('https://www.90minutes.pro/api/streams',), parse_ninetyminutes,
              headers=(('Referer', 'https://www.90minutes.pro/'),)),
@@ -686,6 +715,12 @@ class Catalog:
         return list(await asyncio.gather(*(expand(e) for e in events[:limit]))) + events[limit:]
 
     async def _fetch_provider(self, client, provider, now_ms):
+        if provider.merge:
+            parts = await asyncio.gather(*(self._fetch_provider(client, replace(provider, urls=(u,), merge=False), now_ms) for u in provider.urls))
+            good = [(poll, evs) for poll, evs in parts if poll['ok']]
+            if not good:
+                return parts[0][0], []
+            return dict(good[0][0], mirror=provider.urls[0], latency_ms=max(p['latency_ms'] for p, _ in good)), [e for _, evs in good for e in evs]
         error = None
         for url in provider.urls:
             started = time.monotonic()

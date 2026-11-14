@@ -65,6 +65,7 @@ class StreamKeeperAPI:
         self.app.router.add_post("/restore-layout", self.handle_restore_layout)
         self.app.router.add_post("/switch", self.handle_switch)
         self.app.router.add_get("/player-sources", self.handle_player_sources)
+        self.app.router.add_get("/provider-stats", self.handle_provider_stats)
         self.app.router.add_get("/screenshot", self.handle_screenshot)
         self.app.router.add_post("/layout", self.handle_layout)
         self.app.router.add_post("/tab-view", self.handle_tab_view)
@@ -459,6 +460,10 @@ class StreamKeeperAPI:
             "success": not result.startswith("\u274c"),
             "message": result,
         })
+
+    async def handle_provider_stats(self,request):
+        import provider_stats
+        return web.json_response(await asyncio.get_running_loop().run_in_executor(None,provider_stats.build_report))
 
     async def handle_player_sources(self,request):
         if not hasattr(self.keeper,'player_sources'):return web.json_response({'error':'Source picker requires regular browser mode'},status=400)
