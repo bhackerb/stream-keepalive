@@ -857,7 +857,8 @@ class Catalog:
             anchored_live = not any(not e.get('anchored') for e in cluster) or start <= now_ms + LIVE_KICKOFF_SLACK_MS
             ends = [e['end_ms'] for e in cluster if e['end_ms']]
             declared = [e['live'] for e in cluster if e['live'] is not None and (anchored_live or not e.get('anchored'))]
-            live = any(declared) if declared else start <= now_ms and (not ends or now_ms < max(ends))
+            # A provider that has not yet flipped its own flag must not hide a game whose kickoff has passed.
+            live = any(declared) or (start <= now_ms and (not ends or now_ms < max(ends)))
             teams = best['teams'] if len(best['teams']) == 2 else []
             viewers = [e['viewers'] for e in cluster if e['viewers'] is not None]
             sources, seen = [], set()

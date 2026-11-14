@@ -132,6 +132,7 @@ class RegularBrowserKeeper:
         self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
         self.session=None;self.plan=None;self.suppressed=set();self.errors=[];self._task=None;self._lock=asyncio.Lock();self._frames={};self._layout_ids=();self._client=None;self._reload_times={};self._browser_ready={};self._inventory_errors={};self._end_seen={};self._ownership_lost=set();self._slot_rows={};self._visible_ids=();self.manual_layout=None;self.saved_layout=None;self._manual_signature=();self._group_epochs={};self._releasing=set();self._recovery={};self._companion_info={};self._progress={};self._autoplay_tasks=set();self._last_seen={};self._buffer_watch={};self._last_refresh_pass=0
         self._placement_startup={};self._placement_retry_task=None;self._placement_generation=0
+        self._unplaced=set()  # streams whose placement failed (slow embed load); retried by _maintain_tv_focus
         self.viewing_mode='all';self.local_keepalive={'enabled':False,'profile':'standard'}
         self.display_probe={'state':'unknown','message':'Display detection pending','outputs':[],'displays':{},'availability':{n:'unknown'for n in config.get('layout',{}).get('displays',{})}}
         self._local_care={};self._display_checked=0
@@ -654,12 +655,12 @@ class RegularBrowserKeeper:
         matches=(await asyncio.wait_for(self._catalog(max_age=60),15))['matches']
         row=next((r for r in matches if r.get('id')==sid),None)
         if not row:raise ValueError('This game is no longer in the source catalog')
-        labels={p.name:p.label for p in self.catalog.providers};counts={};choices=[]
+        labels={p.name:p.label for p in self.catalog.providers};counts={};choices=[];failing_hosts=self.catalog.failing_hosts()
         for item in self.catalog.rank(row['sources'],row['category'])[:30]:
             counts[item['provider']]=counts.get(item['provider'],0)+1
             language=item['label']+(' · '+item['language']if item.get('language')else '')
             choices.append(dict(url=item['url'],source=labels.get(item['provider'],item['provider']),provider=item['provider'],number=counts[item['provider']],language=language[:80],hd=item.get('hd')is True,viewers=item.get('viewers'),current=item['url']==stream.url,
-                                reliability=self.catalog.reliability.rating(item['provider'],row['category'],item['url'])))
+                                reliability=self.catalog.reliability.rating(item['provider'],row['category'],item['url']),host_failing=(urlparse(item['url']).hostname or '').removeprefix('www.')in failing_hosts))
         # Wrestling games may also switch to a watch-wrestling embed resolved by Mithrandir.
         return dict(stream_id=sid,choices=choices,wrestling=row.get('category')=='wrestling',user_source=custom)
 
@@ -743,6 +744,9 @@ class RegularBrowserKeeper:
         if len(placements)!=1:return
         p=placements[0];sid=p['stream_id'];s=self.active_streams.get(sid)
         if not all(p.get(k)==tv.get(k)for k in ('x','y','width','height')) or not s or s.session_id!=self.session['id'] or s.parked or sid in self._releasing or sid in self._ownership_lost or not self._browser_ready.get(s.browser):return
+        if sid in self._unplaced and not self._placement_startup.get(sid) and not(self._placement_retry_task and not self._placement_retry_task.done()):
+            # A switched stream whose embed loaded slowly missed its 40s placement window; place it now instead of leaving it windowed.
+            await self._place(placements);return
         records=await self.command(s.browser,'inventory')
         if not isinstance(records,dict) or self._inventory_errors.get(s.browser) or records.get(sid,{}).get('fill') is not True:return
         if self.active_streams.get(sid) is not s or sid in self._releasing or sid in self._ownership_lost:return
@@ -798,9 +802,16 @@ class RegularBrowserKeeper:
             self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
             self._placement_retry_task=None
         result=await self._place_once(placements)
+        self._note_placement(placements,result)
         if result.get('pending'):
             self._placement_retry_task=asyncio.create_task(self._retry_placement(placements,generation,self.session,self.manual_layout))
         return result
+
+    def _note_placement(self,placements,result):
+        ids={p['stream_id']for p in placements}
+        if result.get('pending'):return
+        if result.get('success'):self._unplaced-=ids
+        else:self._unplaced|=ids
 
     async def _retry_placement(self,placements,generation,session,manual):
         targets={p['stream_id']:self.active_streams.get(p['stream_id'])for p in placements}
@@ -828,6 +839,7 @@ class RegularBrowserKeeper:
                 except Exception as exc:
                     log.exception('New owned tab placement retry failed')
                     result=self.layout_status={'success':False,'message':'Placement retry failed: '+(str(exc)or type(exc).__name__)}
+                self._note_placement(placements,result)
                 if result.get('pending'):continue
                 if result['success']:
                     if manual is not None:self._manual_signature=tuple((p['stream_id'],p['x'],p['y'],p['width'],p['height'])for p in placements)

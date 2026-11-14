@@ -516,3 +516,17 @@ class VipRowTests(unittest.TestCase):
     def test_missing_schedule_is_a_provider_failure(self):
         with self.assertRaises(ValueError):
             cp.parse_viprow('<html></html>', 0)
+
+
+class LiveFlagTests(unittest.TestCase):
+    def test_stale_not_live_flag_does_not_hide_a_game_past_kickoff(self):
+        now = 1794623000000
+        start = now - 20 * 60_000
+        events = [cp._event('ppv', 'a', 'Houston Cougars at Colorado Buffaloes', 'american-football', start,
+                            [cp._stream('https://a.example/1', 'x')], live=False, end_ms=start + 3 * 3600_000),
+                  cp._event('matchora', 'b', 'Houston Cougars at Colorado Buffaloes', 'american-football', start,
+                            [cp._stream('https://b.example/1', 'y')], end_ms=start + 3 * 3600_000)]
+        with tempfile.TemporaryDirectory() as d:
+            matches = cp.Catalog(Path(d) / 'h.json')._merge(events, now)
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0]['live'])
