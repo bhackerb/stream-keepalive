@@ -120,7 +120,7 @@ skAPI.runtime.onMessage.addListener((m,_s,respond)=>{
     catch{respond({confirmed:false});}
     return false;
   }
-  if(m.op==='fill_child' && skOwned && skFill && !skEscaped){const f=[...document.querySelectorAll('iframe')].find(f=>f.src===m.src || f.src.split('#')[0]===m.src.split('#')[0]);if(f)skExpand(f);}
+  if(m.op==='fill_child' && skOwned && skFill && !skEscaped){const frames=[...document.querySelectorAll('iframe')];const f=frames.find(f=>f.src===m.src || f.src.split('#')[0]===m.src.split('#')[0]) || (frames.length?frames.sort((a,b)=>b.getBoundingClientRect().width*b.getBoundingClientRect().height-a.getBoundingClientRect().width*a.getBoundingClientRect().height)[0]:null);if(f)skExpand(f);}
   if(m.op==='marker' && window===window.top)document.title=m.value;
   if(m.op==='fill'){skFill=m.enabled;skEscaped=false;if(!skFill)skRestore();}
   if(m.op==='park'){skParked=m.enabled;for(const v of document.querySelectorAll('video')){if(m.enabled){v.dataset.skResume=String(!v.paused);v.pause();}else if(v.dataset.skResume==='true'){delete v.dataset.skResume;void v.play().catch(()=>{});}}}
