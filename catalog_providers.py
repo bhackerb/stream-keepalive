@@ -13,6 +13,7 @@ import os
 import re
 import time
 import unicodedata
+from urllib.parse import urlparse
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -525,8 +526,37 @@ PROVIDERS = (
 
 # --------------------------------------------------------------------------- merge
 
+NHL_TEAMS = (
+    ('anaheim', 'ducks'), ('boston', 'bruins'), ('buffalo', 'sabres'), ('calgary', 'flames'), ('carolina', 'hurricanes'),
+    ('chicago', 'blackhawks'), ('colorado', 'avalanche'), ('columbus', 'blue jackets'), ('dallas', 'stars'),
+    ('detroit', 'red wings'), ('edmonton', 'oilers'), ('florida', 'panthers'), ('los angeles', 'kings'),
+    ('minnesota', 'wild'), ('montreal', 'canadiens'), ('nashville', 'predators'), ('new jersey', 'devils'),
+    ('new york', 'islanders'), ('new york', 'rangers'), ('ottawa', 'senators'), ('philadelphia', 'flyers'),
+    ('pittsburgh', 'penguins'), ('san jose', 'sharks'), ('seattle', 'kraken'), ('saint louis', 'blues'),
+    ('tampa bay', 'lightning'), ('toronto', 'maple leafs'), ('utah', 'mammoth'), ('vancouver', 'canucks'),
+    ('vegas', 'golden knights'), ('washington', 'capitals'), ('winnipeg', 'jets'))
+_NHL_NAMES = {}
+for _city, _nick in NHL_TEAMS:
+    _full = f'{_city} {_nick}'
+    for _name in (_full, _nick) + ((_city,) if _city != 'new york' else ()):
+        _NHL_NAMES.setdefault(_name, set()).add(_full)
+for _alias, _full in (('ny rangers', 'new york rangers'), ('ny islanders', 'new york islanders'), ('nyr', 'new york rangers'),
+                      ('nyi', 'new york islanders'), ('la kings', 'los angeles kings'), ('tb lightning', 'tampa bay lightning'),
+                      ('saint louis', 'saint louis blues'), ('utah hockey club', 'utah mammoth'), ('vegas golden knights', 'vegas golden knights')):
+    _NHL_NAMES.setdefault(_alias, set()).add(_full)
+
+
+def nhl_team(name):
+    """Canonical NHL club for a full name, city, or nickname; None when it is not unambiguously one."""
+    found = _NHL_NAMES.get(' '.join('saint' if t == 'st' else t for t in words(name)))
+    return next(iter(found)) if found and len(found) == 1 else None
+
+
 def same_team(left, right):
     """Accept full names and leading short names, never a shared mascot/region."""
+    nl, nr = nhl_team(left), nhl_team(right)
+    if nl and nr:
+        return nl == nr
     a, b = words(left), words(right)
     a = ['saint' if t == 'st' else t for t in a]
     b = ['saint' if t == 'st' else t for t in b]
@@ -714,9 +744,31 @@ class Catalog:
     def known_url(self, url):
         return url in self.urls or url in self._previous_urls
 
+    def failing_hosts(self):
+        """Embed hosts whose recent autoplay almost never produced playback (>=10 steps, <10% advanced)."""
+        if time.time() - getattr(self, '_failing_at', 0) < 120:
+            return self._failing
+        counts, cutoff = {}, time.time() - 7 * 86400
+        try:
+            for line in (Path(self.health.path).with_name('autoplay-outcomes.jsonl')).read_text().splitlines()[-4000:]:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get('at', 0) >= cutoff and isinstance(row.get('site'), str):
+                    total, good = counts.get(row['site'].removeprefix('www.'), (0, 0))
+                    counts[row['site'].removeprefix('www.')] = (total + 1, good + (row.get('outcome') == 'advanced'))
+        except OSError:
+            pass
+        self._failing = {h for h, (t, g) in counts.items() if t >= 10 and g / t < .1}
+        self._failing_at = time.time()
+        return self._failing
+
     def rank(self, sources, sport=''):
-        # Consistent providers first (coarse buckets so noise cannot reshuffle), then the preferred height, viewers, English, HD.
-        return sorted(sources, key=lambda s: (round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
+        # Hosts that routinely fail to start sink below everything; then consistent providers (coarse buckets so noise
+        # cannot reshuffle), then the preferred height, viewers, English, HD.
+        failing = self.failing_hosts()
+        return sorted(sources, key=lambda s: ((urlparse(s['url']).hostname or '').removeprefix('www.') not in failing, round(self.reliability.rating(s['provider'], sport, s['url'])['score'], 1),
                       round(self.health.score(s['provider']), 1), s.get('height') == PREFERRED_HEIGHT, *stream_rank(s)),
                       reverse=True)
 

@@ -489,3 +489,11 @@ class KeeperCatalogTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NhlCityNameTests(unittest.TestCase):
+    def test_city_and_nickname_are_the_same_club(self):
+        for a, b in (('NY Rangers', 'Rangers'), ('Vancouver', 'Canucks'), ('St. Louis', 'Blues'), ('Vegas', 'Golden Knights')):
+            self.assertTrue(cp.same_team(a, b), (a, b))
+        self.assertFalse(cp.same_team('Kitchener Rangers', 'Rangers'))
+        self.assertFalse(cp.same_team('Boston University', 'Bruins'))
