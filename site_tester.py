@@ -113,6 +113,29 @@ async def load_sites(session):
     return parser.sites
 
 
+async def render_links(url, wait_ms=6000):
+    """Render a JS-driven page in headless Chromium (not the TV) and return (links, frames, media_urls)."""
+    from playwright.async_api import async_playwright
+    media, links, frames = [], [], []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            ctx = await browser.new_context(user_agent=UA, viewport={'width': 1280, 'height': 800}, ignore_https_errors=True)
+            page = await ctx.new_page()
+            page.on('request', lambda r: media.append(r.url) if re.search(r'\.m3u8|\.mpd|\.ts\?|manifest', r.url) else None)
+            await page.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'font', 'stylesheet') else route.continue_())
+            try:
+                await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                await page.wait_for_timeout(wait_ms)
+                links = await page.eval_on_selector_all('a[href]', 'els => els.map(e => [e.href, (e.innerText||"").trim().slice(0,100)])')
+                frames = await page.eval_on_selector_all('iframe[src]', 'els => els.map(e => e.src)')
+            except Exception:
+                pass
+            return links, frames, media
+        finally:
+            await browser.close()
+
+
 async def catalog_index(session):
     """host -> live catalog source URLs, so sites we already ingest are tested on real live games."""
     import catalog_providers as cp
@@ -153,6 +176,17 @@ async def candidates(session, host, home_url, index=None):
     for m in re.finditer(r'["\'](/(?:watch|stream|match|event|embed|game|live|channel)[^"\'\s<>]{3,90})["\']', body):
         url = urljoin(final, m.group(1)).split('#')[0]
         ranked.setdefault(url, 3)
+    if len(ranked) < 2:  # JS-rendered site: look at the rendered DOM instead
+        try:
+            links, frames, media = await render_links(final)
+        except Exception:
+            links, frames, media = [], [], []
+        for url, text in links:
+            sc = score(url, text, final_host)
+            if sc >= 3:
+                ranked[url.split('#')[0]] = max(sc, ranked.get(url.split('#')[0], 0))
+        page.frames += [f for f in frames if f not in page.frames]
+        info['rendered'] = True
     cands = [u for u, _ in sorted(ranked.items(), key=lambda kv: -kv[1])][:MAX_CANDIDATES]
     for frame in page.frames[:2]:
         if frame.startswith('https://') and frame not in cands:
@@ -252,6 +286,8 @@ async def main():
         if any(not s['stream_id'].startswith('probe-') for s in status.get('streams', [])):
             print('Real streams are active; not testing.')
             return
+        for stale in [s['stream_id'] for s in status.get('streams', []) if s['stream_id'].startswith('probe-')]:
+            await api(session, 'DELETE', f'/probe/{stale}', key)  # left over from an interrupted run
         if not status.get('browser_connections', {}).get('firefox'):
             print('Firefox companion is not connected; not testing.')
             return
