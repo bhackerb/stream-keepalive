@@ -140,6 +140,33 @@ async def render_links(url, wait_ms=6000):
             await browser.close()
 
 
+async def media_signal(url, wait_ms=9000):
+    """Headless pre-screen: does this page request a stream manifest or contain a <video> in any frame?"""
+    from playwright.async_api import async_playwright
+    media = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=['--autoplay-policy=no-user-gesture-required', '--mute-audio'])
+        try:
+            ctx = await browser.new_context(user_agent=UA, ignore_https_errors=True)
+            page = await ctx.new_page()
+            page.on('request', lambda r: media.append(r.url) if re.search(r'\.m3u8|\.mpd|/manifest', r.url) else None)
+            await page.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'font', 'stylesheet') else route.continue_())
+            try:
+                await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                await page.wait_for_timeout(wait_ms)
+                video = False
+                for frame in page.frames:
+                    try:
+                        video = video or await frame.evaluate('!!document.querySelector("video")')
+                    except Exception:
+                        pass
+                return bool(media) or video
+            except Exception:
+                return False
+        finally:
+            await browser.close()
+
+
 async def catalog_index(session):
     """host -> live catalog source URLs, so sites we already ingest are tested on real live games."""
     import catalog_providers as cp
@@ -307,6 +334,16 @@ async def main():
             async with sem:
                 return host, *await candidates(session, host, sites[host]['url'], index)
         scouted = await asyncio.gather(*(scout(h) for h in names))
+        shield = asyncio.Semaphore(5)
+
+        async def prescreen(host, info, cands):
+            if info.get('tier') == 'catalog' or len(cands) < 2:
+                return host, info, cands
+            async with shield:
+                flags = await asyncio.gather(*(media_signal(u) for u in cands))
+            ordered = [u for u, f in zip(cands, flags) if f] + [u for u, f in zip(cands, flags) if not f]
+            return host, dict(info, media_signal=sum(flags)), ordered
+        scouted = await asyncio.gather(*(prescreen(*row) for row in scouted))
         for host, info, cands in scouted:
             if time.time() > deadline:
                 print('Time budget reached')
