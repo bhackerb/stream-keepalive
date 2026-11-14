@@ -30,9 +30,9 @@ SECTIONS = ('live-tv', 'live-sports')
 SKIP_LABELS = {'status', 'mirrors', 'discord', 'telegram', 'guide', 'rss', 'reddit', 'subreddit', 'twitter', 'github'}
 SKIP_HOSTS = ('discord.', 't.me', 'telegram.', 'reddit.', 'twitter.', 'x.com', 'github.', 'youtube.', 'facebook.', 'instagram.', 'fmhy.')
 HINT = re.compile(r'watch|stream|live|match|event|game|channel|embed|play|/nhl|/nba|/nfl|/mlb|/soccer|/hockey|/tv', re.I)
-AVOID = re.compile(r'login|register|signup|contact|dmca|privacy|terms|about|faq|discord|telegram|cdn-cgi|/apps?\b|\.(png|jpg|css|js|svg|json)(\?|$)|#$', re.I)
+AVOID = re.compile(r'login|register|signup|contact|dmca|privacy|terms|about|faq|discord|telegram|cdn-cgi|sync-iframe|mediapass|/(movies?|shows?|series|chat|apps?)\b|\.(png|jpg|css|js|svg|json)(\?|$)|#$', re.I)
 AD_HOSTS = ('pubmatic', 'doubleclick', 'googlesyndication', 'googletagmanager', 'adservice', 'adnxs', 'criteo', 'taboola', 'outbrain',
-            'rubiconproject', 'openx', 'amazon-adsystem', 'facebook.', 'google.com', 'adsterra', 'popads', 'propeller', 'exoclick', 'ads.')
+            'rubiconproject', 'openx', 'chatango', 'dtscout', 'yellowblue', 'adsco', 'mgid', 'pubmatic', 'amazon-adsystem', 'facebook.', 'google.com', 'adsterra', 'popads', 'propeller', 'exoclick', 'ads.')
 LISTING = re.compile(r'/(events?|channels?|tv|schedule|dailygrid|matches|sports?|categories|category|leagues?|all)/?$', re.I)
 PLAY_TIMEOUT, SAMPLE_SECONDS, MAX_CANDIDATES, MAX_PROBES_PER_SITE = 50, 40, 3, 4
 
