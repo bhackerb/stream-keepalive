@@ -57,3 +57,9 @@ Tests: `node --test companion/background.test.cjs companion/content.test.cjs` (4
 - **Plan capacity.** The session plan showed `capacity: 1` while `stream_capacity` is 4. Confirm the intended value before the games start.
 - **Laptop.** The laptop checkout is at `f9c7a3e`, pulled tonight. The companion build must go to both devices so their content scripts match.
 - **Streamed references.** The current discover path uses the merged catalog. Remaining Streamed mentions are in docs, the `streamed.pk` default in `stream_keeper.py`, and `watch()` help text. Clean these up when convenient.
+
+## 0.2.13 (2026-11-14) — unsigned, needs Ben to sign and install
+
+- `companion/content.js`: `fill_child` falls back to the largest iframe when no iframe's `src` equals the playing frame's URL. Wrapper pages (e.g. `app.my1click.top`) redirect or rewrite the embed URL, so the player stayed in a small box instead of filling the window. Tests: `node --test companion/*.test.cjs` (47 pass).
+- Version bumped in `build_companion.py`; `build/streamkeeper-firefox.zip` rebuilt. Signing is manual.
+- Both hosts (bhbserv, laptop) currently run 0.2.12. The site tester (`site_tester.py`) records `fill` per site, so the next nightly report shows which hosts still fail to fill.
