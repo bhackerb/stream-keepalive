@@ -1,6 +1,7 @@
 import unittest
+import asyncio
 from unittest.mock import AsyncMock,MagicMock,patch
-from regular_browser import RegularBrowserKeeper,stream_rank
+from regular_browser import RegularBrowserKeeper,stream_rank,SOURCE_RECOVERY_BUDGET,BUFFER_SWITCH_BUDGET,recovery_record
 import test_regular_browser as fixtures
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -36,8 +37,9 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('0',self.k.suppressed);self.assertEqual(self.k.active_streams['0'].url,'https://streamed.pk/watch/0/golf/2')
         self.k._recovery_sources.return_value='https://streamed.pk/watch/0/admin/3';await self.tick(1270)
         self.assertEqual(self.k._recovery['0']['attempts'],3)
+        self.k._recovery['0']['attempts']=SOURCE_RECOVERY_BUDGET
         self.k.command.reset_mock();await self.tick(1400);self.assertEqual([c.args[1]for c in self.k.command.await_args_list],[]);self.assertNotIn('0',self.k.suppressed)
-        fresh=RegularBrowserKeeper(self.config);self.assertEqual(fresh._recovery['0']['attempts'],3);self.assertNotIn('since',fresh._recovery['0'])
+        fresh=RegularBrowserKeeper(self.config);self.assertEqual(fresh._recovery['0']['attempts'],SOURCE_RECOVERY_BUDGET);self.assertNotIn('since',fresh._recovery['0'])
 
     async def test_dead_source_page_is_replaced_after_fifteen_seconds(self):
         await self.setup_stream()
@@ -55,6 +57,51 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.k._frames[('0',0)]=(1016,{'state':'NO_VIDEO','page_error':True})
         with patch('regular_browser.time.time',return_value=1016):await self.k._recover_no_video(self.p)
         self.assertIn('close',[c.args[1] for c in self.k.command.await_args_list])
+
+    async def test_additional_candidates_use_sixty_second_cooldown_and_survive_restart(self):
+        await self.setup_stream()
+        self.k._recovery['0']={'attempts':3,'tried':[], 'since':900,'last_action':1000}
+        self.k._recovery_sources=AsyncMock(return_value='https://streamed.pk/watch/0/golf/9')
+        async def commands(browser,op,**args):
+            if op=='inventory':return {'0':{}}if '0'in self.k.active_streams else {}
+            if op=='close':await self.k._event('firefox',{'event':'closed','stream_id':'0'})
+            return True
+        self.k.command=AsyncMock(side_effect=commands)
+        # Isolate the cooldown from the independent sustained-failure timer.
+        self.k._failure_wait=MagicMock(return_value=0)
+        await self.tick(1059);self.k.command.assert_not_awaited()
+        await self.tick(1060)
+        self.assertEqual(self.k._recovery['0']['attempts'],4)
+        fresh=RegularBrowserKeeper(self.config)
+        self.assertEqual(fresh._recovery['0']['attempts'],4)
+        self.assertEqual(fresh._recovery['0']['url'],'https://streamed.pk/watch/0/golf/9')
+        for attempt in range(5,SOURCE_RECOVERY_BUDGET+1):
+            self.k._recovery_sources.return_value=f'https://streamed.pk/watch/0/golf/{attempt}'
+            await self.tick(1060+(attempt-4)*60)
+            self.assertEqual(self.k._recovery['0']['attempts'],attempt)
+        self.k.command.reset_mock()
+        await self.tick(1500)
+        self.k.command.assert_not_awaited()
+        self.assertIn('exhausted',self.k._recovery['0']['message'])
+
+    async def test_autoplay_contains_desktop_library_exception(self):
+        await self.setup_stream()
+        self.k._autoplay_step=AsyncMock(side_effect=RuntimeError('Desktop authorization unavailable'))
+        self.k._wait_for_advance=AsyncMock(return_value='no_telemetry')
+        with patch('regular_browser.AUTOPLAY_GRACE',0):
+            await self.k._run_autoplay_ladder('0')
+        self.assertEqual(self.k._autoplay_step.await_count,4)
+        self.assertEqual(self.k.active_streams['0'].health_monitor.stats['autoplay']['state'],'needs_click')
+
+    async def test_autoplay_cancellation_is_not_swallowed(self):
+        await self.setup_stream()
+        self.k._autoplay_step=AsyncMock(side_effect=asyncio.CancelledError())
+        with patch('regular_browser.AUTOPLAY_GRACE',0):
+            with self.assertRaises(asyncio.CancelledError):await self.k._run_autoplay_ladder('0')
+
+    def test_maximum_source_history_keeps_exhausted_budget(self):
+        record={'attempts':SOURCE_RECOVERY_BUDGET,'tried':[f'https://streamed.pk/watch/{i}'for i in range(SOURCE_RECOVERY_BUDGET+BUFFER_SWITCH_BUDGET+1)]}
+        self.assertEqual(recovery_record(record)['attempts'],SOURCE_RECOVERY_BUDGET)
 
     async def test_playing_child_paused_loading_stale_and_disconnected_never_mutate(self):
         await self.setup_stream();self.k._recovery['0']={'attempts':0,'tried':[],'since':1}
@@ -160,7 +207,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('left open',self.k._recovery['0']['message'])
 
     async def test_exhausted_failure_recovery_releases_the_slot(self):
-        await self.setup_stream();self.k._recovery['0']={'attempts':3,'tried':[],'since':1,'last_action':1}
+        await self.setup_stream();self.k._recovery['0']={'attempts':SOURCE_RECOVERY_BUDGET,'tried':[],'since':1,'last_action':1}
         self.k._recovery_sources=AsyncMock(return_value='https://streamed.su/watch/0/golf/5')
         async def commands(browser,op,**args):
             if op=='inventory':return {'0':{}}if '0'in self.k.active_streams else {}

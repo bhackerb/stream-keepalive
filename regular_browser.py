@@ -48,6 +48,7 @@ SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
 BUFFER_SWITCH_EPISODES=1  # switch provider after more than this many buffering episodes on one stream
 BUFFER_SWITCH_BUDGET=4  # provider switches per stream, separate from the failure-recovery attempts
+SOURCE_RECOVERY_BUDGET=8  # walk more candidates before asking for manual intervention
 DEAD_SOURCE_WAIT=15  # a page that reports 403/404/5xx has nothing to wait for
 RECOVERY_WAIT=60  # seconds a stream must stay failed before recovery acts (the autoplay ladder needs ~48s)
 REFRESH_INTERVAL_S=600  # providers restart on their own, so earlier failures are retried this often
@@ -77,8 +78,8 @@ def allowlisted(url):
     except ValueError:return False
 
 def recovery_record(value):
-    if not isinstance(value,dict)or type(value.get('attempts'))is not int or not 0<=value['attempts']<=3:return None
-    if not isinstance(value.get('tried'),list)or len(value['tried'])>10:return None
+    if not isinstance(value,dict)or type(value.get('attempts'))is not int or not 0<=value['attempts']<=SOURCE_RECOVERY_BUDGET:return None
+    if not isinstance(value.get('tried'),list)or len(value['tried'])>SOURCE_RECOVERY_BUDGET+BUFFER_SWITCH_BUDGET+1:return None
     if 'user_source'in value and type(value['user_source'])is not bool:return None
     record={'attempts':value['attempts'],'tried':value['tried']}
     if value.get('user_source')is True:record['user_source']=True
@@ -607,7 +608,7 @@ class RegularBrowserKeeper:
             stats['autoplay']={'step':step,'state':'trying'}
             started=time.time()
             try:await self._autoplay_step(sid,step)
-            except(ValueError,TimeoutError,OSError,NotImplementedError)as exc:log.info('Autoplay step %s failed for %s: %s',step,sid,exc)
+            except Exception as exc:log.warning('Autoplay step %s failed for %s: %s',step,sid,exc,exc_info=True)
             outcome=await self._wait_for_advance(sid,started,AUTOPLAY_STEP_TIMEOUT)
             self._record_autoplay(stream,step,outcome)
             if outcome=='advanced':
@@ -1253,7 +1254,7 @@ class RegularBrowserKeeper:
         # Providers restart on their own, so a source that failed earlier may work now: forget the tried
         # sources of streams still in recovery, and reload tabs that still show no video.
         for sid,record in list(self._recovery.items()):
-            if sid not in self.active_streams or sid not in live or record.get('pending_release') or record.get('attempts',0)>=3:continue
+            if sid not in self.active_streams or sid not in live or record.get('pending_release') or record.get('attempts',0)>=SOURCE_RECOVERY_BUDGET:continue
             record['tried']=[record['url']]if record.get('url')else[]
         for sid in list(self.active_streams):
             if sid in live and self.active_streams[sid].health_monitor.stats.get('state')=='NO_VIDEO' and self._recoverable_failure(sid,time.time()):
@@ -1262,8 +1263,8 @@ class RegularBrowserKeeper:
         self._save()
 
     async def _recover_no_video(self,plan):
-        # Called under the same lock as layout/stop. One action per minute tick,
-        # one refresh and at most two alternate players per match, across restarts.
+        # Called under the same lock as layout/stop. One action per tick,
+        # bounded source search across restarts; startup gets the autoplay grace.
         try:await self._check_memory()
         except ValueError as exc:self.errors=[str(exc)];return
         if time.time()-self._last_refresh_pass>=REFRESH_INTERVAL_S:
@@ -1303,11 +1304,11 @@ class RegularBrowserKeeper:
             if buffer_switch:
                 if record.get('buffer_switches',0)>=BUFFER_SWITCH_BUDGET:
                     record['message']='Buffer switches exhausted; choose a source manually';continue
-            elif record['attempts']>=3:
+            elif record['attempts']>=SOURCE_RECOVERY_BUDGET:
                 # Recovery is spent: release the slot so the allocator can fill it with another game.
                 # Never close a tab the user is watching: keep it open and stop auto-recovering it.
                 record.update(message='Automatic recovery exhausted; stream left open, choose a source manually',last_action=time.time());self._save();continue
-            if(not buffer_switch and now-record['since']<self._failure_wait(sid,now))or now-record.get('last_action',0)<90:continue
+            if(not buffer_switch and now-record['since']<self._failure_wait(sid,now))or now-record.get('last_action',0)<60:continue
             stream=self.active_streams[sid];stage='audit'
             try:
                 # Audit proves the exact owned tab still exists. Exceptions or
