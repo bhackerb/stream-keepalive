@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
 
 from regular_browser import RegularBrowserKeeper
+from api_server import StreamKeeperAPI
 import test_regular_browser as fixtures
 
 
@@ -172,3 +173,12 @@ class LaunchPeriodTests(unittest.IsolatedAsyncioTestCase):
         await self.k._reconcile(plan)
         self.assertIs(self.k.active_streams['0'],stream)
         self.assertEqual(stream.health_monitor.stats['launch']['phase'],'normal')
+
+    async def test_status_exposes_launch_phase_and_progress(self):
+        stream=self.add_stream()
+        api=StreamKeeperAPI(self.k,self.config)
+        result=api._stream_to_dict(stream)
+        self.assertEqual(result['health']['launch']['phase'],'launch')
+        self.assertEqual(result['health']['launch']['check_interval_seconds'],15)
+        for now in (100,115,130,145,160):self.sample(now)
+        self.assertEqual(api._stream_to_dict(stream)['health']['launch']['phase'],'normal')

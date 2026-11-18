@@ -225,6 +225,7 @@ class StreamKeeperAPI:
                 "stall_duration": health["stall_duration"],
                 "recovery_count": health["recovery_count"],
                 "duration": health.get("duration"),
+                "launch": health.get("launch"),
             },
         }
 
