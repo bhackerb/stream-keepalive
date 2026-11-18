@@ -13,6 +13,9 @@ media with decoded-frame evidence. Catalog disappearance alone never ends a game
 New-tab layout readiness retries only saved title/marker operations for up to 40
 seconds after open, audited against its exact tab/window/token receipt. A pending
 layout never authorizes another open, reload, adoption, or an ownership bypass.
+Each opened/restored source starts in launch monitoring: checks every 15 seconds
+require 60 seconds of continuous fresh primary-video progress before normal care.
+Launch observation never authorizes mutations; existing recovery guards still apply.
 """
 import asyncio
 import re
@@ -43,6 +46,8 @@ ALLOWED_HOSTS=('streamed.pk','streamed.su','embed.st','rockylive.st','strmd.top'
 AUTOPLAY_STEPS=('play','play_control','pointer','os_click')
 AUTOPLAY_GRACE=8
 AUTOPLAY_STEP_TIMEOUT=10
+LAUNCH_CHECK_INTERVAL=15
+LAUNCH_RELIABLE_SECONDS=60
 # A live stream that stops reporting for this long counts as failed, but only if it was not playing.
 SILENCE_FAILURE_SECONDS=30
 SILENT_FAILURE_STATES=('NO_VIDEO','BUFFERING')
@@ -187,6 +192,48 @@ class RegularBrowserKeeper:
         site='onhockey.tv'if host=='onhockey.tv'or host.endswith('.onhockey.tv')else 'streamed'
         if user_source:site=host
         self.active_streams[sid]=SimpleNamespace(id=sid,user_source=user_source,team=r.get('label',sid),site=site,url=r['url'],browser=r['browser'],started_at=r.get('started_at',time.time()),session_id=r.get('session_id'),parked=r.get('parked',False),health_monitor=SimpleNamespace(stats=health),page=CompanionPage(self,sid))
+        self._begin_launch(self.active_streams[sid])
+
+    @staticmethod
+    def _begin_launch(stream):
+        stream.launch={'previous':None,'last_check':None,'healthy_since':None}
+        stream.health_monitor.stats['launch']={'phase':'launch','checks':0,'healthy_seconds':0,'check_interval_seconds':LAUNCH_CHECK_INTERVAL,'required_seconds':LAUNCH_RELIABLE_SECONDS}
+
+    def _reset_launch_progress(self,stream):
+        if stream.health_monitor.stats['launch']['phase']=='normal':return
+        stream.launch.update(previous=None,healthy_since=None)
+        stream.health_monitor.stats['launch']['healthy_seconds']=0
+
+    def _launch_tick(self):
+        now=time.monotonic()
+        for sid,stream in list(self.active_streams.items()):
+            status=stream.health_monitor.stats['launch'];launch=stream.launch
+            if status['phase']=='normal':continue
+            last=launch['last_check']
+            if last is not None and now-last<LAUNCH_CHECK_INTERVAL:continue
+            launch['last_check']=now;status['checks']+=1
+            primary=self._primary_video(sid)
+            blocked=stream.parked or sid in self.suppressed|self._ownership_lost|self._releasing or not self._browser_ready.get(stream.browser)
+            if blocked or not primary or primary[1][1].get('state')!='PLAYING' or primary[1][1].get('paused')is True or primary[1][1].get('ended'):
+                self._reset_launch_progress(stream);continue
+            key,(_,health)=primary;previous=launch['previous']
+            # Never bridge missed checks, a replaced frame, or a frozen video.
+            advancing=previous is not None and previous[0]==key and last is not None and now-last<=LAUNCH_CHECK_INTERVAL+5 and self._video_advanced(previous[1],health)
+            if not advancing:launch['healthy_since']=now
+            launch['previous']=(key,dict(health))
+            status['healthy_seconds']=int(now-launch['healthy_since'])
+            if status['healthy_seconds']>=LAUNCH_RELIABLE_SECONDS:
+                status['phase']='normal';launch['previous']=None
+                log.info('Launch verified; normal monitoring stream=%s checks=%s',sid,status['checks'])
+
+    async def _launch_loop(self):
+        # Separate from catalog I/O: slow discovery cannot delay launch checks.
+        loop=asyncio.get_running_loop();deadline=loop.time()+LAUNCH_CHECK_INTERVAL
+        while True:
+            while loop.time()<deadline:await asyncio.sleep(deadline-loop.time())
+            try:self._launch_tick()
+            except Exception:log.exception('Launch check failed; promotion deferred')
+            deadline=max(deadline+LAUNCH_CHECK_INTERVAL,loop.time()+LAUNCH_CHECK_INTERVAL)
     async def refresh_displays(self):
         self.display_probe=await probe_displays(self.config.get('layout',{}).get('displays',{}),self.config.get('layout',{}).get('backend'))
         self._display_checked=time.time()
@@ -219,9 +266,12 @@ class RegularBrowserKeeper:
         await self.refresh_displays()
         self._task=asyncio.create_task(self._loop())
         self._reliability_task=asyncio.create_task(self._reliability_loop())
+        self._launch_task=asyncio.create_task(self._launch_loop())
     async def shutdown(self):
         if self._placement_retry_task:self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
         if self._task:self._task.cancel();await asyncio.gather(self._task,return_exceptions=True)
+        launch_task=getattr(self,'_launch_task',None)
+        if launch_task:launch_task.cancel();await asyncio.gather(launch_task,return_exceptions=True)
         reliability_task=getattr(self,'_reliability_task',None)
         if reliability_task:reliability_task.cancel();await asyncio.gather(reliability_task,return_exceptions=True)
         self._save()
@@ -309,6 +359,8 @@ class RegularBrowserKeeper:
             if any(type(h.get(k,0))not in(int,float)or not math.isfinite(h.get(k,0))for k in('width','height','current_time','volume','stall_seconds')):return
             now=time.time();key=(sid,m.get('frame_id'));h=dict(h)
             previous=self._frames.get(key);progress=self._progress.get(key)
+            sampled=s.launch['previous']
+            if previous and sampled and sampled[0]==key and now-previous[0]>=6:self._reset_launch_progress(s)
             if previous and now-previous[0]<12 and h.get('current_time',0)>previous[1].get('current_time',0):
                 before,after=previous[1].get('decoded_frames'),h.get('decoded_frames')
                 if before is None or after is None or (type(before)in(int,float)and type(after)in(int,float)and after>before):
@@ -337,6 +389,8 @@ class RegularBrowserKeeper:
             # Playback aggregation can favor a small PLAYING ad. Audio controls
             # must describe the same fresh primary video that volume targets.
             primary=self._primary_video(sid)
+            if not primary or primary[1][1].get('state')!='PLAYING' or primary[1][1].get('paused')is True or primary[1][1].get('ended'):
+                self._reset_launch_progress(s)
             if primary:
                 audio=primary[1][1]
                 s.health_monitor.stats.update(muted=bool(audio.get('muted',True)),volume=audio.get('volume',0))
@@ -473,6 +527,7 @@ class RegularBrowserKeeper:
                 if sid:return '❌ Reload budget: at most once per stream per 10 minutes'
                 skipped.append(target);continue
             await self.command_for(target,'reload');self._reload_times[target]=time.time()
+            if target in self.active_streams:self._begin_launch(self.active_streams[target])
             for key in list(self._frames):
                 if key[0]==target:del self._frames[key];self._progress.pop(key,None)
             # A reloaded page starts from scratch, so the autoplay ladder runs again for it.
@@ -1262,17 +1317,30 @@ class RegularBrowserKeeper:
                 except Exception as e:log.warning('Periodic reload failed for %s: %s',sid,type(e).__name__)
         self._save()
 
-    async def _recover_no_video(self,plan):
-        # Called under the same lock as layout/stop. One action per tick,
-        # bounded source search across restarts; startup gets the autoplay grace.
+    async def _recover_monitored_streams(self,plan):
+        # Launch care owns unverified sources; normal care receives only promoted streams.
         try:await self._check_memory()
         except ValueError as exc:self.errors=[str(exc)];return
         if time.time()-self._last_refresh_pass>=REFRESH_INTERVAL_S:
             self._last_refresh_pass=time.time()
             await self._periodic_refresh({r['id']:r for r in plan['live']})
-        live={r['id']:r for r in plan['live']}
+        for phase in ('launch','normal'):await self._recover_no_video(plan,phase=phase)
+
+    async def _recover_no_video(self,plan,phase=None):
+        # Called under the same lock as layout/stop. One action per tick,
+        # bounded source search across restarts; startup gets the autoplay grace.
+        try:await self._check_memory()
+        except ValueError as exc:self.errors=[str(exc)];return
+        def eligible(sid):
+            stream=self.active_streams.get(sid)
+            return phase is None or bool(stream and stream.health_monitor.stats['launch']['phase']==phase)
+        live={r['id']:r for r in plan['live']if eligible(r['id'])}
+        if phase is None and time.time()-self._last_refresh_pass>=REFRESH_INTERVAL_S:
+            self._last_refresh_pass=time.time()
+            await self._periodic_refresh(live)
         if self.local_keepalive.get('enabled'):return
         for sid,record in list(self._recovery.items()):
+            if not eligible(sid):continue
             if record.get('pending_release')and sid in self._releasing and sid in self.active_streams:
                 stream=self.active_streams[sid]
                 if not self._browser_ready.get(stream.browser):continue
@@ -1290,6 +1358,7 @@ class RegularBrowserKeeper:
                     record['message']='Previous close audited; waiting for fresh video evidence';self._save()
                 except Exception:continue
         for sid in list(self.active_streams):
+            if not eligible(sid):continue
             now=time.time();record=self._recovery.get(sid)
             buffer_switch=bool(record and record.get('buffer_switch'))
             if(not buffer_switch and not self._recoverable_failure(sid,now))or sid not in live:
@@ -1506,7 +1575,7 @@ class RegularBrowserKeeper:
                 if time.time()-getattr(self,'_last_catalog_poll',0)<60:
                     # Between catalog polls still watch for failures every loop so a dead source is replaced in seconds, not minutes.
                     if self.plan:
-                        try:await self._recover_no_video(self.plan)
+                        try:await self._recover_monitored_streams(self.plan)
                         except Exception:log.exception('Fast recovery pass failed; preserving playing windows')
                     continue
                 self._last_catalog_poll=time.time()
@@ -1514,7 +1583,7 @@ class RegularBrowserKeeper:
                     self.session=None;self._save();continue # leave playing games alone
                 try:
                     plan=await self.discover(self.session['spec'],self.session['until_ms'])
-                    self.plan=plan;await self._reconcile(plan);await self._recover_no_video(plan)
+                    self.plan=plan;await self._reconcile(plan);await self._recover_monitored_streams(plan)
                 except Exception as e:
                     log.exception('Session poll failed; preserving playing windows')
                     self.errors=['Catalog unavailable; existing streams preserved: '+type(e).__name__]
