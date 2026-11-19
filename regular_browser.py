@@ -17,6 +17,7 @@ Each opened/restored source starts in launch monitoring: checks every 15 seconds
 require 60 seconds of continuous fresh primary-video progress before normal care.
 Launch observation never authorizes mutations; existing recovery guards still apply.
 """
+from cast_mirror import CastMirror
 import asyncio
 import re
 import json
@@ -140,6 +141,7 @@ class RegularBrowserKeeper:
         self._resource_lock=asyncio.Lock();self._opening_lock=asyncio.Lock()
         self.default_site='streamed';self.active_streams={};self.connections={};self.pending={}
         self.layout_status={'success':False,'message':'No companion connected'}
+        self.cast=CastMirror(config,self._cast_wanted)
         self.ad_handler=SimpleNamespace(stats={'requests_blocked':0,'overlays_dismissed':0,'network_enabled':False,'network_verified':False,'extension_verified':False,'note':'Regular browser uses its own blockers. Installation and live blocking must be verified in that browser.'})
         self.state_path=Path(config.get('session',{}).get('state_file','regular-session.json'))
         self.catalog=Catalog(self.state_path.with_name('provider-health.json'),disabled=config.get('catalog',{}).get('disabled',[]))
@@ -272,7 +274,12 @@ class RegularBrowserKeeper:
         self._task=asyncio.create_task(self._loop())
         self._reliability_task=asyncio.create_task(self._reliability_loop())
         self._launch_task=asyncio.create_task(self._launch_loop())
+        await self.cast.start()
+    def _cast_wanted(self,display):
+        streams=self.active_streams
+        return any(p.get('display')==display and p.get('stream_id')in streams and not getattr(streams[p['stream_id']],'parked',False)for p in self.layout_status.get('placements',[]))
     async def shutdown(self):
+        await self.cast.shutdown()
         if self._placement_retry_task:self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)
         if self._task:self._task.cancel();await asyncio.gather(self._task,return_exceptions=True)
         launch_task=getattr(self,'_launch_task',None)
@@ -997,7 +1004,7 @@ class RegularBrowserKeeper:
         except (ValueError,TimeoutError) as e:
             self.layout_status={'success':False,'message':str(e)};return self.layout_status
     def extra_status(self):
-        return {'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','buffering':{sid:dict(w)for sid,w in self._buffer_watch.items()if sid in self.active_streams},'audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.provider_summary(),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
+        return {'cast':self.cast.snapshot(),'resources':self.resources.snapshot,'stream_capacity':self.max_streams,'memory_guard':self.config.get('session',{}).get('memory_guard',True),'displays':self.display_probe.get('displays',{}),'connected_displays':list(self.display_probe.get('displays',{})),'display_probe':self.display_probe,'viewing':{'mode':self.viewing_mode},'keepalive':{**self.local_keepalive,**{k:v for k,v in self._local_care.items()if k in ('state','message','attempts','next_retry')}},'control_mode':'regular','buffering':{sid:dict(w)for sid,w in self._buffer_watch.items()if sid in self.active_streams},'audio_capabilities':self.audio_capabilities(),'browser_connections':{b:bool(b in self.connections and self._browser_ready.get(b))for b in ('firefox','chromium')},'session':{'active':bool(self.session),'group_id':(self.session or{}).get('group_id'),'group_epoch':(self.session or{}).get('group_epoch'),'ownership_lost':sorted(self._ownership_lost),'recovery':self._recovery,'plan':self.plan,'errors':self.errors,'suppressed':sorted(self.suppressed),'manual_layout':self.manual_layout,'saved_layout':self.saved_layout},'catalog':{'providers':self.catalog.provider_summary(),'fetched_at':(self.catalog.last or{}).get('fetched_at')}}
     async def _catalog(self,max_age=0):
         # Every provider is polled together; one failing site only drops its sources.
         if self.catalog.last and time.time()-self.catalog.last_at<=max_age:return self.catalog.last
