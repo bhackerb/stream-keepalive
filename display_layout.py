@@ -22,8 +22,6 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
         if type(limit)is not int or not 1<=limit<=(4 if name=="tv" else CAPACITIES[name]):raise ValueError("Invalid display stream limit")
         limit=min(limit,CAPACITIES[name])
         capacity = limit if mode == "grid" else min(limit,2 if mode == "side-by-side" else 1)
-        if name == "vertical" and mode == "side-by-side":
-            raise ValueError("Side-by-side is supported on TV and widescreen")
         regions.append((name, region, capacity))
     if not regions:raise ValueError("No connected displays available for this layout")
     if len(stream_ids) > sum(r[2] for r in regions):
@@ -33,7 +31,7 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
     for name, region, capacity in regions:
         selected, remaining = remaining[:capacity], remaining[capacity:]
         n = len(selected)
-        columns = 1 if name == "vertical" or n <= 1 else (3 if n > 4 else 2)
+        columns = 1 if n <= 1 or region["height"] > region["width"] else (3 if n > 4 else 2)
         rows = (n + columns - 1) // columns
         for i, sid in enumerate(selected):
             row, col = divmod(i, columns)

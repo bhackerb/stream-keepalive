@@ -50,7 +50,7 @@ layout:
   # displays:
   #   tv: {x: 0, y: 0, width: 3840, height: 2160}
   #   widescreen: {x: 0, y: 0, width: 3440, height: 1440}
-  #   vertical: {x: 3440, y: 0, width: 1080, height: 1920}
+  #   vertical: {x: 3440, y: 0, width: 1920, height: 1080}  # second monitor, landscape
   # Replace laptop coordinates with its actual desktop geometry; no guessed defaults.
 
 # Default preferences

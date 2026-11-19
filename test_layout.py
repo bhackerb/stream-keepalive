@@ -8,7 +8,7 @@ from stream_keeper import StreamKeeper
 
 DISPLAYS = {"tv": {"x": 0, "y": 0, "width": 3840, "height": 2160},
             "widescreen": {"x": -3440, "y": 0, "width": 3440, "height": 1440},
-            "vertical": {"x": 0, "y": -1920, "width": 1080, "height": 1920}}
+            "vertical": {"x": 0, "y": -1080, "width": 1920, "height": 1080}}
 
 
 class LayoutTests(unittest.TestCase):
@@ -34,9 +34,13 @@ class LayoutTests(unittest.TestCase):
     def test_focus_side_by_side_and_rejected_overflow(self):
         self.assertEqual(plan_layout(DISPLAYS, "tv", "focus", ["a"])[0]["width"], 3840)
         self.assertEqual([p["width"] for p in plan_layout(DISPLAYS, "widescreen", "side-by-side", ["a", "b"])], [1720, 1720])
-        for args in [("tv", "focus", ["a", "b"]), ("tv", "grid", ["a"] * 2), ("missing", "grid", ["a"]), ("vertical", "side-by-side", ["a"])]:
+        for args in [("tv", "focus", ["a", "b"]), ("tv", "grid", ["a"] * 2), ("missing", "grid", ["a"])]:
             with self.assertRaises(ValueError):
                 plan_layout(DISPLAYS, *args)
+
+    def test_landscape_second_monitor_uses_two_by_two(self):
+        cells = plan_layout(DISPLAYS, "vertical", "grid", list("abcd"))
+        self.assertEqual({(p["width"], p["height"]) for p in cells}, {(960, 540)})
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
