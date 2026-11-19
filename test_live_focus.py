@@ -11,9 +11,9 @@ class LiveFocusTests(unittest.IsolatedAsyncioTestCase):
   self.display_patch=patch('regular_browser.probe_displays',side_effect=lambda displays,*_: {'state':'available','displays':displays,'availability':{n:'connected'for n in displays},'outputs':[]})
   self.display_patch.start();self.addCleanup(self.display_patch.stop)
   self.tmp=tempfile.TemporaryDirectory();self.tv=dict(x=0,y=0,width=3840,height=2160)
-  self.k=RegularBrowserKeeper({'api':{'api_key':'test-key'},'layout':{'displays':{'tv':self.tv,'vertical':self.tv}},'session':{'state_file':str(Path(self.tmp.name)/'state')}})
+  self.k=RegularBrowserKeeper({'api':{'api_key':'test-key'},'layout':{'displays':{'tv':self.tv,'secondary':self.tv}},'session':{'state_file':str(Path(self.tmp.name)/'state')}})
   await self.k.refresh_displays()
-  self.k.session={'id':'session'};self.p=dict(stream_id='game',display='tv',**self.tv);self.other=dict(stream_id='other',display='vertical',**self.tv)
+  self.k.session={'id':'session'};self.p=dict(stream_id='game',display='tv',**self.tv);self.other=dict(stream_id='other',display='secondary',**self.tv)
   self.k.plan={'placements':[self.p,self.other]};self.k.layout_status={'success':True,'placements':[self.p,self.other]}
   self.k.active_streams={'game':SimpleNamespace(page='page',browser='firefox',parked=False,session_id='session')}
   self.k.command=AsyncMock(return_value={'game':{'fill':True}});self.k.command_for=AsyncMock(return_value=True);self.k._browser_ready['firefox']=True

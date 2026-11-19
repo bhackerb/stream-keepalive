@@ -8,12 +8,12 @@ from stream_keeper import StreamKeeper
 
 DISPLAYS = {"tv": {"x": 0, "y": 0, "width": 3840, "height": 2160},
             "widescreen": {"x": -3440, "y": 0, "width": 3440, "height": 1440},
-            "vertical": {"x": 0, "y": -1080, "width": 1920, "height": 1080}}
+            "secondary": {"x": 0, "y": -1080, "width": 1920, "height": 1080}}
 
 
 class LayoutTests(unittest.TestCase):
     def test_requested_capacities_and_even_coverage(self):
-        for display, count in [("tv", 1), ("widescreen", 6), ("vertical", 4), ("dock", 10)]:
+        for display, count in [("tv", 1), ("widescreen", 6), ("secondary", 4), ("dock", 10)]:
             placements = plan_layout(DISPLAYS, display, "grid", [str(i) for i in range(count)])
             self.assertEqual(len(placements), count)
             for name in {p["display"] for p in placements}:
@@ -39,7 +39,7 @@ class LayoutTests(unittest.TestCase):
                 plan_layout(DISPLAYS, *args)
 
     def test_landscape_second_monitor_uses_two_by_two(self):
-        cells = plan_layout(DISPLAYS, "vertical", "grid", list("abcd"))
+        cells = plan_layout(DISPLAYS, "secondary", "grid", list("abcd"))
         self.assertEqual({(p["width"], p["height"]) for p in cells}, {(960, 540)})
 
 
@@ -74,3 +74,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DisplayNameMigrationTests(unittest.TestCase):
+    def test_legacy_vertical_state_migrates(self):
+        from regular_browser import migrate_display_names
+        raw = '{"presets": {"vertical": 4}, "assignments": [{"display": "vertical", "slot": 1}]}'
+        self.assertEqual(migrate_display_names(raw), '{"presets": {"secondary": 4}, "assignments": [{"display": "secondary", "slot": 1}]}')

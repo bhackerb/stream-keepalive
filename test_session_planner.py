@@ -1,6 +1,6 @@
 import unittest
 from session_planner import build_plan, validate_spec
-D = {'widescreen':dict(x=1152,y=383,width=3440,height=1440), 'vertical':dict(x=0,y=0,width=1152,height=2048), 'tv':dict(x=0,y=0,width=3840,height=2080)}
+D = {'widescreen':dict(x=1152,y=383,width=3440,height=1440), 'secondary':dict(x=0,y=0,width=1152,height=2048), 'tv':dict(x=0,y=0,width=3840,height=2080)}
 def game(i, start=1000000, sport='hockey', title=None):
     return dict(id=str(i),date=start,category=sport,title=title or 'Game '+str(i),sources=[])
 class PlannerTests(unittest.TestCase):
@@ -15,7 +15,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(a['pending']),2)
         self.assertEqual(len(b['placements']),7)
         self.assertTrue({r['id'] for r in a['selected']} <= {r['id'] for r in b['selected']})
-        self.assertEqual(b['placements'][-1]['display'],'vertical')
+        self.assertEqual(b['placements'][-1]['display'],'secondary')
     def test_channels_excluded_and_tv_overflow_visible(self):
         games=[game(i) for i in range(7)]+[game('network',0)]
         p=build_plan(games,{g['id'] for g in games},{},{'display':'tv'},D,1000000)

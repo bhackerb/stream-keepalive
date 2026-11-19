@@ -111,6 +111,11 @@ def recovery_record(value):
     record.setdefault('created_at',time.time())
     return record
 
+def migrate_display_names(raw):
+    """The landscape second monitor was named 'vertical' before 2026-11-18."""
+    return raw.replace('"display": "vertical"','"display": "secondary"').replace('"display":"vertical"','"display":"secondary"').replace('"vertical":','"secondary":')
+
+
 class PlacementPending(ValueError):
     """An exact newly opened owned tab has not installed its receiver yet."""
     def __init__(self,sid):
@@ -151,7 +156,7 @@ class RegularBrowserKeeper:
     def _load(self):
         if self.state_path.exists():
             try:
-                state=json.loads(self.state_path.read_text());self._recovery={k:r for k,v in (state.get('recovery',{})if isinstance(state.get('recovery'),dict)else {}).items()if isinstance(k,str)and (r:=recovery_record(v))is not None};self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
+                state=json.loads(migrate_display_names(self.state_path.read_text()));self._recovery={k:r for k,v in (state.get('recovery',{})if isinstance(state.get('recovery'),dict)else {}).items()if isinstance(k,str)and (r:=recovery_record(v))is not None};self._group_epochs=state.get('group_epochs',{});self._releasing=set(state.get('releasing',[]));self.manual_layout=state.get('manual_layout');self.saved_layout=state.get('saved_layout');self.session=state.get('session');self.suppressed=set(state.get('suppressed',[]));self._ownership_lost=set(state.get('ownership_lost',[]));self._slot_rows=state.get('slot_rows',{});self._layout_ids=tuple(state.get('layout_ids',[]));self._visible_ids=tuple(state.get('visible_ids',[]))
                 if state.get('viewing_mode')in ('all','laptop-only'):self.viewing_mode=state['viewing_mode']
                 care=state.get('local_keepalive',{})
                 if isinstance(care,dict)and type(care.get('enabled'))is bool and care.get('profile')in ('standard','travel')and (not care['enabled']or isinstance(care.get('stream_id'),str)):

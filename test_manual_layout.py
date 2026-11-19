@@ -5,12 +5,12 @@ from test_session_planner import D
 import test_regular_browser as fixtures
 class GeometryTests(unittest.TestCase):
     def test_reserved_future_slot_does_not_resize_existing_stream(self):
-        layout=validate_manual_layout({'presets':{'widescreen':6,'vertical':4},'assignments':[{'game_id':'now','display':'widescreen','slot':0},{'game_id':'later','display':'widescreen','slot':5}]},D)
+        layout=validate_manual_layout({'presets':{'widescreen':6,'secondary':4},'assignments':[{'game_id':'now','display':'widescreen','slot':0},{'game_id':'later','display':'widescreen','slot':5}]},D)
         first=manual_placements(layout,D,{'now'});second=manual_placements(layout,D,{'now','later'})
         self.assertEqual(first[0],second[0]);self.assertEqual(second[1]['x'],3445)
     def test_conflicts_and_nonconfigured_slots_reject(self):
         base={'presets':{'tv':1},'assignments':[{'game_id':'a','display':'tv','slot':0}]}
-        for extra in ({'game_id':'a','display':'tv','slot':1},{'game_id':'b','display':'tv','slot':0},{'game_id':'b','display':'tv','slot':4},{'game_id':'b','display':'vertical','slot':0}):
+        for extra in ({'game_id':'a','display':'tv','slot':1},{'game_id':'b','display':'tv','slot':0},{'game_id':'b','display':'tv','slot':4},{'game_id':'b','display':'secondary','slot':0}):
             with self.assertRaises(ValueError):validate_manual_layout({**base,'assignments':base['assignments']+[extra]},D)
 class ManualTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp=fixtures.RegularTests.asyncSetUp
@@ -74,11 +74,11 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         await self.k.set_session_layout(body);self.assertNotIn('1',self.k.active_streams);self.assertNotIn('1',self.k.suppressed)
         with self.assertRaises(ValueError):await self.k.set_session_layout({**body,'group_epoch':1})
         self.assertEqual(self.k.extra_status()['session']['group_epoch'],2)
-    async def test_laptop_panel_adds_four_slots_between_wide_and_vertical(self):
+    async def test_laptop_panel_adds_four_slots_between_wide_and_secondary(self):
         from display_layout import plan_layout
         displays={**D,'laptop':{'x':4592,'y':592,'width':1970,'height':1231}}
         layout=plan_layout(displays,'dock','grid',[str(i)for i in range(14)])
-        self.assertEqual([p['display']for p in layout],['widescreen']*6+['laptop']*4+['vertical']*4)
+        self.assertEqual([p['display']for p in layout],['widescreen']*6+['laptop']*4+['secondary']*4)
     async def test_timed_out_release_keeps_new_desired_layout_and_late_close_is_not_user_suppression(self):
         await self.k._reconcile(self.plan(2));self.k.discover=AsyncMock(return_value=self.plan(2))
         self.k.command=AsyncMock(side_effect=TimeoutError('fixture'))

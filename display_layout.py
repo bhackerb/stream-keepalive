@@ -1,12 +1,12 @@
 """Deterministic stream layout planning; coordinates are desktop pixels."""
 
-CAPACITIES = {"tv": 1, "widescreen": 6, "vertical": 4, "laptop": 4}
+CAPACITIES = {"tv": 1, "widescreen": 6, "secondary": 4, "laptop": 4}
 
 
 def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) -> list[dict]:
     if mode not in ("grid", "side-by-side", "focus"):
         raise ValueError("mode must be grid, side-by-side, or focus")
-    names = [n for n in ("widescreen", "laptop", "vertical") if n in displays] if display == "dock" else [display]
+    names = [n for n in ("widescreen", "laptop", "secondary") if n in displays] if display == "dock" else [display]
     if len(set(stream_ids)) != len(stream_ids):
         raise ValueError("stream_ids must be unique")
     regions = []

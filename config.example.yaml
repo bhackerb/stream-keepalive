@@ -34,7 +34,7 @@ browser:
     - "--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies"
 
 streams:
-  max_streams: 10  # Dock: six widescreen + four vertical
+  max_streams: 11  # Dock: six widescreen + four secondary + one laptop
 
 layout:
   borderless: true  # Regular owned stream windows; false restores native decorations.
@@ -50,7 +50,7 @@ layout:
   # displays:
   #   tv: {x: 0, y: 0, width: 3840, height: 2160}
   #   widescreen: {x: 0, y: 0, width: 3440, height: 1440}
-  #   vertical: {x: 3440, y: 0, width: 1920, height: 1080}  # second monitor, landscape
+  #   secondary: {x: 3440, y: 0, width: 1920, height: 1080}  # second monitor, landscape
   # Replace laptop coordinates with its actual desktop geometry; no guessed defaults.
 
 # Default preferences
