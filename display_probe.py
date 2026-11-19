@@ -60,6 +60,9 @@ def xrandr_outputs(value):
 def bind_displays(configured,outputs):
     displays={};availability={};used=set()
     for name,region in configured.items():
+        if region.get('virtual')is True:
+            # Cast-only displays have no physical output; their window is mirrored, not shown.
+            availability[name]='connected';displays[name]={**region,'output':'virtual'};continue
         connector=region.get('output')
         candidates=[o for o in outputs if o['name']==connector] if connector else []
         if not connector and name=='laptop':candidates=[o for o in outputs if re.match(r'^(eDP|LVDS|DSI)(-|\d|$)',o['name'],re.I)]

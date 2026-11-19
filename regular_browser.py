@@ -277,7 +277,10 @@ class RegularBrowserKeeper:
         await self.cast.start()
     def _cast_wanted(self,display):
         streams=self.active_streams
-        return any(p.get('display')==display and p.get('stream_id')in streams and not getattr(streams[p['stream_id']],'parked',False)for p in self.layout_status.get('placements',[]))
+        for p in sorted(self.layout_status.get('placements',[]),key=lambda p:(p.get('y',0),p.get('x',0))):
+            s=streams.get(p.get('stream_id'))
+            if p.get('display')==display and s and not s.parked:return (s.id,s.url)
+        return None
     async def shutdown(self):
         await self.cast.shutdown()
         if self._placement_retry_task:self._placement_retry_task.cancel();await asyncio.gather(self._placement_retry_task,return_exceptions=True)

@@ -17,7 +17,7 @@ def validate_spec(spec):
     if browser not in ('firefox', 'chromium'):
         raise ValueError('browser must be firefox or chromium')
     display = spec.get('display', 'dock')
-    if display not in ('dock', 'tv', 'widescreen', 'secondary', 'laptop'):
+    if display not in ('dock', 'tv', 'comm', 'widescreen', 'secondary', 'laptop'):
         raise ValueError('Unknown display')
     hours = spec.get('hours', 12)
     if type(hours) is not int or not 1 <= hours <= 24:

@@ -81,3 +81,13 @@ class DisplayNameMigrationTests(unittest.TestCase):
         from regular_browser import migrate_display_names
         raw = '{"presets": {"vertical": 4}, "assignments": [{"display": "vertical", "slot": 1}]}'
         self.assertEqual(migrate_display_names(raw), '{"presets": {"secondary": 4}, "assignments": [{"display": "secondary", "slot": 1}]}')
+
+
+class VirtualDisplayTests(unittest.TestCase):
+    def test_virtual_cast_displays_bind_without_outputs(self):
+        from display_probe import bind_displays
+        cfg = {'tv': {'x': 0, 'y': 0, 'width': 1920, 'height': 1080, 'virtual': True},
+               'comm': {'x': 1920, 'y': 0, 'width': 1280, 'height': 800, 'virtual': True}}
+        displays, availability = bind_displays(cfg, [])
+        self.assertEqual(availability, {'tv': 'connected', 'comm': 'connected'})
+        self.assertEqual(displays['comm']['output'], 'virtual')

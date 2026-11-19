@@ -152,8 +152,8 @@ session:
 # Live-game catalog providers (see catalog_providers.py); all are polled and merged.
 catalog:
   disabled: []  # e.g. [cdnlivetv]
-# Mirror the TV display's desktop to a Google Cast device (never takes over a busy one).
+# Cast displays: run browser.engine: chromium and mark displays `virtual: true`; each display's
+# stream tab is mirrored (with audio) to a Google Cast device. Busy devices are never taken over.
 # cast:
 #   enabled: true
-#   sink: Livingroom Cast
-#   display: tv
+#   targets: {tv: Livingroom Cast, comm: The Comm}

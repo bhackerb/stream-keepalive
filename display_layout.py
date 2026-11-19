@@ -1,6 +1,6 @@
 """Deterministic stream layout planning; coordinates are desktop pixels."""
 
-CAPACITIES = {"tv": 1, "widescreen": 6, "secondary": 4, "laptop": 4}
+CAPACITIES = {"tv": 1, "comm": 1, "widescreen": 6, "secondary": 4, "laptop": 4}
 
 
 def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) -> list[dict]:
