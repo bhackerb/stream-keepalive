@@ -68,6 +68,9 @@ def bind_displays(configured,outputs):
         if not connector and name=='laptop':candidates=[o for o in outputs if re.match(r'^(eDP|LVDS|DSI)(-|\d|$)',o['name'],re.I)]
         if not candidates and not connector:
             candidates=[o for o in outputs if o.get('enabled') and all(o.get(k)==region.get(k)for k in KEYS)]
+            if not candidates:
+                # Monitors get nudged in KDE; a unique non-internal output of the same size is the same screen.
+                candidates=[o for o in outputs if o.get('enabled') and o['name'] not in used and not re.match(r'^(eDP|LVDS|DSI)(-|\d|$)',o['name'],re.I) and o.get('width')==region.get('width') and o.get('height')==region.get('height')]
         if len(candidates)!=1:
             availability[name]='unknown';continue
         output=candidates[0]
