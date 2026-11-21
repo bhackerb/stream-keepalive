@@ -1,10 +1,12 @@
 """Validated, fixed display slots for manual game placement and future reservations."""
 import re
 from display_layout import CAPACITIES,plan_layout
-PRESETS={'tv':(1,),'comm':(1,),'widescreen':(1,2,4,6),'secondary':(1,2,3,4),'laptop':(1,2,4)}
+PRESETS={'tv':(1,),'comm':(1,),'widescreen':(1,2,4,6),'secondary':(1,2,4),'laptop':(1,2,4)}
 def validate_manual_layout(body,displays):
     if not isinstance(body,dict):raise ValueError('Expected layout object')
     presets=body.get('presets',{})
+    # Legacy 3-up secondary grids become 2x2; Ben does not want a 3 grid there.
+    if isinstance(presets,dict)and presets.get('secondary')==3:presets={**presets,'secondary':4}
     assignments=body.get('assignments',[])
     if not isinstance(presets,dict)or not isinstance(assignments,list)or len(assignments)>14:raise ValueError('Invalid manual layout')
     for name,count in presets.items():

@@ -30,7 +30,8 @@ def plan_layout(displays: dict, display: str, mode: str, stream_ids: list[str]) 
     remaining = list(stream_ids)
     for name, region, capacity in regions:
         selected, remaining = remaining[:capacity], remaining[capacity:]
-        n = len(selected)
+        # The second monitor never shows a 3-up grid: three streams use 2x2 with one empty cell.
+        n = 4 if name == "secondary" and len(selected) == 3 else len(selected)
         columns = 1 if n <= 1 or region["height"] > region["width"] else (3 if n > 4 else 2)
         rows = (n + columns - 1) // columns
         for i, sid in enumerate(selected):

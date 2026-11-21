@@ -13,4 +13,15 @@ class MovedMonitor(unittest.TestCase):
         assert displays['secondary']['y']==288 and displays['secondary']['output']=='DP-4'
 
 
+class SecondaryNoThreeGrid(unittest.TestCase):
+    def test_three_streams_use_quarters(self):
+        from display_layout import plan_layout
+        r={'secondary':{'x':0,'y':0,'width':2048,'height':1152}}
+        cells=plan_layout(r,'secondary','grid',['a','b','c'])
+        self.assertEqual({(c['width'],c['height'])for c in cells},{(1024,576)})
+    def test_manual_three_preset_migrates_to_four(self):
+        from manual_layout import validate_manual_layout
+        r={'secondary':{'x':0,'y':0,'width':2048,'height':1152,'max_streams':4}}
+        self.assertEqual(validate_manual_layout({'presets':{'secondary':3},'assignments':[]},r)['presets'],{'secondary':4})
+
 if __name__=='__main__':unittest.main()
