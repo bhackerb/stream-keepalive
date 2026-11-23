@@ -566,3 +566,51 @@ class FailureMemoryTests(unittest.TestCase):
             self.assertEqual(catalog.rank(sources, 'basketball')[0]['url'], 'https://a.example/1')
             catalog.note_failure('https://a.example/1')
             self.assertEqual(catalog.rank(sources, 'basketball')[0]['url'], 'https://b.example/1')
+
+
+SUNDAY_3PM_ET = 1795377600_000  # 2026-11-22 15:00 America/New_York
+
+
+class RedZoneTests(unittest.TestCase):
+    def payloads(self):
+        streamfree = {'streams': [{'id': 'sf-rz', 'name': 'RedZone', 'category': 'football', 'league': 'NFL', 'match_timestamp': 1789318200,
+                                   'iframe': 'https://strmfree.st/embed/football/redzone1080p', 'sources': []}]}
+        ninety = {'streams': [{'category_name': '24/7-streams', 'streams': [
+            {'id': '247-nfl-network', 'name': 'NFL Network', 'always_live': 1, 'starts_at': 1795398571, 'status': 'live',
+             'sources': [{'name': 'NFL Network', 'embed': 'https://damitv.st/embed/?id=247-nfl-network'},
+                         {'name': 'NFL RedZone', 'embed': 'https://damitv.st/player/hls/?v=542&name=NFL%20RedZone'}]}]}]}
+        reed = [{'category': 'american-football', 'date': 1795370400000, 'ends_at': 1795395600000, 'id': 'nfl-redzone', 'title': 'NFL RedZone',
+                 'league_name': 'NFL', 'sources': [{'embedUrl': 'https://taifood-blog.asia/embed/nfl-redzone-32681', 'name': 'HD | NFL RedZone'},
+                                                    {'embedUrl': 'https://taifood-blog.asia/embed/nfl-redzone-32681_540p', 'name': 'SD | NFL RedZone'}]}]
+        tva = ('<a class="game" data-game="" data-sport="NFL" data-status="hot" data-search="NFL Redzone"\n'
+               '   href="https://thetvapp.plus/live/nfl/nfl-redzone-live-streaming">')
+        ppv = {'streams': [{'category': '24/7', 'streams': [{'id': 9, 'name': 'NFL RedZone', 'always_live': 1, 'iframe': 'https://ppv.example/rz'}]}]}
+        return [cp.parse_streamfree(streamfree, SUNDAY_3PM_ET), cp.parse_ninetyminutes(ninety, SUNDAY_3PM_ET),
+                cp.normalize_redzone(cp.parse_reedstreams(reed, SUNDAY_3PM_ET), SUNDAY_3PM_ET),
+                cp.parse_thetvapp(tva, SUNDAY_3PM_ET), cp.parse_ppv(ppv, SUNDAY_3PM_ET)]
+
+    def test_every_provider_channel_merges_into_one_live_redzone_game(self):
+        events = [e for evs in self.payloads() for e in evs if e]
+        self.assertEqual({e['provider'] for e in events}, {'streamfree', 'ninetyminutes', 'reedstreams', 'thetvapp', 'ppv'})
+        with tempfile.TemporaryDirectory() as d:
+            matches = cp.Catalog(Path(d) / 'h.json')._merge(events, SUNDAY_3PM_ET)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]['id'], '2026-11-22-nfl-redzone')
+        self.assertTrue(matches[0]['live'])
+        self.assertEqual(len(matches[0]['sources']), 6)
+
+    def test_redzone_is_dropped_outside_the_sunday_broadcast(self):
+        monday = SUNDAY_3PM_ET + 86400_000
+        self.assertEqual(cp.parse_streamfree({'streams': [{'id': 'x', 'name': 'RedZone', 'match_timestamp': 1, 'iframe': 'https://a.example/rz', 'sources': []}]}, monday), [None])
+        self.assertEqual(cp.normalize_redzone([cp._event('reedstreams', 1, 'NFL RedZone', 'american-football', monday, [cp._stream('https://a.example/rz', 'x')])], monday), [])
+
+
+class NflNameTests(unittest.TestCase):
+    def test_nickname_listing_merges_with_full_name_listing(self):
+        a = cp._event('timstreams', 1, 'Vikings @ 49ers', 'american-football', NOW, [cp._stream('https://a.example/1', 'a')])
+        b = cp._event('matchora', 2, 'Minnesota Vikings @ San Francisco 49ers', 'american-football', NOW, [cp._stream('https://b.example/1', 'b')])
+        self.assertTrue(cp.same_game(a, b))
+
+    def test_college_mascot_does_not_match_nfl_club(self):
+        self.assertFalse(cp.same_team('Louisville Cardinals', 'Arizona Cardinals', 'american-football'))
+        self.assertFalse(cp.same_team('Cardinals', 'Louisville Cardinals', 'american-football'))

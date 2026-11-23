@@ -145,13 +145,49 @@ def _stream(url, label, *, language=None, hd=False, viewers=None):
             'height': _height(url, label)}
 
 
+REDZONE = re.compile(r'red\s?zone', re.I)
+
+
+def redzone_window(now_ms):
+    """(start_ms, end_ms) of today's RedZone broadcast (Sunday NFL season, 1pm-8pm ET), else None."""
+    now = datetime.fromtimestamp(now_ms / 1000, ET)
+    if now.weekday() != 6 or now.month not in (9, 10, 11, 12, 1):
+        return None
+    start, end = now.replace(hour=12, minute=45, second=0, microsecond=0), now.replace(hour=20, minute=0, second=0, microsecond=0)
+    return (int(start.timestamp() * 1000), int(end.timestamp() * 1000)) if start <= now < end else None
+
+
+def redzone_event(provider, pid, streams, now_ms):
+    """24/7 RedZone channels become one dated game, so every provider's feed merges as an alternate."""
+    window = redzone_window(now_ms)
+    if not window:
+        return None
+    return _event(provider, pid, 'NFL RedZone', 'american-football', window[0], streams, teams=[], end_ms=window[1], live=True)
+
+
+def normalize_redzone(events, now_ms):
+    """Scheduled RedZone listings share one title/start; outside the broadcast they are dropped."""
+    out = []
+    for e in events:
+        if e and REDZONE.search(e['title']):
+            e = redzone_event(e['provider'], e['pid'], e['streams'], now_ms)
+        if e:
+            out.append(e)
+    return out
+
+
 # --------------------------------------------------------------------------- adapters
 
 def parse_ppv(payload, now_ms):
     events = []
     for group in payload.get('streams') or []:
         for item in (group.get('streams') or []) if isinstance(group, dict) else []:
-            if not isinstance(item, dict) or item.get('always_live'):
+            if not isinstance(item, dict):
+                continue
+            if item.get('always_live'):
+                if REDZONE.search(str(item.get('name') or '')):
+                    events.append(redzone_event('ppv', item.get('id'), [_stream(item.get('iframe'), item.get('source_tag') or 'PPV')] +
+                                                [_stream(sub.get('iframe'), sub.get('source_tag') or 'PPV alt') for sub in item.get('substreams') or [] if isinstance(sub, dict)], now_ms))
                 continue
             start, end = _int(item.get('starts_at')), _int(item.get('ends_at'))
             if not start:
@@ -174,6 +210,10 @@ def parse_streamfree(payload, now_ms):
     events = []
     for item in payload.get('streams') or []:
         if not isinstance(item, dict):
+            continue
+        if REDZONE.search(str(item.get('name') or '')):
+            urls = list(item.get('sources') or []) or [item.get('iframe')]
+            events.append(redzone_event('streamfree', item.get('id'), [_stream(u, f'StreamFree RedZone {i + 1}', hd='1080' in str(u)) for i, u in enumerate(urls)], now_ms))
             continue
         start = _int(item.get('match_timestamp'))
         if not start or now_ms - start * 1000 > STALE_EVENT_MS:
@@ -329,7 +369,16 @@ def parse_ninetyminutes(payload, now_ms):
     events = []
     for group in payload.get('streams') or []:
         for item in (group.get('streams') or []) if isinstance(group, dict) else []:
-            if not isinstance(item, dict) or item.get('always_live'):
+            if not isinstance(item, dict):
+                continue
+            if item.get('always_live'):
+                # The 24/7 NFL Network channel carries RedZone as one of its sources.
+                red = [_stream(s.get('embed'), s.get('name')) for s in item.get('sources') or []
+                       if isinstance(s, dict) and REDZONE.search(str(s.get('name') or ''))]
+                if REDZONE.search(str(item.get('name') or '')):
+                    red += [_stream(item.get('embed'), item.get('name'))]
+                if red:
+                    events.append(redzone_event('ninetyminutes', f"{item.get('id')}-redzone", red, now_ms))
                 continue
             start, end = _int(item.get('starts_at')), _int(item.get('ends_at'))
             if not start or now_ms - start * 1000 > STALE_EVENT_MS:
@@ -477,7 +526,12 @@ def parse_thetvapp(page, now_ms):
     events = []
     for attrs in THETVAPP_ROW.findall(page):
         fields = dict(re.findall(r'(data-[a-z-]+|href)="([^"]*)"', attrs))
-        if fields.get('data-status') != 'live' or not fields.get('href', '').startswith('https://'):
+        if not fields.get('href', '').startswith('https://'):
+            continue
+        if REDZONE.search(fields.get('data-search', '')) and fields.get('data-status') in ('live', 'hot'):
+            events.append(redzone_event('thetvapp', 'nfl-redzone', [_stream(fields['href'], 'TheTVApp RedZone')], now_ms))
+            continue
+        if fields.get('data-status') != 'live':
             continue
         sport = html.unescape(fields.get('data-sport', ''))
         title = html.unescape(fields.get('data-search', '')).strip()
@@ -612,11 +666,42 @@ def nhl_team(name):
     return next(iter(found)) if found and len(found) == 1 else None
 
 
+NFL_TEAMS = (
+    ('arizona', 'cardinals'), ('atlanta', 'falcons'), ('baltimore', 'ravens'), ('buffalo', 'bills'), ('carolina', 'panthers'),
+    ('chicago', 'bears'), ('cincinnati', 'bengals'), ('cleveland', 'browns'), ('dallas', 'cowboys'), ('denver', 'broncos'),
+    ('detroit', 'lions'), ('green bay', 'packers'), ('houston', 'texans'), ('indianapolis', 'colts'), ('jacksonville', 'jaguars'),
+    ('kansas city', 'chiefs'), ('las vegas', 'raiders'), ('los angeles', 'chargers'), ('los angeles', 'rams'), ('miami', 'dolphins'),
+    ('minnesota', 'vikings'), ('new england', 'patriots'), ('new orleans', 'saints'), ('new york', 'giants'), ('new york', 'jets'),
+    ('philadelphia', 'eagles'), ('pittsburgh', 'steelers'), ('san francisco', '49ers'), ('seattle', 'seahawks'),
+    ('tampa bay', 'buccaneers'), ('tennessee', 'titans'), ('washington', 'commanders'))
+_NFL_FULL, _NFL_NICK = {}, {}
+for _city, _nick in NFL_TEAMS:
+    _NFL_FULL[f'{_city} {_nick}'] = _NFL_NICK[_nick] = f'{_city} {_nick}'
+for _alias, _full in (('la chargers', 'los angeles chargers'), ('la rams', 'los angeles rams'), ('ny giants', 'new york giants'),
+                      ('ny jets', 'new york jets'), ('sf 49ers', 'san francisco 49ers'), ('niners', 'san francisco 49ers'),
+                      ('bucs', 'tampa bay buccaneers'), ('saint louis', None)):
+    if _full:
+        _NFL_NICK[_alias] = _full
+
+
+def nfl_team(name):
+    """(canonical NFL club, is_full_name) for a full name or nickname; None otherwise."""
+    key = ' '.join(words(name))
+    if key in _NFL_FULL:
+        return _NFL_FULL[key], True
+    return (_NFL_NICK[key], False) if key in _NFL_NICK else None
+
+
 def same_team(left, right, sport='hockey'):
     """Accept full names and leading short names, never a shared mascot/region."""
     nl, nr = (nhl_team(left), nhl_team(right)) if sport in ('hockey', 'other') else (None, None)
     if nl and nr:
         return nl == nr
+    if sport == 'american-football':
+        # A bare NFL nickname ("Vikings") matches only its full NFL name, so college mascots stay distinct.
+        fl, fr = nfl_team(left), nfl_team(right)
+        if fl and fr and (fl[1] or fr[1]) and fl[0] == fr[0]:
+            return True
     a, b = words(left), words(right)
     a = ['saint' if t == 'st' else t for t in a]
     b = ['saint' if t == 'st' else t for t in b]
@@ -771,7 +856,7 @@ class Catalog:
                 continue
             latency = int((time.monotonic() - started) * 1000)
             try:  # a changed schema is a provider failure, not a catalog crash
-                events = [e for e in provider.parse(payload, now_ms) if e] if isinstance(payload, (dict, list) if kind == 'json' else str) else None
+                events = normalize_redzone(provider.parse(payload, now_ms), now_ms) if isinstance(payload, (dict, list) if kind == 'json' else str) else None
             except (KeyError, TypeError, ValueError, AttributeError) as e:
                 events, error = None, f'{url}: schema changed ({type(e).__name__})'
             if events is None:
