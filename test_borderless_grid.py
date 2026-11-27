@@ -16,6 +16,19 @@ class BorderlessGridTests(unittest.IsolatedAsyncioTestCase):
    result['windows'][0]['borderless']=False
    self.assertFalse((await arrange_windows({'a':SimpleNamespace(page=page)},plans,borderless=True))['success'])
   self.assertEqual(page.evaluate.await_args.args,('title => document.title = title','Game'))
+ async def test_unreachable_page_keeps_its_slot_and_other_windows_are_verified(self):
+  placements=[dict(stream_id=sid,x=i*500,y=0,width=500,height=400) for i,sid in enumerate(('bad','good'))]
+  bad=SimpleNamespace(title=AsyncMock(return_value='Error page'),evaluate=AsyncMock(side_effect=ValueError('Receiving end does not exist')))
+  good=SimpleNamespace(title=AsyncMock(return_value='Game'),evaluate=AsyncMock())
+  measured={'success':True,'windows':[{'geometry':dict(x=500,y=0,width=500,height=400),'borderless':True}]}
+  with patch('kwin_layout.run_script',AsyncMock(return_value=measured)) as run,patch('kwin_layout.asyncio.sleep',AsyncMock()):
+   result=await arrange_windows({'good':SimpleNamespace(page=good),'bad':SimpleNamespace(page=bad)},placements,True)
+  self.assertFalse(result['success'])
+  self.assertEqual(result['confirmed_placements'],[placements[1]])
+  self.assertEqual(list(result['failed_streams']),['bad'])
+  for call in run.await_args_list:
+   self.assertEqual([p['stream_id'] for p in call.args[0]],['good'])
+
  def test_kwin_defaults_do_not_remove_unrelated_decorations(self):
   self.assertIn('const borderless = null',script_source([], 'fixture'))
   self.assertIn('const borderless = true',script_source([], 'fixture',borderless=True))

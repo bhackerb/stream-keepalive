@@ -924,7 +924,8 @@ class RegularBrowserKeeper:
 
     async def _apply_fill(self,placements,result):
         """A tab opened by a source switch or recovery starts unfilled; give it the fill a manual restore would."""
-        if result.get('pending') or not result.get('success'):return
+        if result.get('pending') or not result.get('success'):
+            placements=result.get('confirmed_placements',[]) if result.get('failed_streams') else []
         for p in placements:
             sid=p['stream_id']
             if sid in self._needs_fill and sid in self.active_streams and sid not in self._releasing:
@@ -934,12 +935,18 @@ class RegularBrowserKeeper:
 
     def _note_placement(self,placements,result):
         ids={p['stream_id']for p in placements}
+        if result.get('failed_streams'):
+            self._unplaced.difference_update(p['stream_id'] for p in result['confirmed_placements'])
+            self._unplaced.update(result['failed_streams'])
+            return
         if result.get('pending'):return
         if result.get('success'):self._unplaced-=ids
         else:self._unplaced|=ids
 
     async def _retry_placement(self,placements,generation,session,manual):
         targets={p['stream_id']:self.active_streams.get(p['stream_id'])for p in placements}
+        confirmed={p['stream_id']:p for p in self.layout_status.get('confirmed_placements',[])
+                   if p in placements} if self.layout_status.get('failed_streams') else {}
         while True:
             await asyncio.sleep(PLACEMENT_RETRY_INTERVAL)
             async with self._lock:
@@ -950,7 +957,7 @@ class RegularBrowserKeeper:
                     # Revalidate the original open receipt even when the next
                     # marker command succeeds; a restored/replaced tab is not
                     # the tab accepted for this bounded retry.
-                    for sid in targets:
+                    for sid in targets.keys()-confirmed.keys():
                         startup=self._placement_startup.get(sid)
                         if not startup:continue
                         remaining=startup[2]-asyncio.get_running_loop().time()
@@ -960,11 +967,21 @@ class RegularBrowserKeeper:
                         if self._inventory_errors.get(startup[0].browser)or not isinstance(current,dict)or any(current.get(k)!=startup[1][k]for k in ('tabId','windowId','token')):
                             raise ValueError('Placement ownership audit failed; exact opened tab is unavailable')
                     if any(self.active_streams.get(sid)is not stream or sid in self.suppressed|self._ownership_lost|self._releasing for sid,stream in targets.items()):raise ValueError('Placement ownership changed')
-                    result=await self._place_once(placements)
+                    remaining_plans=[p for p in placements if p['stream_id'] not in confirmed]
+                    result=await self._place_once(remaining_plans)
+                    if result['success']:
+                        result['placements']=placements
+                    else:
+                        confirmed.update((p['stream_id'],p) for p in result.get('confirmed_placements',[]) if p in remaining_plans)
+                        result['confirmed_placements']=list(confirmed.values())
                 except Exception as exc:
                     log.exception('New owned tab placement retry failed')
                     result=self.layout_status={'success':False,'message':'Placement retry failed: '+(str(exc)or type(exc).__name__)}
-                self._note_placement(placements,result)
+                if confirmed and not result['success']:
+                    result['confirmed_placements']=list(confirmed.values())
+                    result['placements']=placements
+                    self._unplaced.difference_update(confirmed)
+                self._note_placement([p for p in placements if p['stream_id'] not in confirmed],result)
                 await self._apply_fill(placements,result)
                 if result.get('pending'):continue
                 if result['success']:
@@ -997,8 +1014,8 @@ class RegularBrowserKeeper:
                     await asyncio.to_thread(move_window,wid,p,fullscreen=focus,borderless=borderless)
                     if focus and not await asyncio.to_thread(wait_window_matches,wid,p,fullscreen=True):raise ValueError('TV focus geometry not confirmed')
                 result={'success':True,'message':'X11 placement requested; full-TV focus geometry confirmed when applicable'}
-            if result['success']:
-                for p in placements:self._placement_startup.pop(p['stream_id'],None)
+            for p in placements if result['success'] else result.get('confirmed_placements',[]):
+                self._placement_startup.pop(p['stream_id'],None)
             self.layout_status={**result,'placements':placements};return self.layout_status
         except PlacementPending as e:
             confirmed=self.layout_status.get('placements',[])if self.layout_status.get('success')else self.layout_status.get('confirmed_placements',[])

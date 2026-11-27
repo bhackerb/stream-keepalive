@@ -93,6 +93,28 @@ class PlacementReadinessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.k._placement_retry_task)
         self.run.assert_not_awaited();self.assertEqual(sum(op=='open'for op,_ in self.ops),1)
 
+    async def test_mixed_grid_retries_only_the_pending_window(self):
+        self.k._add('healthy',dict(url='https://streamed.pk/watch/healthy',browser='firefox'))
+        await self.k._open('0','https://streamed.pk/watch/0','Game','firefox','session')
+        original=self.k.command
+        async def command(browser,op,**args):
+            if args.get('stream_id')=='healthy':
+                return 'Healthy game' if op=='title' else True
+            return await original(browser,op,**args)
+        self.k.command=command
+        placements=[dict(stream_id=sid,display='widescreen',x=1152+i*1720,y=383,width=1720,height=1440)
+                    for i,sid in enumerate(('0','healthy'))]
+        result=await self.k._place(placements)
+        self.assertTrue(result['pending'])
+        self.assertEqual(result['confirmed_placements'],[placements[1]])
+        self.ready=True
+        await asyncio.wait_for(self.k._placement_retry_task,2)
+        self.assertTrue(self.k.layout_status['success'])
+        self.assertEqual(self.k.layout_status['placements'],placements)
+        self.assertEqual([call.args[0][0]['stream_id'] for call in self.run.await_args_list],
+                         ['healthy']*3+['0']*3)
+        self.assertFalse(self.k._unplaced)
+
     async def test_old_stream_missing_receiver_stays_a_real_failure(self):
         self.k._add('0',dict(url='https://streamed.pk/watch/0',browser='firefox'))
         result=await self.k._place([dict(stream_id='0',x=0,y=0,width=3440,height=1440)])

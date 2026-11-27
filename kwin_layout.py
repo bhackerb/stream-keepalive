@@ -88,13 +88,29 @@ async def arrange_windows(streams, placements, borderless=None):
     tagged = []
     try:
         plans = []
+        failures = {}
+        pending = []
         for placement in placements:
             page = streams[placement["stream_id"]].page
-            title = await page.title()
-            marker = "streamkeeper-" + uuid.uuid4().hex
-            tagged.append((page, title))
-            await page.evaluate("marker => document.title = marker", marker)
+            sid = placement["stream_id"]
+            try:
+                title = await page.title()
+                marker = "streamkeeper-" + uuid.uuid4().hex
+                tagged.append((page, title))
+                await page.evaluate("marker => document.title = marker", marker)
+            except (ValueError, TimeoutError) as exc:
+                if len(placements) == 1:
+                    raise
+                failures[sid] = str(exc) or type(exc).__name__
+                if getattr(exc, "stream_id", None) == sid:
+                    pending.append(sid)
+                continue
             plans.append({**placement, "marker": marker})
+        partial = {"success": False, "pending": bool(pending), "pending_stream_ids": pending,
+                   "failed_streams": failures, "confirmed_placements": [],
+                   "message": "Window identification failed: " + ", ".join(failures)}
+        if failures and not plans:
+            return partial
         # Give the compositor time to receive browser caption updates.
         await asyncio.sleep(0.2)
         result = await run_script(plans, dry_run=True)
@@ -110,6 +126,10 @@ async def arrange_windows(streams, placements, borderless=None):
         matches = all(all(abs(window["geometry"][key] - plan[key]) <= 2 for key in ("x", "y", "width", "height"))
                       for window, plan in zip(measured["windows"], plans))
         if borderless is not None:matches=matches and all(w.get('borderless') is borderless for w in measured['windows'])
+        if matches and failures:
+            ready = {p["stream_id"] for p in plans}
+            return {**partial, "confirmed_placements": [p for p in placements if p["stream_id"] in ready],
+                    "windows": measured["windows"]}
         return {"success": matches, "message": "KWin placement verified" if matches else "KWin constrained one or more windows; requested layout was not achieved",
                 "windows": measured["windows"]}
     finally:
